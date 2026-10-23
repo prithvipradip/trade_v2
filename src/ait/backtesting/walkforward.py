@@ -113,6 +113,7 @@ class WalkForwardConfig:
     # W65 research-history knobs (None = legacy behaviour; the research entry points
     # resolve them from config.yaml backtest.* and pass them explicitly).
     history_start_date: "date | None" = None   # trim data + start windows here
+    history_end_date: "date | None" = None     # W91: pin the last day the research loader returns (backtest.history_end_date)
     history_days: int | None = None            # None -> legacy train+test+100
     vlmc_min_coverage: float | None = None     # 5-min day coverage needed for VLMC; W90b: None -> backtest.vlmc_min_coverage
     macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
@@ -1300,6 +1301,8 @@ class WalkForwardBacktester:
                 "SPY", days=_ctx_days, db_path=self._db_path,
                 table_prefix=self._table_prefix,
                 start_date=self._config.history_start_date,
+                end_date=self._config.history_end_date,
+                research=(self._db_path is not None),     # W91: the tables are shared; no prefix to infer from
             )
             if not _spy_full.empty and _spy_full.index.tz is not None:
                 _spy_full.index = _spy_full.index.tz_localize(None)
@@ -3289,7 +3292,7 @@ class WalkForwardBacktester:
         calendar's span with an ERROR rather than silently mixed. No table / no rows
         -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour)."""
         cfg = self._config
-        if cfg.macro_event_types is None or self._db_path is None or not self._table_prefix:
+        if cfg.macro_event_types is None or self._db_path is None:   # W91: research mode = a db_path was given
             return data
         from ait.data.economic_calendar import build_research_calendar
         from ait.data.historical import HistoricalDataStore
@@ -3447,8 +3450,11 @@ class WalkForwardBacktester:
                 # W65: the research kwargs are passed ONLY when set, so a legacy run
                 # (no prefix, no start date) makes the exact pre-W65 call.
                 _kw: dict = {}
-                if self._table_prefix:
+                if self._db_path is not None:          # W91: research mode = a db_path was given
                     _kw["table_prefix"] = self._table_prefix
+                    _kw["research"] = True
+                    if cfg.history_end_date is not None:   # W91: a registered study's pinned last day
+                        _kw["end_date"] = cfg.history_end_date
                 if start is not None:
                     _kw["start_date"] = start
                 df = await loop.run_in_executor(

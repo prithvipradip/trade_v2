@@ -116,10 +116,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
-    if not args.table_prefix and not args.allow_live_tables:
-        print("ERROR: a non-empty --table-prefix is required (e.g. research_); "
-              "pass --allow-live-tables to write the live table.")
-        return 2
+    # W91: the guard that refused an empty --table-prefix is gone: the un-prefixed tables ARE the one shared
+    # history (every row carries its source tag), so that is where this writes by default. --allow-live-tables
+    # is kept as an accepted no-op so existing commands keep working.
     if not args.csv.exists():
         print(f"ERROR: {args.csv} not found")
         return 2

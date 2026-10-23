@@ -262,7 +262,9 @@ class ModelTrainer:
 
             # W65: persist the provider that served the frame (IB_TRADES_RTH / YAHOO_UNADJ)
             # W89: never persist today's mid-session (partial) bar; training still sees `df` as before.
-            self._store.save(symbol, drop_incomplete_session(df), source=df.attrs.get("source"))
+            # W91: append-only -- a stored completed session is never rewritten by the retrain.
+            self._store.save(symbol, drop_incomplete_session(df), source=df.attrs.get("source"),
+                             overwrite=False)
             accuracies = self._predictor.train(
                 df, symbol=symbol, market_context=market_context
             )

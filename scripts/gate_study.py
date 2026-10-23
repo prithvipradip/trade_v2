@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "IWM"])
     ap.add_argument("--db-path", default="data/historical.db")
-    ap.add_argument("--table-prefix", default="research_")
+    ap.add_argument("--table-prefix", default="")   # W91: the one shared set of tables
     ap.add_argument("--start", default="2024-01-01")
     ap.add_argument("--any-direction", action="store_true")
     ap.add_argument("--n-boot", type=int, default=2000)

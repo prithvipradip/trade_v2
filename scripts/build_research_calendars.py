@@ -286,10 +286,9 @@ def main(argv: list[str] | None = None, fetcher: Fetcher | None = None) -> int:
     ap.add_argument("--offline", action="store_true", help="use only the cache (no network)")
     args = ap.parse_args(argv)
 
-    if not args.table_prefix and not args.allow_live_tables:
-        print("ERROR: a non-empty --table-prefix is required (e.g. research_); "
-              "pass --allow-live-tables to write the live tables.")
-        return 2
+    # W91: the guard that refused an empty --table-prefix is gone: the un-prefixed tables ARE the one shared
+    # history (every row carries its source tag), so that is where this writes by default. --allow-live-tables
+    # is kept as an accepted no-op so existing commands keep working.
     since = date.fromisoformat(args.since)
     db = Path(args.db_path)
     f = fetcher or Fetcher(Path(args.cache_dir), "" if args.offline else _contact(), offline=args.offline)

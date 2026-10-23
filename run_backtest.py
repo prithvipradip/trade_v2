@@ -486,8 +486,11 @@ def parse_args() -> argparse.Namespace:
                    help="Calendar days of history to request. Overrides config "
                         "backtest.history_start_date (which otherwise sets the span).")
     p.add_argument("--table-prefix", default=None,
-                   help="Research table prefix (default: config backtest.research_table_prefix, "
-                        "'research_'). Pass '' to use the live tables / legacy loader.")
+                   help="History table prefix (default: config backtest.research_table_prefix, '' = the one "
+                        "shared set of tables since W91).")
+    p.add_argument("--legacy-history", action="store_true",
+                   help="W91: ignore the stored history and use the legacy loader (5-min resample / Yahoo) for "
+                        "this run (the old `--table-prefix ''`).")
     p.add_argument("--db-path", default="data/historical.db",
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--max-windows", type=int, default=None,
@@ -621,14 +624,18 @@ async def run_backtest(args: argparse.Namespace) -> None:
         _bcfg = None
     _prefix = (args.table_prefix if args.table_prefix is not None
                else (_bcfg.research_table_prefix if _bcfg else ""))
-    _research = bool(_prefix)
+    # W91: the tables are shared, so "research" is its own switch (backtest.research_history), not an empty prefix;
+    # an explicit non-empty --table-prefix still means research on that set.
+    _research = (not args.legacy_history) and (bool(_prefix) or bool(_bcfg and _bcfg.research_history))
     _start = (None if args.history_days is not None
               else (_bcfg.history_start_date if (_bcfg and _research) else None))
+    _end = (_bcfg.history_end_date if (_bcfg and _research) else None)
     _hist_days = (args.history_days if args.history_days is not None
                   else (_bcfg.history_days if (_bcfg and _research) else None))
     if _research:
-        print(f"  History:    research tables '{_prefix}*' in {args.db_path} | "
-              f"{'from ' + str(_start) if _start else str(_hist_days) + ' days'}")
+        print(f"  History:    stored history tables '{_prefix}*' in {args.db_path} | "
+              f"{'from ' + str(_start) if _start else str(_hist_days) + ' days'}"
+              f"{' | pinned end ' + str(_end) if _end else ''}")
     else:
         print("  History:    legacy loader (5-min resample / Yahoo), live tables")
 
@@ -636,6 +643,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
         gates_mode=args.gates_mode,
         max_windows=args.max_windows,
         history_start_date=_start,
+        history_end_date=_end,
         history_days=_hist_days,
         vlmc_min_coverage=(_bcfg.vlmc_min_coverage if _bcfg else BacktestConfig().vlmc_min_coverage),   # W90a: schema default
         macro_event_types=(tuple(_bcfg.macro_event_types) if (_bcfg and _research) else None),

@@ -51,7 +51,7 @@ DEFAULT_DTES = (1, 3, 7, 14)
 class _ReadOnlyIntraday:
     """5-minute bars straight from the research table (sqlite ``mode=ro``)."""
 
-    def __init__(self, db: Path, symbol: str, prefix: str = "research_") -> None:
+    def __init__(self, db: Path, symbol: str, prefix: str = "") -> None:   # W91: shared tables
         self._c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         self._sym, self._t, self._cache = symbol, f"{prefix}intraday_prices", {}
 

@@ -215,11 +215,16 @@ def load_trades(path: str | Path) -> list[ReplayTrade]:
 # --------------------------------------------------------------------------
 
 class ResearchData:
-    """Read-only view of the research tables in data/historical.db."""
+    """Read-only view of the stored history tables in data/historical.db.
 
-    def __init__(self, db_path: str | Path, symbol: str, prefix: str = "research_") -> None:
+    W91: the tables are shared (prefix "" by default). `end_date` pins the last day the daily frame and the
+    intraday bars return (backtest.history_end_date), so a study's inputs stay fixed as the tables grow."""
+
+    def __init__(self, db_path: str | Path, symbol: str, prefix: str = "",
+                 end_date: "date | None" = None) -> None:
         self._uri = f"file:{db_path}?mode=ro"
         self.symbol = symbol.upper()
+        self._end = end_date
         self._daily = f"{prefix}daily_prices"
         self._intra = f"{prefix}intraday_prices"
         self._frame: pd.DataFrame | None = None
@@ -234,7 +239,8 @@ class ResearchData:
                 df = pd.read_sql_query(
                     f"SELECT date, open AS Open, high AS High, low AS Low, close AS Close, "
                     f"volume AS Volume, implied_vol FROM {self._daily} "
-                    f"WHERE symbol = ? ORDER BY date", c, params=(self.symbol,))
+                    f"WHERE symbol = ?" + (" AND date <= ?" if self._end else "") + " ORDER BY date",
+                    c, params=((self.symbol, str(self._end)) if self._end else (self.symbol,)))
             df.index = pd.to_datetime(df.pop("date"))
             self._frame = df
         return self._frame
@@ -285,6 +291,8 @@ class ResearchData:
         if key in cache:
             return cache[key]
         lo = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc)
+        if self._end is not None and end_date > self._end:      # W91: never past the pinned last day
+            end_date = self._end
         hi = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
         fmt = "%Y-%m-%dT%H:%M:%S+00:00"
         with self._conn() as c:

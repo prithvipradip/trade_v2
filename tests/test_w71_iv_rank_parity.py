@@ -219,7 +219,7 @@ class TestReadOnlyIntradayAdapter:
         con.close()
         before = db.read_bytes()
         from ait.backtesting.replay import ResearchData
-        rd = ResearchData(str(db), "QQQ")
+        rd = ResearchData(str(db), "QQQ", prefix="research_")
         df = rd.load_intraday_range("QQQ", date(2026, 3, 10), date(2026, 3, 10))
         assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
         assert len(df) == 2 and str(df.index.tz) == "UTC"

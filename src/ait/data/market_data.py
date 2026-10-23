@@ -67,6 +67,8 @@ def load_daily_ohlcv(
     db_path: "Path | None" = None,
     table_prefix: str = "",
     start_date: "date | None" = None,
+    end_date: "date | None" = None,
+    research: bool | None = None,
 ) -> pd.DataFrame:
     """Load daily OHLCV — IB SQLite store first, Yahoo Finance fallback.
 
@@ -100,15 +102,19 @@ def load_daily_ohlcv(
         db_path: Path to SQLite DB; uses production DB_PATH if None.
         table_prefix: Research table prefix ("" = live tables, legacy path).
         start_date:   Earliest date to return (research path only).
+        end_date:     W91: latest date to return (research path only; backtest.history_end_date).
+        research:     W91: read the stored-history path. None keeps the pre-W91 rule (a non-empty
+                      table_prefix); the tables are shared now, so callers pass it explicitly.
 
     Returns:
         DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol].
     """
     from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
 
-    if table_prefix and not symbol.startswith("^"):   # indices (^VIX) are not in the research store
+    if (bool(table_prefix) if research is None else research) and not symbol.startswith("^"):
+        # indices (^VIX) are not in the research store
         _research = _load_research_daily(
-            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date)
+            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date, end_date)
         if _research is not None:
             return _research
         # fall through to the legacy path (WARNING already logged)
@@ -197,8 +203,12 @@ def _load_research_daily(
     db_path,
     table_prefix: str,
     start_date,
+    end_date=None,
 ) -> "pd.DataFrame | None":
-    """W65: the IB research table path of load_daily_ohlcv. None = not sufficient."""
+    """W65: the stored-history path of load_daily_ohlcv. None = not sufficient.
+
+    W91: `end_date` (backtest.history_end_date) pins the last day returned, so a registered study keeps
+    its inputs while the shared tables keep growing."""
     from ait.data.historical import HistoricalDataStore
 
     store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
@@ -209,7 +219,7 @@ def _load_research_daily(
     else:
         span_days = days
         start = today - timedelta(days=days + 30)
-    df = store.load(symbol, start_date=start)
+    df = store.load(symbol, start_date=start, end_date=end_date)
     if not df.empty:
         # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.
         df = df.dropna(subset=["Close"])
@@ -223,8 +233,8 @@ def _load_research_daily(
                     start=str(start),
                     note="IB research history is short for this request; falling back "
                          "to the legacy loader (5-min resample, then Yahoo). Run "
-                         "scripts/backfill_historical_data.py --mode daily --table-prefix "
-                         f"{table_prefix}")
+                         "scripts/backfill_historical_data.py --mode daily"
+                         + (f" --table-prefix {table_prefix}" if table_prefix else ""))
         return None
     df.index.name = "Date"
     # Real IBKR implied vol from the same research prefix (NaN where absent).

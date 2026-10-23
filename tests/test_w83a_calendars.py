@@ -226,10 +226,13 @@ class TestStore:
 
 
 class TestScript:
-    def test_a_prefix_is_required(self, tmp_path):
+    def test_no_prefix_is_needed_any_more(self, tmp_path):
+        """W91: the empty-prefix guard is gone (the un-prefixed tables are the one shared set), so a run without
+        --table-prefix gets as far as the cache lookup instead of exiting 2."""
         import build_research_calendars as b
-        assert b.main(["--db-path", str(tmp_path / "h.db"), "--report-dir", str(tmp_path)]) == 2
-        assert not (tmp_path / "h.db").exists()
+        with pytest.raises(FileNotFoundError):
+            b.main(["--what", "econ", "--db-path", str(tmp_path / "h.db"), "--offline",
+                    "--cache-dir", str(tmp_path / "empty"), "--report-dir", str(tmp_path)])
 
     def test_a_missing_contact_refuses_to_fetch(self, tmp_path, monkeypatch):
         import build_research_calendars as b

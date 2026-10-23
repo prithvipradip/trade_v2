@@ -401,7 +401,7 @@ class TestReplaySurfaceVariant:
         bars = make_bars([date(2026, 8, 12), date(2026, 8, 13), date(2026, 8, 14)],
                          spot=100.0, max_dte=20)
         surf = IVSurface.from_bars(bars)
-        return rp, rp.ResearchData(db, "QQQ"), P, _condor(ENTRY, EXPIRY), surf
+        return rp, rp.ResearchData(db, "QQQ", prefix="research_"), P, _condor(ENTRY, EXPIRY), surf
 
     def test_each_leg_is_priced_from_the_previous_sessions_smile(self, tmp_path):
         rp, data, P, trade, surf = self._setup(tmp_path)

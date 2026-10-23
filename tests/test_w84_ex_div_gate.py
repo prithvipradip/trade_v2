@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import random
+import sqlite3
 import sys
 import types
 from datetime import date, timedelta
@@ -192,7 +193,7 @@ class TestRule:
 @pytest.fixture
 def div_db(tmp_path):
     db = tmp_path / "historical.db"
-    HistoricalDataStore(db_path=db, table_prefix="research_").save_dividends(
+    HistoricalDataStore(db_path=db).save_dividends(      # W91: the one shared (un-prefixed) dividends table
         "SPY", [(d, 0.5) for d in QUARTERLY], source=SOURCE_YAHOO_DIVIDENDS,
         fetched_at="2026-10-16T00:00:00-04:00")
     return db
@@ -257,7 +258,7 @@ class TestEngine:
         sits 12 days before the expiry of the 04-04 attempt (outside K=7, inside exact)."""
         dates = [date(2024, 2, 12), date(2024, 4, 6)]
         db = tmp_path / "h.db"
-        HistoricalDataStore(db_path=db, table_prefix="research_").save_dividends(
+        HistoricalDataStore(db_path=db).save_dividends(      # W91: the one shared (un-prefixed) table
             "SPY", [(d, 0.5) for d in dates], SOURCE_YAHOO_DIVIDENDS, "t")
         ex = _engine(synth_df, synth_features, db, "exact")
         lk = _engine(synth_df, synth_features, db, "last_k_days", ex_div_entry_k_days=7)
@@ -381,9 +382,12 @@ class TestStoreAndBackfill:
                       str(tmp_path / "rep"), *extra], fetch=self._fake_fetch)
         return rc, db
 
-    def test_a_prefix_is_required(self, tmp_path):
+    def test_no_prefix_writes_the_shared_table(self, tmp_path):
+        """W91: the empty-prefix guard is gone; the un-prefixed dividends is the one shared table."""
         rc, db = self._main(tmp_path)
-        assert rc == 2 and not db.exists()
+        assert rc == 0
+        with sqlite3.connect(db) as c:
+            assert c.execute("SELECT COUNT(*) FROM dividends").fetchone()[0] > 0
 
     def test_dry_run_writes_nothing(self, tmp_path):
         rc, db = self._main(tmp_path, "--table-prefix", "research_", "--dry-run")

@@ -96,11 +96,17 @@ def _scrub(settings_dump: dict) -> dict:
     return out
 
 
-def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str]) -> dict:
+def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str],
+                     as_of: "date | str | None" = None) -> dict:
     """Rows and date span per table, and a sha256 of each symbol's (date, close) series, through a
-    read-only connection. Missing tables are reported, not raised."""
+    read-only connection. Missing tables are reported, not raised.
+
+    W91: `as_of` (backtest.history_end_date) restricts the close series to dates <= as_of, so a study that
+    pinned its end date keeps a stable hash while the shared tables grow; it is recorded in the output."""
     db = Path(db_path)
     out: dict[str, Any] = {"db": str(db), "tables": {}, "closes": {}}
+    if as_of is not None:
+        out["as_of"] = str(as_of)
     if not db.is_file():
         out["error"] = "database not found"
         return out
@@ -118,8 +124,12 @@ def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str])
                 out["tables"][name] = {"rows": rows, "first": span[0], "last": span[1]}
         for sym in symbols:
             try:
-                rows = con.execute(f"SELECT date, close FROM {table_prefix}daily_prices WHERE symbol=? "
-                                   f"ORDER BY date", (sym,)).fetchall()
+                q = f"SELECT date, close FROM {table_prefix}daily_prices WHERE symbol=?"
+                args: tuple = (sym,)
+                if as_of is not None:
+                    q += " AND date <= ?"
+                    args = (sym, str(as_of))
+                rows = con.execute(q + " ORDER BY date", args).fetchall()
             except sqlite3.Error:
                 rows = []
             h = hashlib.sha256("\n".join(f"{d}|{c}" for d, c in rows).encode()).hexdigest()
@@ -154,7 +164,8 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
     """Assemble the record. ``settings`` is the RESOLVED settings object the run used."""
     now = now or datetime.now()
     dump = settings.model_dump(mode="json") if settings is not None else {}
-    prefix = getattr(getattr(settings, "backtest", None), "research_table_prefix", "research_")
+    prefix = getattr(getattr(settings, "backtest", None), "research_table_prefix", "")
+    as_of = getattr(getattr(settings, "backtest", None), "history_end_date", None)   # W91
     run_id = f"{kind}_{name}_{now.strftime('%Y%m%d_%H%M%S')}"
     return {
         "schema": SCHEMA, "run_id": run_id, "kind": kind, "name": name,
@@ -170,7 +181,7 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
         "feature_spec_hash": _feature_spec_hash(settings),
         # W88a: {dotted.key: [value, layer]} -- which layer decides each value (study > overlay > config.yaml > default)
         "settings_origin": ({k: list(v) for k, v in settings_origin.items()} if settings_origin else None),
-        "data": data_fingerprint(db_path, prefix, list(symbols or [])) if db_path else None,
+        "data": data_fingerprint(db_path, prefix, list(symbols or []), as_of) if db_path else None,
         "seeds": seed_inventory(seeds, settings),
         "search_space": search_space, "search_space_hash": search_space_hash,
         "metrics": metrics or {},

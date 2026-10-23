@@ -1688,7 +1688,7 @@ class Backtester:
         sym = (self._symbol or "").upper()
         table = f"{self._research_table_prefix}dividends"
         fix = (f"run: python scripts/backfill_dividends.py --symbols {sym or '<SYMBOL>'} "
-               f"--table-prefix {self._research_table_prefix}")
+               + (f"--table-prefix {self._research_table_prefix}" if self._research_table_prefix else ""))
         if not sym:
             raise ValueError(f"ex_div_entry_gate={self._ex_div_mode!r} needs a symbol (the "
                              f"ex-dividend calendar is per symbol)")
@@ -2169,7 +2169,7 @@ class Backtester:
     _ex_div_mode: str = "off"
     _ex_div_k: int = BacktestConfig.model_fields["ex_div_entry_k_days"].default     # W90e: the schema default, not a copy
     _ex_dates: list | None = None
-    _research_table_prefix: str = "research_"
+    _research_table_prefix: str = ""     # W91: the one shared set of tables
     _risk_free_rate: float = DEFAULT_RISK_FREE_RATE
     _legacy: LegacyEngineConfig = LegacyEngineConfig()      # W88b: a partial engine keeps the schema defaults
     _eng: EngineTuningConfig = EngineTuningConfig()         # W90c: ... and the engine-tuning defaults

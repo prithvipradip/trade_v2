@@ -37,6 +37,7 @@ DB_PATH = Path("data/historical.db")
 SOURCE_IB_TRADES_RTH = "IB_TRADES_RTH"      # IB daily TRADES bars, regular trading hours
 SOURCE_YAHOO_UNADJ = "YAHOO_UNADJ"          # Yahoo daily bars, auto_adjust=False
 SOURCE_IB_OPTION_IV = "IB_OPTION_IV"        # IB OPTION_IMPLIED_VOLATILITY daily close/OHLC
+SOURCE_IB_VIX_INDEX = "IB_INDEX_TRADES"    # W91: IB daily TRADES of the CBOE VIX-family indices, stored /100
 SOURCE_UNRECORDED = "UNRECORDED"            # label used when READING NULL source rows
 SOURCE_INVESTING_CSV = "INVESTING_CSV"      # operator-compiled Investing.com economic calendar CSV
 SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of listed options
@@ -442,8 +443,15 @@ class HistoricalDataStore:
                 )
             """)
 
-    def save(self, symbol: str, df: pd.DataFrame, source: str | None = None) -> int:
-        """Save historical data for a symbol. Returns number of rows inserted.
+    def save(self, symbol: str, df: pd.DataFrame, source: str | None = None,
+             overwrite: bool = True) -> int:
+        """Save historical data for a symbol. Returns number of rows passed.
+
+        W91: `overwrite=False` makes the save APPEND-ONLY: a (symbol, date) that is already stored is
+        left exactly as it is (`ON CONFLICT DO NOTHING`), only new dates are inserted. The daily
+        retrain uses it so a stored completed session is never rewritten (a later vendor correction or
+        a different provider can no longer change history under a registered study). Backfill scripts
+        keep the default (explicit overwrite).
 
         W65: `source` tags the OHLCV provider (SOURCE_* constants). None leaves an
         existing tag untouched (COALESCE below), so an untagged older caller can
@@ -476,15 +484,18 @@ class HistoricalDataStore:
             # doesn't carry — so the daily retrain's save() nulled every IV
             # the backfill had written, silently killing the IV/IV-rank
             # features. Upsert only the OHLCV columns instead.
+            on_conflict = (
+                """DO UPDATE SET
+                     open=excluded.open, high=excluded.high,
+                     low=excluded.low, close=excluded.close,
+                     volume=excluded.volume,
+                     source=COALESCE(excluded.source, source)"""
+                if overwrite else "DO NOTHING")
             conn.executemany(
                 f"""INSERT INTO {self._daily_table}
                    (symbol, date, open, high, low, close, volume, source)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(symbol, date) DO UPDATE SET
-                     open=excluded.open, high=excluded.high,
-                     low=excluded.low, close=excluded.close,
-                     volume=excluded.volume,
-                     source=COALESCE(excluded.source, source)""",
+                   ON CONFLICT(symbol, date) {on_conflict}""",
                 rows,
             )
 
@@ -991,6 +1002,20 @@ class HistoricalDataStore:
 
         log.debug("daily_iv_bars_saved", symbol=symbol, rows=len(rows))
         return len(rows)
+
+    def iv_dates_present(self, symbol: str, since: date | str) -> tuple[set[str], set[str]]:
+        """W91: (dates with a daily_iv row, dates whose daily_prices.implied_vol is set), both >= `since`.
+
+        The append-only IV refresh writes only what is missing, so a stored IV reading is never
+        rewritten by a later refresh."""
+        with sqlite3.connect(self._db_path) as conn:
+            bars = {r[0] for r in conn.execute(
+                f"SELECT date FROM {self._daily_iv_table} WHERE symbol = ? AND date >= ?",
+                (symbol, str(since)))}
+            vals = {r[0] for r in conn.execute(
+                f"SELECT date FROM {self._daily_table} WHERE symbol = ? AND date >= ? "
+                f"AND implied_vol IS NOT NULL", (symbol, str(since)))}
+        return bars, vals
 
     def load_daily_iv_bars(
         self,

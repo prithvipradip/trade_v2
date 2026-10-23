@@ -272,7 +272,8 @@ class TestTrainerStoresNoPartialBar:
         df.attrs["source"] = "IB_TRADES_RTH"
         saved = {}
         store = MagicMock()
-        store.save = lambda sym, d, source=None: saved.update(sym=sym, rows=len(d), source=source)
+        store.save = lambda sym, d, source=None, overwrite=True: saved.update(
+            sym=sym, rows=len(d), source=source, overwrite=overwrite)
         md = MagicMock()
         md.get_historical = AsyncMock(return_value=df)
         predictor = MagicMock()
@@ -280,4 +281,4 @@ class TestTrainerStoresNoPartialBar:
         trainer = ModelTrainer(MLConfig(), predictor, md, store)
         monkeypatch.setattr(trainer, "_fetch_market_context", AsyncMock(return_value={}))
         asyncio.run(trainer.train_all_symbols(["QQQ"]))
-        assert saved == {"sym": "QQQ", "rows": 1, "source": "IB_TRADES_RTH"}
+        assert saved == {"sym": "QQQ", "rows": 1, "source": "IB_TRADES_RTH", "overwrite": False}

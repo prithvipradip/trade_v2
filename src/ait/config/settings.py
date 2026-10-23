@@ -934,11 +934,24 @@ class BacktestConfig(_StrictModel):
         description="W65: calendar days of history a research run requests when no "
                     "history_start_date is set (legacy fallback). The walk-forward used to "
                     "fetch only train+test+100 days (528) = 2 windows.")
-    research_table_prefix: str = Field(default="research_", pattern=r"^([a-z][a-z0-9_]*_)?$",
-        description="W65: table prefix of the IB-sourced research history in historical.db "
-                    "(research_daily_prices, research_daily_iv, research_intraday_prices, "
-                    "research_econ_events). Empty = the live tables. Keeps research data in one "
-                    "consistent source and the live tables untouched.")
+    research_table_prefix: str = Field(default="", pattern=r"^([a-z][a-z0-9_]*_)?$",
+        description="W65/W91: table prefix of the history tables research reads in historical.db. Empty (the "
+                    "default since W91) = the ONE set of tables (daily_prices, daily_iv, intraday_prices, "
+                    "econ_events, dividends, ...): live and research share them, every stored row carries its "
+                    "source tag, and the live retrain only appends. A prefix still selects a parallel set "
+                    "(tests use 'test_'). Whether research reads stored history at all is research_history.")
+    research_history: bool = Field(default=False,
+        description="W91: True = research entry points read the stored history tables (IB bars with real volume, "
+                    "IB implied vol, the economic calendar, dividends) instead of the legacy loader "
+                    "(5-minute resample / Yahoo). Before W91 this was implied by a non-empty "
+                    "research_table_prefix; the tables are shared now, so it is its own switch "
+                    "(the research overlay file sets it; the live bot never loads that file). "
+                    "run_backtest.py / run_optimizer.py --legacy-history forces it off for one run.")
+    history_end_date: date | None = Field(default=None,
+        description="W91: research only. Pin the last day a research run may see (inclusive); None = the newest "
+                    "stored day. The history tables are shared with the live bot and grow every day, so a "
+                    "registered study pins this to keep its inputs fixed; the run record stores it and the "
+                    "data fingerprint hashes the closes up to it.")
     default_symbols: list[str] = Field(default=["QQQ"], min_length=1, max_length=20,
         description="W87a: the symbols a research entry point (run_backtest.py, run_optimizer.py) runs when "
                     "--symbols is not given. QQQ because it is the one symbol with the historical option "

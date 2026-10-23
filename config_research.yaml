@@ -30,11 +30,12 @@ backtest:
                                        # (IronCondor.affordable_width, $1 floor when capped) and rejects a
                                        # structure whose max loss exceeds the budget.
 
-  # --- W65: research history (IB-sourced research_* tables; live tables are never written) ---
+  # --- W65/W91: research history (stored IB history in the shared tables; the retrain only appends) ---
   history_start_date: 2024-01-01       # first day of the operator's economic-calendar CSV, so the research
                                        # macro gate is ON in every window. Wins over history_days.
   history_days: 1826                   # legacy fallback span (no start date)
-  research_table_prefix: research_
+  research_history: true               # W91: read the stored history tables (was implied by research_table_prefix);
+                                       # research_table_prefix is "" now = the one shared set of tables
   vlmc_min_coverage: 0.95              # 5-min day coverage required to train with VLMC/intraday-fractal features
   macro_event_types: [FOMC, CPI, NFP, PCE, GDP]   # = live's five, for parity
 

@@ -79,8 +79,10 @@ def parse_args() -> argparse.Namespace:
                         "account.capital (W-capital: the single home).")
     p.add_argument("--optimize-ml", action="store_true", help="Also search ML hyperparameter spaces")
     p.add_argument("--table-prefix", default=None,
-                   help="Research table prefix (default: config backtest.research_table_prefix). "
-                        "Pass '' for the legacy loader / live tables.")
+                   help="History table prefix (default: config backtest.research_table_prefix, '' = the one "
+                        "shared set of tables since W91).")
+    p.add_argument("--legacy-history", action="store_true",
+                   help="W91: use the legacy loader (5-min resample / Yahoo) for this run.")
     p.add_argument("--db-path", default="data/historical.db",
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--storage", type=str, default=None, help="Optuna storage URL, e.g. sqlite:///data/optuna.db")
@@ -179,20 +181,21 @@ def main() -> None:
         _bcfg = None
     _prefix = (args.table_prefix if args.table_prefix is not None
                else (_bcfg.research_table_prefix if _bcfg else ""))
+    _research = (not args.legacy_history) and (bool(_prefix) or bool(_bcfg and _bcfg.research_history))   # W91
     _calendar = None
-    if _prefix and _bcfg is not None:
+    if _research and _bcfg is not None:
         from ait.data.economic_calendar import build_research_calendar
         try:
             _calendar = build_research_calendar(Path(args.db_path), _prefix, _bcfg.macro_event_types)
         except Exception as _exc:  # noqa: BLE001
             print(f"  ! research calendar unavailable ({_exc}); hardcoded calendar used")
-    print(f"  History:     {'research tables ' + _prefix + '* in ' + args.db_path if _prefix else 'legacy loader'}"
+    print(f"  History:     {'stored history tables ' + _prefix + '* in ' + args.db_path if _research else 'legacy loader'}"
           f"{' | research macro calendar' if _calendar else ''}")
 
     optimizer = StrategyOptimizer(
         table_prefix=_prefix,
-        db_path=(Path(args.db_path) if _prefix else None),
-        history_start_date=(_bcfg.history_start_date if (_bcfg and _prefix) else None),
+        db_path=(Path(args.db_path) if _research else None),
+        history_start_date=(_bcfg.history_start_date if (_bcfg and _research) else None),
         economic_calendar=_calendar,
         symbols=args.symbols,
         strategies=args.strategies,

@@ -863,7 +863,8 @@ class StrategyOptimizer:
                 df = load_daily_ohlcv(
                     symbol, days=fetch_days, db_path=self._db_path,
                     table_prefix=self._table_prefix, start_date=self._history_start_date,
-                ) if self._table_prefix else load_daily_ohlcv(symbol, days=fetch_days)
+                    research=True,
+                ) if self._db_path is not None else load_daily_ohlcv(symbol, days=fetch_days)   # W91: research = a db_path was given
                 if len(df) > 0:
                     df = df.tail(requested_days)
                     if len(df) >= _MIN_BACKTEST_ROWS:

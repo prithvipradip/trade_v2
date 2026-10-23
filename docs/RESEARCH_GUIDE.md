@@ -16,9 +16,11 @@ How research mode works, what it contains, and how to run and read a study. Shor
 **What is it?** An offline simulator of the iron-condor strategy. It replays history, trades it the way the bot would,
 and reports what happened. It is how changes are tested before they are promoted to the live bot.
 
-**What does it read?** Historical data in `data/historical.db` (the `research_*` tables: daily prices, daily IV,
-5-minute bars, the economic calendar, dividends, option spreads), plus `config.yaml`, `config_research.yaml` and an
-optional study file.
+**What does it read?** Historical data in `data/historical.db` (since W91 the ONE shared set of tables, no `research_`
+prefix: daily prices, daily IV, 5-minute bars, the economic calendar, dividends, earnings, QQQ holdings, option
+bars and spreads; see "Where each field comes from" below), plus `config.yaml`, `config_research.yaml` and an
+optional study file. `backtest.research_history: true` (research overlay) selects the stored-history path;
+`backtest.history_end_date` pins the last day a study may see (the tables grow every day).
 
 **What does it never touch?** The broker, `data/ait_state.db`, `data/ait_analytics.duckdb`, and the live model files in
 `models/`. It writes only run records under `reports/runs/`, a research model sandbox under `models/research/`, and (if MLflow is installed) the MLflow database `data/mlflow.db`.
@@ -28,6 +30,26 @@ The live bot never loads `config_research.yaml`; a test enforces that.
 cost and fill assumptions". See [13 Known limits](#13-known-limits).
 
 ---
+
+### Where each field comes from (one source per field, W91)
+
+Every stored row carries its source tag; the retrain only appends completed days and never rewrites a stored one.
+
+| Field | Table | Source tag | Written by |
+|---|---|---|---|
+| Underlying daily OHLCV (SPY, QQQ, IWM) | `daily_prices` | `IB_TRADES_RTH` | daily retrain (append-only), `backfill_historical_data.py --mode daily` |
+| Daily implied vol (close) | `daily_prices.implied_vol` | `IB_OPTION_IV` | `ait.data.iv_refresh` (retrain, `--mode iv`), the bot for today |
+| Daily implied vol (OHLC) | `daily_iv` | `IB_OPTION_IV` | `ait.data.iv_refresh` |
+| VIX, VIX3M, VIX6M, VIX9D (/100) | `daily_iv` | `IB_INDEX_TRADES` | `ait.data.iv_refresh`, `--mode vix` |
+| 5-minute bars | `intraday_prices` | `TRADES` | the bot, `backfill_historical_data.py` |
+| Option daily bars + solved IV/greeks | `option_daily_bars` | Polygon | `backfill_option_history.py` |
+| Option bid/ask spreads | `option_spread_*`, `option_leg_spread_*` | `IB_BID_ASK_BARS` | `calibrate_option_spreads.py` |
+| Dividends | `dividends` | `YAHOO_DIVIDENDS` | `backfill_dividends.py` |
+| Earnings dates, QQQ holdings, econ schedule | `earnings_schedule`, `qqq_holdings`, `econ_schedule` | EDGAR / Fed / BLS tags | `build_research_calendars.py` |
+| Economic events | `econ_events` | `INVESTING_CSV` | `load_econ_calendar_csv.py` |
+
+Rows from before the source tags (old retired symbols in `daily_prices`) carry `NULL`; nothing new is written
+untagged. `scripts/unify_history_tables.py` merged the old `research_*` copies into these tables (W91).
 
 ## 2. The pieces
 
@@ -49,7 +71,8 @@ cost and fill assumptions". See [13 Known limits](#13-known-limits).
 ## 3. What one run does
 
 1. **Load config.** `config.yaml` + `config_research.yaml` (+ the study file, if given), merged and validated.
-2. **Load data.** Daily bars and IV for each symbol from the `research_*` tables, from `backtest.history_start_date`.
+2. **Load data.** Daily bars and IV for each symbol from the shared history tables, from `backtest.history_start_date`
+   (to `backtest.history_end_date` when pinned).
 3. **Cut windows.** Default: train 365 days, a 5-day purge gap, test 63 days, step 63 days (non-overlapping tests).
 4. **For each window:**
    1. Train the models on the training slice only: direction ensemble, range model, meta-labeler ([section 6](#6-the-models)).

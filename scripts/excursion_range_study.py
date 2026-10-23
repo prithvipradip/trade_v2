@@ -73,6 +73,8 @@ def load_inputs(db: Path, symbols) -> dict:
     loaded and prints its size (a silent empty join must not read as a result)."""
     from ait.backtesting.replay import ResearchData
 
+    # W91: the research_* tables were merged into the shared tables (scripts/unify_history_tables.py; rows verified
+    # identical), so the calendars, holdings and dividends are read un-prefixed.
     out = {"prices": {}, "dividends": {}}
     for s in symbols:
         f = ResearchData(str(db), s).daily_frame()
@@ -81,13 +83,13 @@ def load_inputs(db: Path, symbols) -> dict:
     with _ro(db) as c:
         vix = pd.read_sql_query("SELECT symbol, date, iv_close FROM daily_iv WHERE symbol IN "
                                 "('VIX','VIX3M','VIX9D')", c)
-        out["econ"] = pd.read_sql_query("SELECT event_date, event FROM research_econ_schedule", c)
-        out["holdings"] = pd.read_sql_query("SELECT filed_date, company_key, weight FROM research_qqq_holdings "
+        out["econ"] = pd.read_sql_query("SELECT event_date, event FROM econ_schedule", c)
+        out["holdings"] = pd.read_sql_query("SELECT filed_date, company_key, weight FROM qqq_holdings "
                                             "WHERE company_key IS NOT NULL", c)
-        out["earnings"] = pd.read_sql_query("SELECT company_key, event_session FROM research_earnings_schedule", c)
+        out["earnings"] = pd.read_sql_query("SELECT company_key, event_session FROM earnings_schedule", c)
         for s in symbols:
             out["dividends"][s] = pd.read_sql_query(
-                "SELECT ex_date, amount FROM research_dividends WHERE symbol=? ORDER BY ex_date", c, params=(s,))
+                "SELECT ex_date, amount FROM dividends WHERE symbol=? ORDER BY ex_date", c, params=(s,))
     v = vix.pivot(index="date", columns="symbol", values="iv_close")
     v.index = pd.to_datetime(v.index)
     out["vix"] = v

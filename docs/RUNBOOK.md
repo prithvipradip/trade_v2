@@ -536,10 +536,10 @@ python scripts/parity_replay.py                 # reads data/replay/manual_trade
   `last_k_days` (a real ex-date within `backtest.ex_div_entry_k_days`, default 5, of expiry). The
   schema default is `off`; `config_research.yaml` sets `live`. The manifest warns whenever research
   differs from live (`ex_div_entry:`); the registry row is a live twin.
-- **Data.** The gate reads `research_dividends` in `data/historical.db`; any mode but `off` raises
-  without it. Refresh it (yfinance; prints per-year counts and off-cycle gaps; writes
-  `reports/dividends_audit_<date>.json`; a non-empty prefix is required):
-  `python scripts/backfill_dividends.py --symbols QQQ SPY IWM --table-prefix research_ [--dry-run]`.
+- **Data.** The gate reads the `dividends` table in `data/historical.db` (the shared set, W91); any mode but `off`
+  raises without it. Refresh it (yfinance; prints per-year counts and off-cycle gaps; writes
+  `reports/dividends_audit_<date>.json`):
+  `python scripts/backfill_dividends.py --symbols QQQ SPY IWM [--dry-run]`.
   Re-run it before a study that ends after the last stored ex-date.
 - **Measure it:** `python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]`
   (read-only; about 15 minutes for 36 runs). Real engine runs, so a blocked entry frees its slot.
@@ -653,3 +653,26 @@ switch or backup is a hope, not a control.
       (startup asserts this in live mode and will refuse to run otherwise)
 - [ ] simulated capital OFF: `account.simulate_live_capital: false` in config.yaml (W63; was `AIT_SIMULATED_CAPITAL` in .env — also make sure no `AIT_SIMULATED_CAPITAL` override remains in .env); account funded $3k CAD
 - [ ] Fresh DB backup taken; PLAN.md gates re-read
+
+
+## History tables: one set, one source per field (W91)
+
+`data/historical.db` used to keep the same history twice (un-prefixed "live" tables and `research_*` twins). Since W91
+there is ONE set; research reads it through `backtest.research_history: true` (research overlay) and
+`research_table_prefix: ""`. See `docs/RESEARCH_GUIDE.md` ("Where each field comes from") for the source of every field.
+
+- **The retrain is append-only** (`HistoricalDataStore.save(overwrite=False)`): a stored completed session is never
+  rewritten; today's partial bar is never stored. Backfill scripts overwrite only when you run them.
+- **Implied vol stays fresh without a new job:** the 07:30 ET retrain, after its IB pre-flight, runs
+  `ait.data.iv_refresh` for the universe and the VIX family (`iv_refresh QQQ:+2->2026-10-22 ...` in `retrain_*.log`). A
+  failure there is a WARNING, not a failed retrain; the next run fills the gap. Catch up by hand:
+  `python scripts/backfill_historical_data.py --symbols QQQ SPY IWM --mode iv --years 1`, and the VIX family:
+  `--mode vix --symbols VIX --years 8`.
+- **Studies pin an end date:** `backtest.history_end_date` (a study file or the overlay). The run record stores it and the
+  data fingerprint hashes the closes up to it.
+- **The merge tool** (`scripts/unify_history_tables.py`): dry run by default; `--apply` backs up, merges (additive,
+  research rows win on overlap, live-only rows kept) and verifies; `--verify` re-checks any time; `--archive` renames
+  `research_X` to `archive_w91_research_X` (refused unless verification passes); `--drop-archives` drops them. It
+  refuses to write the real database while the supervisor/bot runs (`--allow-running` overrides). Order: merge, merge
+  the code and restart the supervisor, one clean retrain and a research run, THEN archive, THEN drop. Do not run it
+  during the Sunday 20:00 weekly backtest or an option-history refresh.

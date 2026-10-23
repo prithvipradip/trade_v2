@@ -41,7 +41,9 @@ def _series(symbol: str, db: Path):
     from ait.data.iv_rank import iv_rank_series
     from ait.ml.features import FeatureEngine
 
-    frame = ResearchData(str(db), symbol).daily_frame()
+    # W91: this W71 probe compares the research_* table with the live one; after the tables were merged the two are
+    # identical by construction, so it only has meaning on a database that still has both sets.
+    frame = ResearchData(str(db), symbol, prefix="research_").daily_frame()
     research_iv = frame["implied_vol"]
     with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
         live = pd.read_sql_query(

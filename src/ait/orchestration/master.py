@@ -1561,6 +1561,14 @@ async def train():
         if missing:
             print(f"[retrain] ABORTED before any write: no IB daily history for {missing}", flush=True)
             sys.exit(3)
+        # W91: refresh the implied-vol history from the same IB session (daily_iv + daily_prices.implied_vol
+        # + the VIX family), append-only. Training does not need it, so a failure here never aborts.
+        try:
+            from ait.data.iv_refresh import refresh_daily_iv, summary_line
+            _iv = await refresh_daily_iv(ibkr.ib, historical, symbols)
+            print("[retrain] " + summary_line(_iv), flush=True)
+        except Exception as e:
+            print(f"[retrain] iv_refresh skipped: {type(e).__name__}: {e}", flush=True)
         trainer = ModelTrainer(
             settings.ml, predictor, market_data, historical,
             range_predictor=range_pred,

@@ -211,7 +211,7 @@ class TestResearchData:
     def test_reads_are_correct_and_never_modify_the_file(self, tmp_path):
         db = _make_db(tmp_path / "h.db")
         before = hashlib.sha256(db.read_bytes()).hexdigest()
-        d = rp.ResearchData(db, "qqq")
+        d = rp.ResearchData(db, "qqq", prefix="research_")
         row = d.session_row(date(2026, 8, 17))
         assert row is not None and row["Close"] > 0
         iv_same = d.stored_iv(date(2026, 8, 17))
@@ -225,11 +225,11 @@ class TestResearchData:
     def test_missing_db_is_an_error_not_a_new_empty_file(self, tmp_path):
         ghost = tmp_path / "nope.db"
         with pytest.raises(sqlite3.OperationalError):
-            rp.ResearchData(ghost, "QQQ").daily_frame()
+            rp.ResearchData(ghost, "QQQ", prefix="research_").daily_frame()
         assert not ghost.exists()
 
     def test_bar_containment_boundaries(self, tmp_path):
-        d = rp.ResearchData(_make_db(tmp_path / "h.db"), "QQQ")
+        d = rp.ResearchData(_make_db(tmp_path / "h.db"), "QQQ", prefix="research_")
         inside = d.bar_containing(datetime(2026, 8, 17, 9, 32, 59, tzinfo=ET))      # 13:32:59Z -> 13:30 bar
         assert inside is not None and inside["open"] == pytest.approx(100.0)
         nxt = d.bar_containing(datetime(2026, 8, 17, 9, 35, 0, tzinfo=ET))           # exactly the next bar
@@ -242,7 +242,7 @@ class TestResearchData:
         c = sqlite3.connect(db)
         c.execute("DELETE FROM research_intraday_prices WHERE datetime = '2026-08-17T13:35:00+00:00'")
         c.commit(); c.close()
-        d = rp.ResearchData(db, "QQQ")
+        d = rp.ResearchData(db, "QQQ", prefix="research_")
         # 09:35:00 ET is exactly 5:00 after the 13:30Z bar started: that bar's
         # interval is half-open, so the instant is NOT inside it (bar missing).
         assert d.bar_containing(datetime(2026, 8, 17, 9, 35, 0, tzinfo=ET)) is None
@@ -257,7 +257,7 @@ class TestResearchData:
             d.bar_containing(ENTRY)
 
     def test_no_leg_model_returns_none(self, tmp_path):
-        d = rp.ResearchData(_make_db(tmp_path / "h.db", with_leg_model=False), "QQQ")
+        d = rp.ResearchData(_make_db(tmp_path / "h.db", with_leg_model=False), "QQQ", prefix="research_")
         assert d.leg_spread_model() is None
 
 
@@ -297,7 +297,7 @@ class TestImpliedVol:
 class TestEntryReplay:
     def _setup(self, tmp_path, friction=None):
         db = _make_db(tmp_path / "h.db")
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         # make the 'actual' fills equal to what the clean model predicts, so error == 0
         probe = _condor(ENTRY, EXPIRY)
         e = rp.entry_replay(probe, data, P, friction)["clean"]
@@ -340,7 +340,7 @@ class TestEntryReplay:
 
     def test_missing_intraday_bar_degrades_clean_only(self, tmp_path):
         db = _make_db(tmp_path / "h.db")
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         t = _condor(datetime(2026, 8, 18, 10, 0, tzinfo=ET), EXPIRY)   # no bars that day
         res = rp.entry_replay(t, data, P, None)
         assert res["clean"] is None and res["engine"] is not None
@@ -355,7 +355,7 @@ class TestEntryReplay:
 class TestExitReplay:
     def test_value_error_sign_and_calendar_engine_variant_suppressed(self, tmp_path):
         db = _make_db(tmp_path / "h.db")
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         when = datetime(2026, 8, 17, 14, 0, tzinfo=ET)
         t = _condor(ENTRY, EXPIRY, closed_at=when, close_px=(0.5, 0.4, 0.05, 0.05))
         entry = rp.entry_replay(t, data, P, None)
@@ -373,7 +373,7 @@ class TestExitReplay:
         assert cex["engine"] is None
 
     def test_not_applicable_when_legs_closed_at_expiry_or_open(self, tmp_path):
-        data = rp.ResearchData(_make_db(tmp_path / "h.db"), "QQQ")
+        data = rp.ResearchData(_make_db(tmp_path / "h.db"), "QQQ", prefix="research_")
         t = _condor(ENTRY, EXPIRY, still_open=True)
         assert rp.exit_replay(t, data, P, None, rp.entry_replay(t, data, P, None)) is None
 
@@ -408,7 +408,7 @@ class TestEngineExitScan:
         entry = datetime.combine(days[40].date(), datetime.min.time(), tzinfo=ET).replace(hour=10)
         expiry = days[40].date() + timedelta(days=30)
         t = _condor(entry, expiry, strikes=(104, 96, 107, 93))
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         e = rp.entry_replay(t, data, P, None)
         before = hashlib.sha256(db.read_bytes()).hexdigest()
         scan = rp.engine_exit_scan(t, data, e)
@@ -426,7 +426,7 @@ class TestEngineExitScan:
         c.commit(); c.close()
         entry = datetime.combine(days[40].date(), datetime.min.time(), tzinfo=ET).replace(hour=10)
         t = _condor(entry, days[40].date() + timedelta(days=30), strikes=(104, 96, 107, 93))
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         scan = rp.engine_exit_scan(t, data, rp.entry_replay(t, data, P, None))
         assert scan["engine_exit_date"] != days[40].strftime("%Y-%m-%d")
         assert scan["engine_exit_reason"] != "touch_stop"
@@ -438,7 +438,7 @@ class TestEngineExitScan:
         expiry = days[40].date() + timedelta(days=14)
         # actual credit so rich that 50% take-profit is unreachable at flat prices
         t = _condor(entry, expiry, legs_px=(4.0, 4.0, 0.1, 0.1), strikes=(104, 96, 107, 93))
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         scan = rp.engine_exit_scan(t, data, rp.entry_replay(t, data, P, None))
         # DTE <= EXPIRY_APPROACHING_DTE (5) on the first session with <= 5 calendar days left
         assert scan["engine_exit_reason"] in ("expiry_approaching", "take_profit_short")
@@ -452,7 +452,7 @@ class TestEngineExitScan:
         db, days = self._data_with_path(tmp_path, [100.0] * 70)
         entry = datetime.combine(days[40].date(), datetime.min.time(), tzinfo=ET).replace(hour=10)
         t = _condor(entry, days[40].date() + timedelta(days=21))
-        data = rp.ResearchData(db, "QQQ")
+        data = rp.ResearchData(db, "QQQ", prefix="research_")
         rp.engine_exit_scan(t, data, rp.entry_replay(t, data, P, None))
         assert "AIT_BT_CALIBRATED_SPREADS" not in os.environ
         monkeypatch.setenv("AIT_BT_CALIBRATED_SPREADS", "1")

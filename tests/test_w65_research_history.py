@@ -203,9 +203,10 @@ class TestWalkForwardHistory:
         import ait.data.market_data as md
         calls = []
 
-        def _fake(symbol, days=730, db_path=None, table_prefix="", start_date=None):
+        def _fake(symbol, days=730, db_path=None, table_prefix="", start_date=None,
+                  end_date=None, research=None):
             calls.append(dict(symbol=symbol, days=days, table_prefix=table_prefix,
-                              start_date=start_date))
+                              start_date=start_date, research=research))
             return _ohlcv("2023-06-01", 700)
 
         monkeypatch.setattr(md, "load_daily_ohlcv", _fake)
@@ -213,6 +214,7 @@ class TestWalkForwardHistory:
         bt = _wf(tmp_path, history_start_date=start)
         data = await bt._fetch_data()
         assert {c["table_prefix"] for c in calls} == {"research_"}
+        assert {c["research"] for c in calls if c["symbol"] != "^VIX"} == {True}     # W91: a db_path = research
         assert all(c["start_date"] == start for c in calls)
         assert all(c["days"] >= (today_et() - start).days + 30 for c in calls)
         assert all(df.index[0] >= pd.Timestamp(start) for df in data.values())  # trimmed
@@ -280,7 +282,8 @@ class TestConfigKeys:
         from ait.config.research import load_research_settings
         b = load_research_settings(str(ROOT / "config.yaml")).backtest
         assert b.history_start_date == date(2024, 1, 1)
-        assert b.research_table_prefix == "research_"
+        assert b.research_table_prefix == ""          # W91: the one shared set of tables
+        assert b.research_history is True
         assert b.macro_event_types == ["FOMC", "CPI", "NFP", "PCE", "GDP"]
         assert b.vlmc_min_coverage == pytest.approx(0.95)
 
@@ -333,12 +336,14 @@ class TestBackfillDailyMode:
         a = mod._parse_args(["--symbols", "SPY", "--mode", "research", "--table-prefix", "research_"])
         assert a.mode == "research" and a.allow_live_tables is False
 
-    def test_daily_modes_refuse_the_live_table_by_default(self, tmp_path):
+    def test_daily_modes_no_longer_refuse_the_shared_table(self, tmp_path):
+        """W91: the W65 guard is gone (an empty prefix IS the one shared set of tables); the run now gets as far
+        as needing IB, so a --dry-run returns 0 instead of the old exit code 2."""
         mod = _load_script("backfill_historical_data")
         for mode in ("daily", "research"):
             a = mod._parse_args(["--symbols", "SPY", "--mode", mode, "--db-path",
-                                 str(tmp_path / "h.db")])
-            assert asyncio.run(mod._main(a)) == 2
+                                 str(tmp_path / "h.db"), "--dry-run"])
+            assert asyncio.run(mod._main(a)) == 0
 
     async def test_ib_bars_land_only_in_the_prefixed_table_with_a_source_tag(self, tmp_path, monkeypatch):
         mod = _load_script("backfill_historical_data")
@@ -490,9 +495,12 @@ class TestEconomicCalendar:
         assert Backtester(data=df, strategies=["iron_condor"], economic_calendar=cal)._economic_cal is cal
         assert isinstance(Backtester(data=df, strategies=["iron_condor"])._economic_cal, EconomicCalendar)
 
-    def test_ingest_refuses_the_live_table_without_the_flag(self, csv_path, tmp_path):
+    def test_ingest_writes_the_shared_table_without_a_flag(self, csv_path, tmp_path):
+        """W91: the empty-prefix guard is gone; the un-prefixed econ_events is the one shared table."""
         mod = _load_script("load_econ_calendar_csv")
-        assert mod.main(["--csv", str(csv_path), "--db-path", str(tmp_path / "h.db")]) == 2
+        assert mod.main(["--csv", str(csv_path), "--db-path", str(tmp_path / "h.db")]) == 0
+        with sqlite3.connect(tmp_path / "h.db") as c:
+            assert c.execute("SELECT COUNT(*) FROM econ_events").fetchone()[0] > 0
 
     def test_walkforward_trims_data_to_the_calendar_span_and_builds_it(self, csv_path, tmp_path):
         mod = _load_script("load_econ_calendar_csv")
@@ -643,7 +651,7 @@ class TestTrainerPersistsTheProvider:
         saved = []
 
         class _Store:
-            def save(self, symbol, df, source=None):
+            def save(self, symbol, df, source=None, overwrite=True):
                 saved.append((symbol, source))
 
         class _MD:
@@ -721,7 +729,7 @@ class TestOptimizerResearchSupport:
         import ait.data.market_data as md
         seen = []
         monkeypatch.setattr(md, "load_daily_ohlcv", lambda s, days=730, db_path=None,
-                            table_prefix="", start_date=None:
+                            table_prefix="", start_date=None, end_date=None, research=None:
                             seen.append((table_prefix, start_date)) or _ohlcv("2024-01-02", 300))
         o = self._opt(5_000, table_prefix="research_", db_path=tmp_path / "h.db",
                       history_start_date=date(2024, 1, 1))

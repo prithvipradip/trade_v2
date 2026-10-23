@@ -9,10 +9,11 @@ Modes:
   --mode both         — run intraday then iv
   --mode daily        — (W65) daily TRADES bars with REAL volume into {prefix}daily_prices,
                         source-tagged IB_TRADES_RTH (Yahoo YAHOO_UNADJ only as a whole-symbol
-                        fallback). Requires --table-prefix (IB volume is ~0.64-0.71x the
-                        stored Polygon/Yahoo volume, so it must never be spliced into the
-                        live table; --allow-live-tables overrides explicitly)
+                        fallback). W91: writes the one shared set of tables by default
+                        (--allow-live-tables is a deprecated no-op)
   --mode research     — (W65) daily then iv, i.e. the research history in one pass
+  --mode vix          — (W91) daily TRADES of the CBOE VIX-family indices (VIX, VIX3M, VIX6M, VIX9D, stored /100)
+                        into daily_iv, source IB_INDEX_TRADES (--symbols is ignored; --years of history)
 
 Usage:
     # Seed QQQ 5-min bars for the last 2 years:
@@ -70,7 +71,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode", default="intraday",
-        choices=["intraday", "iv", "iv-intraday", "both", "daily", "research"],
+        choices=["intraday", "iv", "iv-intraday", "both", "daily", "research", "vix"],
         help="What to backfill: 5-min bars, daily IV, 5-min IV, both (intraday+iv), "
              "daily TRADES bars (W65), or research (daily+iv) (default: intraday).",
     )
@@ -118,8 +119,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--allow-live-tables", action="store_true",
-        help="W65: permit --mode daily/research with an EMPTY --table-prefix (writes IB "
-             "daily bars into the LIVE daily_prices table). Off by default.",
+        help="W65, DEPRECATED no-op since W91 (an empty --table-prefix writes the one shared set of tables).",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -245,6 +245,42 @@ async def _backfill_intraday_symbol(
 # Daily IV backfill
 # ---------------------------------------------------------------------------
 
+async def _backfill_vix(ib, store, years: float, pause_secs: float, dry_run: bool) -> int:
+    """W91: daily TRADES of the CBOE VIX-family indices (stored /100) into daily_iv, source IB_INDEX_TRADES.
+
+    One 1-year request per index per year; explicit backfill = overwrite (append_only=False)."""
+    import pandas as pd
+
+    from ait.data.iv_refresh import VIX_FAMILY, fetch_index_levels, store_index_levels
+    from ait.utils.time import now_et
+
+    total = 0
+    for sym in VIX_FAMILY:
+        frames = []
+        for y in range(int(max(1, math.ceil(years)))):
+            end = (datetime.now(tz=timezone.utc) - timedelta(days=y * 365)).strftime("%Y%m%d %H:%M:%S") + " UTC"
+            print(f"  [{sym}] vix chunk {y + 1}: 1 Y ending {end}", end="", flush=True)
+            if dry_run:
+                print(" [DRY RUN]")
+                continue
+            try:
+                df = await fetch_index_levels(ib, sym, "1 Y", end)
+            except Exception as e:  # noqa: BLE001
+                print(f" ERROR: {e}")
+                continue
+            print(f" -> {len(df)} bars")
+            if len(df):
+                frames.append(df)
+            time.sleep(pause_secs)
+        if frames and not dry_run:
+            full = pd.concat(frames).sort_index()
+            full = full[~full.index.duplicated(keep="first")]
+            n = store_index_levels(store, sym, full, append_only=False, now=now_et())
+            print(f"  [{sym}] vix: {n} daily_iv rows stored")
+            total += n
+    return total
+
+
 async def _backfill_iv_symbol(
     ib,
     symbol: str,
@@ -266,7 +302,10 @@ async def _backfill_iv_symbol(
     Returns the number of daily_prices rows updated.
     """
     import pandas as pd
-    from ib_insync import Stock, util
+    from ib_insync import Stock
+
+    from ait.data.iv_refresh import parse_ohlc_bars, store_option_iv
+    from ait.utils.time import now_et
 
     contract = Stock(symbol, "SMART", "USD")
     try:
@@ -281,8 +320,7 @@ async def _backfill_iv_symbol(
 
     # IBKR allows up to 1 Y per request for daily IV; chunk by year
     total_years = int(max(1, years))
-    all_iv: dict[str, float] = {}
-    all_ohlc: dict[str, tuple[float, float, float, float]] = {}
+    frames = []
 
     for year_idx in range(total_years):
         end_dt = datetime.now(tz=timezone.utc) - timedelta(days=year_idx * 365)
@@ -317,45 +355,24 @@ async def _backfill_iv_symbol(
             print(" 0 bars")
             continue
 
-        df = util.df(bars)
         # OPTION_IMPLIED_VOLATILITY bars are OHLC (start/high/low/last IV,
-        # decimals e.g. 0.25 = 25%), same as a price bar — not a scalar.
-        if {"date", "open", "high", "low", "close"}.issubset(df.columns):
-            for _, row in df.iterrows():
-                try:
-                    date_str = str(row["date"])[:10]
-                    o, h, l, c = (float(row["open"]), float(row["high"]),
-                                  float(row["low"]), float(row["close"]))
-                    if c > 0:
-                        all_iv[date_str] = c
-                        all_ohlc[date_str] = (o, h, l, c)
-                except (ValueError, TypeError):
-                    continue
-
+        # decimals e.g. 0.25 = 25%), same as a price bar -- not a scalar.
+        frames.append(parse_ohlc_bars(bars))
         print(f" → {len(bars)} bars fetched")
 
         if year_idx < total_years - 1:
             time.sleep(pause_secs)
 
-    if (not all_iv) or dry_run:
+    if (not frames) or dry_run:
         return 0
 
-    # Close-only series feeds the live daily_prices.implied_vol / IV-rank path.
-    iv_series = pd.Series(all_iv, name="implied_vol")
-    iv_series.index = pd.to_datetime(iv_series.index)
-    iv_series = iv_series.sort_index()
-
-    # Full OHLC feeds the dedicated daily_iv table.
-    ohlc_df = pd.DataFrame.from_dict(
-        all_ohlc, orient="index", columns=["Open", "High", "Low", "Close"],
-    )
-    ohlc_df.index = pd.to_datetime(ohlc_df.index)
-    ohlc_df.sort_index(inplace=True)
-    bars_stored = store.save_daily_iv_bars(symbol, ohlc_df, source=SOURCE_IB_OPTION_IV)
+    # W91: one writer (ait.data.iv_refresh): full OHLC -> daily_iv, close -> daily_prices.implied_vol;
+    # today's mid-session bar is never stored. Explicit backfill = overwrite (append_only=False).
+    ohlc_df = pd.concat(frames).sort_index()
+    ohlc_df = ohlc_df[~ohlc_df.index.duplicated(keep="first")]
+    bars_stored, updated = store_option_iv(store, symbol, ohlc_df, append_only=False, now=now_et())
     print(f"  [{symbol}] iv: {bars_stored} daily_iv OHLC rows stored")
-
-    updated = store.save_daily_iv(symbol, iv_series, source=SOURCE_IB_OPTION_IV)
-    print(f"  [{symbol}] iv: {len(all_iv)} values fetched, {updated} daily_prices rows updated")
+    print(f"  [{symbol}] iv: {len(ohlc_df)} values fetched, {updated} daily_prices rows updated")
     return updated
 
 
@@ -612,12 +629,10 @@ async def _main(args: argparse.Namespace) -> int:
     do_iv_intraday = args.mode == "iv-intraday"
     do_daily = args.mode in ("daily", "research")
 
-    # W65 guard: IB daily volume is ~0.64-0.71x the stored (Polygon/Yahoo) volume, so
-    # daily bars must never be spliced into the live table by accident.
-    if do_daily and not args.table_prefix and not args.allow_live_tables:
-        print("ERROR: --mode daily/research needs a non-empty --table-prefix "
-              "(e.g. research_); pass --allow-live-tables to write the LIVE table.")
-        return 2
+    # W91: the W65 guard (IB volume is ~0.64-0.71x the old stored volume, so IB bars must not be spliced into
+    # the live table) is gone: the live window is IB since W89 and scripts/unify_history_tables.py replaced the
+    # older rows with IB ones, so the shared tables hold ONE source per field. --allow-live-tables is kept as an
+    # accepted no-op.
 
     intraday_chunks = (
         _build_chunks(args.years, args.chunk_months)
@@ -648,6 +663,9 @@ async def _main(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print("[DRY RUN — no IBKR calls will be made]")
+        if args.mode == "vix":
+            asyncio.run(_backfill_vix(None, None, args.years, args.pause_secs, True))
+            return 0
         for sym in args.symbols:
             if do_intraday or do_iv_intraday:
                 for i, (end_dt, dur) in enumerate(intraday_chunks, 1):
@@ -681,6 +699,12 @@ async def _main(args: argparse.Namespace) -> int:
     print("Connected. Starting backfill...\n")
     t_start = time.time()
     grand_total = 0
+
+    if args.mode == "vix":          # W91: the VIX-family indices, not --symbols
+        n = await _backfill_vix(ib, store, args.years, args.pause_secs, False)
+        ib.disconnect()
+        print(f"\nDone. {n} daily_iv rows written for the VIX family in {time.time() - t_start:.1f}s.")
+        return 0
 
     for sym in args.symbols:
         print(f"\n=== {sym} ===")
