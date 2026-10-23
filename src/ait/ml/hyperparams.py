@@ -30,11 +30,19 @@ TREE_BASE: dict = TreeHyperparamsConfig().model_dump()
 XGB_COMMON: dict = {"verbosity": 0, "n_jobs": -1}
 LGBM_COMMON: dict = {"verbose": -1, "n_jobs": -1, "class_weight": "balanced", "deterministic": True}
 
-# Binary predictors (range, vol-magnitude): the share of rows that must be the positive class for the
-# label to be usable, and the minimum rows of the minority class. Warning-only guards, formerly copied.
-POSITIVE_RATE_MIN: float = 0.05
-POSITIVE_RATE_MAX: float = 0.98
-MIN_CLASS_SAMPLES: int = 10
+# Binary predictors (range, vol-magnitude): the share of rows that must be the positive class for the label to be usable
+# (warning only) and the minimum rows of each class (hard). W90d: these were module constants here (0.05 / 0.98 / 10);
+# they are ``ml.label_balance_min`` / ``ml.label_balance_max`` / ``ml.min_class_samples`` and the predictors read them
+# through ``label_balance_limits``.
+
+
+def label_balance_limits(ml=None) -> tuple[float, float, int]:
+    """``(positive-rate floor, positive-rate ceiling, minimum rows per class)`` of the binary models, from ``ml`` (an
+    ``MLConfig``) or the loaded settings, else the schema defaults."""
+    if ml is None:
+        from ait.config.settings import loaded_ml_config
+        ml = loaded_ml_config()
+    return float(ml.label_balance_min), float(ml.label_balance_max), int(ml.min_class_samples)
 
 
 def default_hyperparams() -> TreeHyperparamsConfig:

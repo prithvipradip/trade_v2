@@ -321,24 +321,6 @@
    ],
    "category": "structural"
   },
-  "src/ait/ml/ensemble.py::DirectionPredictor._create_labels": {
-   "values": [
-    0.01,
-    0.01,
-    0.01,
-    0.01
-   ],
-   "category": "registered_followup",
-   "note": "direction label thresholds (+/-1%)"
-  },
-  "src/ait/ml/ensemble.py::DirectionPredictor._walk_forward_split": {
-   "values": [
-    20,
-    50
-   ],
-   "category": "registered_followup",
-   "note": "walk-forward CV minimum rows and fold sizing"
-  },
   "src/ait/ml/excursion.py::<module>": {
    "values": [
     0.01,
@@ -523,39 +505,22 @@
    ],
    "category": "fixed_feature_group"
   },
-  "src/ait/ml/hyperparams.py::<module>": {
-   "values": [
-    0.05,
-    0.98
-   ],
-   "category": "registered_followup",
-   "note": "positive-rate guards 0.05 / 0.98 (W87a shared; warning-only)"
-  },
-  "src/ait/ml/range_predictor.py::RangePredictor.__init__": {
-   "values": [
-    0.05,
-    0.05
-   ],
-   "category": "registered_followup",
-   "note": "live range band 5% (ml/range_spec.LIVE_RANGE_THRESHOLD_PCT)"
-  },
-  "src/ait/ml/range_predictor.py::RangePredictor.load_models": {
+  "src/ait/ml/range_predictor.py::<module>": {
    "values": [
     1e-09,
     0.05
    ],
-   "category": "registered_followup",
-   "note": "spec-guard tolerance 1e-9 and the 5% default"
+   "category": "structural",
+   "note": "facts about artifacts already on disk: a range.pkl with no spec key was trained at +/-5% over 30 days (compared as such), and the 1e-9 float tolerance of the load-time spec guard (W90d)"
   },
   "src/ait/ml/range_spec.py::<module>": {
    "values": [
-    0.05,
     9,
     14,
     21
    ],
    "category": "structural",
-   "note": "the live range band and the research horizon buckets (documented operator-reviewable constants)"
+   "note": "research horizon buckets (a research-cost approximation); the live band is the setting ml.range_threshold_pct (W90d)"
   },
   "src/ait/ml/regime.py::RegimeDetector._classify": {
    "values": [
@@ -612,22 +577,6 @@
    ],
    "category": "structural"
   },
-  "src/ait/ml/trainer.py::ModelTrainer._apply_optimized_hyperparams": {
-   "values": [
-    42,
-    50
-   ],
-   "category": "registered_followup",
-   "note": "live retrain: n_trials 50 and Optuna seed 42"
-  },
-  "src/ait/ml/trainer.py::ModelTrainer._apply_optimized_hyperparams._objective": {
-   "values": [
-    42,
-    42
-   ],
-   "category": "registered_followup",
-   "note": "search-time proxy model seed 42"
-  },
   "src/ait/ml/trainer.py::ModelTrainer._fetch_market_context": {
    "values": [
     20,
@@ -636,47 +585,19 @@
    "category": "structural",
    "note": "minimum rows of VIX / SPY context"
   },
-  "src/ait/ml/trainer.py::ModelTrainer._should_rollback": {
-   "values": [
-    0.05
-   ],
-   "category": "registered_followup",
-   "note": "live retrain rollback margin 0.05"
-  },
   "src/ait/ml/trainer.py::ModelTrainer.check_range_spec": {
    "values": [
     1e-09
    ],
    "category": "epsilon"
   },
-  "src/ait/ml/trainer.py::ModelTrainer.train_all_symbols": {
-   "values": [
-    50
-   ],
-   "category": "registered_followup",
-   "note": "default n_trials 50 of the live retrain"
-  },
-  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor": {
-   "values": [
-    0.1
-   ],
-   "category": "registered_followup",
-   "note": "class-level default big-move threshold"
-  },
-  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor.__init__": {
-   "values": [
-    0.07
-   ],
-   "category": "registered_followup",
-   "note": "live vol-magnitude band 7%"
-  },
-  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor.load_models": {
+  "src/ait/ml/vol_magnitude_predictor.py::<module>": {
    "values": [
     1e-09,
     0.07
    ],
-   "category": "registered_followup",
-   "note": "spec-guard tolerance 1e-9 and the 7% default"
+   "category": "structural",
+   "note": "facts about artifacts already on disk: a vol_magnitude.pkl with no spec key was trained at +/-7% over 30 days, and the 1e-9 spec-guard tolerance (W90d)"
   },
   "src/ait/optimization/optimizer.py::<module>": {
    "values": [

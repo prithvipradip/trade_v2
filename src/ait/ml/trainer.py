@@ -219,7 +219,7 @@ class ModelTrainer:
         self,
         symbols: list[str],
         optimize_hyperparams: bool = False,
-        optimize_n_trials: int = 50,
+        optimize_n_trials: int | None = None,     # W90d: None -> ml.retrain_optuna_trials (was 50)
     ) -> dict[str, dict[str, float]]:
         """Fetch fresh data and train models for all symbols.
 
@@ -231,7 +231,7 @@ class ModelTrainer:
         Returns dict of {symbol: {model: accuracy}}.
         """
         if optimize_hyperparams:
-            self._apply_optimized_hyperparams(symbols, n_trials=optimize_n_trials)
+            self._apply_optimized_hyperparams(symbols, n_trials=optimize_n_trials)   # None -> ml.retrain_optuna_trials
         # Save previous scores for comparison
         prev_version = self._predictor.model_version
         prev_scores = dict(self._predictor.cv_scores)
@@ -312,7 +312,7 @@ class ModelTrainer:
             except Exception:  # noqa: BLE001
                 pass
             new_scores = self._predictor.cv_scores
-            if self._should_rollback(prev_scores, new_scores):
+            if self._should_rollback(prev_scores, new_scores, self._ml("rollback_margin")):
                 log.warning(
                     "model_performance_degraded",
                     prev_scores=prev_scores,
@@ -380,19 +380,30 @@ class ModelTrainer:
 
     @staticmethod
     def _should_rollback(
-        prev_scores: dict[str, float], new_scores: dict[str, float]
+        prev_scores: dict[str, float], new_scores: dict[str, float], margin: float | None = None
     ) -> bool:
-        """Check if new model is worse enough to warrant rollback."""
+        """Check if new model is worse enough to warrant rollback.
+
+        W90d: ``margin`` (default ``ml.rollback_margin`` of the loaded settings, 0.05 = 5 percentage points of CV accuracy)
+        was a literal."""
+        if margin is None:
+            from ait.config.settings import loaded_ml_config
+            margin = loaded_ml_config().rollback_margin
         if not prev_scores or not new_scores:
             return False
 
         prev_avg = sum(prev_scores.values()) / len(prev_scores)
         new_avg = sum(new_scores.values()) / len(new_scores)
 
-        # Rollback if accuracy dropped by more than 5 percentage points
-        return new_avg < prev_avg - 0.05
+        # Rollback if accuracy dropped by more than the margin
+        return new_avg < prev_avg - margin
 
-    def _apply_optimized_hyperparams(self, symbols: list[str], n_trials: int = 50) -> None:
+    def _ml(self, name: str):
+        """W90d: ``ml.<name>`` of THIS trainer's config; a stub config without the field degrades to the schema default."""
+        v = getattr(self._config, name, None)
+        return v if v is not None else MLConfig.model_fields[name].default
+
+    def _apply_optimized_hyperparams(self, symbols: list[str], n_trials: int | None = None) -> None:
         """Run a dedicated Optuna search over ML hyperparameter spaces.
 
         For each trial, XGBoost and LightGBM are constructed with suggested
@@ -401,6 +412,11 @@ class ModelTrainer:
         into the predictor's model constructors via ``_xgb_kwargs`` /
         ``_lgbm_kwargs`` so the next ``train()`` call uses them.
         """
+        if n_trials is None:
+            n_trials = int(self._ml("retrain_optuna_trials"))
+        # W90d: the proxy models of the search follow ml.hyperparams.random_state (null = unseeded); was a literal 42
+        _hp = getattr(self._config, "hyperparams", None)
+        _proxy_seed = _hp.random_state if _hp is not None else MLConfig().hyperparams.random_state
         try:
             import optuna
 
@@ -462,7 +478,7 @@ class ModelTrainer:
                                 eval_metric="mlogloss",
                                 verbosity=0,
                                 n_jobs=1,
-                                random_state=42,
+                                random_state=_proxy_seed,
                             )
                         elif model_name == "lightgbm":
                             from lightgbm import LGBMClassifier
@@ -473,7 +489,7 @@ class ModelTrainer:
                                 metric="multi_logloss",
                                 verbose=-1,
                                 n_jobs=1,
-                                random_state=42,
+                                random_state=_proxy_seed,
                             )
                         else:
                             continue
@@ -500,7 +516,7 @@ class ModelTrainer:
             study = optuna.create_study(
                 direction="maximize",
                 study_name="ml_hyperparams",
-                sampler=optuna.samplers.TPESampler(seed=42),
+                sampler=optuna.samplers.TPESampler(seed=int(self._ml("retrain_optuna_seed"))),     # W90d: was 42
                 pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
             )
             study.optimize(_objective, n_trials=n_trials, n_jobs=1)

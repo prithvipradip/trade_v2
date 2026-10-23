@@ -25,11 +25,9 @@ from sklearn.preprocessing import StandardScaler
 
 from ait.ml.features import FeatureEngine
 from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the label guards
-    MIN_CLASS_SAMPLES,
-    POSITIVE_RATE_MAX,
-    POSITIVE_RATE_MIN,
     default_hyperparams,
     feature_spec_refused,
+    label_balance_limits,
     lgbm_binary_kwargs,
     model_spec,
     warn_on_spec_mismatch,
@@ -39,6 +37,14 @@ from ait.utils.logging import get_logger
 from ait.utils.time import today_et
 
 log = get_logger("ml.range_predictor")
+
+# W90d: facts about ARTIFACTS already on disk, not tunables. A range.pkl written before the spec was recorded carries no
+# threshold / horizon key and was trained at +/-5% over 30 days; it must be compared as such, whatever the settings say now
+# (so a changed ml.range_threshold_pct flags it for retraining instead of silently matching). _SPEC_TOLERANCE is the float
+# comparison tolerance of the load-time spec guard.
+_LEGACY_ARTIFACT_THRESHOLD = 0.05
+_LEGACY_ARTIFACT_HORIZON = 30
+_SPEC_TOLERANCE = 1e-9
 
 warnings.filterwarnings(
     "ignore",
@@ -89,12 +95,13 @@ class RangePredictor:
         # landing here, truncated to 0, disabling the training floor).
         *,
         min_training_samples: int | None = None,
-        threshold_pct: float = 0.05,
+        threshold_pct: float | None = None,       # W90d: None -> ml.range_threshold_pct (was 0.05)
         horizon_days: int = 30,
         ensemble_weights: dict[str, float] | None = None,
-        min_edge_over_baseline: float = 0.05,
+        min_edge_over_baseline: float | None = None,   # W90d: None -> ml.range_min_edge_over_baseline (was 0.05)
         model_dir: "Path | str | None" = None,
         hyperparams=None,
+        ml_config=None,
     ) -> None:
         # R20b follow-up: was a bare MLConfig() (pydantic field default,
         # never reads config.yaml) despite the comment above claiming this
@@ -102,15 +109,19 @@ class RangePredictor:
         # helper (also used by engine.py/walkforward.py/optimizer.py) —
         # this file and vol_magnitude_predictor.py used to hand-roll an
         # identical copy of this block independently.
+        # W90d: ONE read of the ml section (an explicit ml_config wins) for the training floor, the band, the edge floor,
+        # the CV geometry and the class-balance limits
+        if ml_config is None:
+            from ait.config.settings import loaded_ml_config
+            ml_config = loaded_ml_config()
+        self._ml = ml_config
         if min_training_samples is None:
-            from ait.config.settings import MLConfig, load_settings, resolve_config_value
-            try:
-                _settings = load_settings()
-            except Exception:  # noqa: BLE001 — never block construction
-                _settings = None
-            min_training_samples = resolve_config_value(
-                None, "ml", "min_training_samples", MLConfig, _settings)
+            min_training_samples = ml_config.min_training_samples
         self._min_training_samples = int(min_training_samples)
+        if threshold_pct is None:
+            threshold_pct = ml_config.range_threshold_pct
+        if min_edge_over_baseline is None:
+            min_edge_over_baseline = ml_config.range_min_edge_over_baseline
         # W88c: tree hyperparameters are ml.hyperparams (an explicit TreeHyperparamsConfig wins)
         self._hp = hyperparams if hyperparams is not None else default_hyperparams()
         self._threshold = threshold_pct
@@ -230,19 +241,20 @@ class RangePredictor:
         positive_rate = features["target"].mean()
         n_pos = int(features["target"].sum())
         n_neg = len(features) - n_pos
-        # Require at least 10 examples of each class — fewer than that and CV folds
+        # Require at least ml.min_class_samples (10) examples of each class — fewer than that and CV folds
         # will routinely produce single-class training splits, causing sklearn to crash.
-        if n_pos < MIN_CLASS_SAMPLES or n_neg < MIN_CLASS_SAMPLES:
+        _pos_min, _pos_max, _min_class = label_balance_limits(self._ml)      # W90d: ml.label_balance_* / min_class_samples
+        if n_pos < _min_class or n_neg < _min_class:
             log.warning(
                 "range_single_class", symbol=symbol,
                 in_range_pct=f"{positive_rate:.1%}",
                 n_in_range=n_pos, n_breakout=n_neg,
-                min_required=MIN_CLASS_SAMPLES,
+                min_required=_min_class,
                 hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
                      f"examples to train reliably — cannot train binary classifier",
             )
             return {}
-        if positive_rate < POSITIVE_RATE_MIN or positive_rate > POSITIVE_RATE_MAX:
+        if positive_rate < _pos_min or positive_rate > _pos_max:
             log.warning(
                 "range_imbalanced", symbol=symbol,
                 in_range_pct=f"{positive_rate:.1%}",
@@ -359,7 +371,9 @@ class RangePredictor:
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
 
-    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int | None = None):
+    def _walk_forward_split(self, n: int, n_splits: int | None = None, gap: int | None = None):
+        if n_splits is None:
+            n_splits = self._ml.binary_cv_splits         # W90d: was 4
         # LEAKAGE FIX (audit 2026-07-07 item 2.4): labels look `horizon` days
         # forward and OVERLAP, so a gap smaller than the horizon lets ~
         # (horizon - gap) days of each training fold's label window bleed
@@ -367,7 +381,7 @@ class RangePredictor:
         # edge-vs-threshold gate that decides whether iron condors trade at
         # all. The purge gap must be >= the label horizon.
         if gap is None:
-            gap = max(5, int(self._horizon))
+            gap = max(self._ml.binary_cv_min_gap_days, int(self._horizon))     # W90d: was max(5, horizon)
         splits = []
         fold = n // (n_splits + 1)
         for i in range(n_splits):
@@ -706,9 +720,9 @@ class RangePredictor:
 
             if feature_spec_refused("range", data.get("spec"), self._feature_engine.spec_hash()):
                 return False                              # W88d: trained under other windows: retrain, never serve
-            loaded_threshold = float(data.get("threshold", 0.05))
-            loaded_horizon = int(data.get("horizon", 30))
-            if (abs(loaded_threshold - self._spec_threshold) > 1e-9
+            loaded_threshold = float(data.get("threshold", _LEGACY_ARTIFACT_THRESHOLD))
+            loaded_horizon = int(data.get("horizon", _LEGACY_ARTIFACT_HORIZON))
+            if (abs(loaded_threshold - self._spec_threshold) > _SPEC_TOLERANCE
                     or loaded_horizon != self._spec_horizon):
                 self._spec_mismatch = True
                 log.critical(

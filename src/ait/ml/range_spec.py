@@ -38,9 +38,18 @@ from __future__ import annotations
 
 import math
 
-# Fixed live containment band: +/-5%. Research adapts its threshold per window;
-# live keeps the wing-matched constant until that is deliberately changed HERE.
-LIVE_RANGE_THRESHOLD_PCT: float = 0.05
+# Live containment band: +/-5% (the wing width the live condor sells). Research adapts its threshold per window; live
+# keeps this constant until it is deliberately changed. W90d: the value is the setting ``ml.range_threshold_pct``;
+# ``LIVE_RANGE_THRESHOLD_PCT`` stays importable as an alias of that setting's SCHEMA DEFAULT (a lazy module attribute, so
+# this module stays import-light), and ``live_range_spec`` reads the LOADED value.
+
+
+def __getattr__(name: str):
+    if name == "LIVE_RANGE_THRESHOLD_PCT":
+        from ait.config.settings import MLConfig
+        return MLConfig.model_fields["range_threshold_pct"].default
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # W78: the horizons (label bars) a research range model is trained at. A study that lets the
 # entry DTE vary would otherwise need one model per distinct horizon (up to ~30 per window);
@@ -114,11 +123,17 @@ def live_range_spec(settings=None) -> tuple[float, int]:
     must equal ``walkforward._range_label_horizon()``.
     """
     opts = getattr(settings, "options", None) if settings is not None else None
-    if opts is None:
-        from ait.config.settings import OptionsConfig, load_settings
+    ml = getattr(settings, "ml", None) if settings is not None else None
+    if opts is None or ml is None:
+        from ait.config.settings import MLConfig, OptionsConfig, load_settings
         try:
-            opts = load_settings().options
+            loaded = load_settings()
+            opts = opts if opts is not None else loaded.options
+            ml = ml if ml is not None else loaded.ml
         except Exception:  # noqa: BLE001 — never block construction on config I/O
-            opts = OptionsConfig()
+            opts = opts if opts is not None else OptionsConfig()
+            ml = ml if ml is not None else MLConfig()
 
-    return LIVE_RANGE_THRESHOLD_PCT, horizon_for(int(opts.dte_range[0]))
+    # W90d: the band is ``ml.range_threshold_pct`` (was the LIVE_RANGE_THRESHOLD_PCT = 0.05 literal)
+    return float(getattr(ml, "range_threshold_pct", None) or __getattr__("LIVE_RANGE_THRESHOLD_PCT")), \
+        horizon_for(int(opts.dte_range[0]))

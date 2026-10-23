@@ -1535,6 +1535,53 @@ class MLConfig(_StrictModel):
         description="Floor for model-overridden signal confidence (range/"
                     "vol-mag). 0.65 beat 0.55 across every backtest metric. "
                     "Was hardcoded in orchestrator — audit item 3.3.")
+    # --- W90d: the live-shared label / validation / retrain constants (were literals in ml/*.py; values unchanged) ---
+    range_threshold_pct: float = Field(default=0.05, gt=0.0, le=0.5,
+        description="W90d: the LIVE range model's containment band (+/- this fraction), the wing width the live condor sells. "
+                    "ml.range_spec.live_range_spec reads it. Research does NOT use it: it adapts the band per window "
+                    "(backtest.walkforward_tuning.range_threshold_*). A saved range model records the band it was trained at "
+                    "and a mismatch is flagged (needs retrain), so changing this means a retrain.")
+    range_min_edge_over_baseline: float = Field(default=0.05, ge=0.0, le=1.0,
+        description="W90d: the live range model is only used when its cross-validated edge over the baseline hit rate is at "
+                    "least this (RangePredictor's default; research passes backtest.min_edge_over_baseline).")
+    vol_magnitude_threshold_pct: float = Field(default=0.07, gt=0.0, le=0.5,
+        description="W90d: the vol-magnitude model's 'big move' size (a +/- fraction); bigger than the range band on purpose.")
+    vol_magnitude_horizon_days: int = Field(default=30, ge=1, le=120,
+        description="W90d: ... and the number of days ahead it looks for that move.")
+    vol_magnitude_min_edge_over_baseline: float = Field(default=0.10, ge=0.0, le=1.0,
+        description="W90d: the vol-magnitude model is only used when its CV edge over the baseline is at least this.")
+    direction_label_threshold_pct: float = Field(default=0.01, gt=0.0, le=0.2,
+        description="W90d: the direction model's 3-class label: a forward return above +this is bullish, below -this "
+                    "bearish, otherwise neutral.")
+    direction_label_horizon_days: int = Field(default=5, ge=1, le=60,
+        description="W90d: ... measured over this many days forward (also the rows dropped from the end of the training set).")
+    direction_cv_splits: int = Field(default=5, ge=2, le=20,
+        description="W90d: walk-forward validation folds of the direction model (and of the retrain's hyperparameter search).")
+    direction_cv_gap_days: int = Field(default=5, ge=0, le=60,
+        description="W90d: purge gap between the direction model's training and validation rows.")
+    cv_min_val_rows: int = Field(default=20, ge=5, le=500,
+        description="W90d: smallest validation fold of the direction model's walk-forward split.")
+    cv_min_train_rows: int = Field(default=50, ge=10, le=2000,
+        description="W90d: a direction-model fold whose training part is shorter than this is skipped (with fewer than two "
+                    "usable folds the split falls back to sklearn's TimeSeriesSplit).")
+    binary_cv_splits: int = Field(default=4, ge=2, le=20,
+        description="W90d: walk-forward folds of the two binary models (range, vol-magnitude).")
+    binary_cv_min_gap_days: int = Field(default=5, ge=0, le=60,
+        description="W90d: purge gap of the binary models is the larger of this and the label horizon (the horizon must be "
+                    "covered or the overlapping label windows leak into validation: audit 2026-07-07 item 2.4).")
+    label_balance_min: float = Field(default=0.05, gt=0.0, lt=0.5,
+        description="W90d: a binary label whose positive rate is below this is warned about (too few positives to learn from).")
+    label_balance_max: float = Field(default=0.98, gt=0.5, lt=1.0,
+        description="W90d: ... or above this (almost always positive). Warning only.")
+    min_class_samples: int = Field(default=10, ge=2, le=1000,
+        description="W90d: a binary model is not trained unless each class has at least this many rows.")
+    retrain_optuna_trials: int = Field(default=50, ge=1, le=2000,
+        description="W90d: Optuna trials of the live retrain's optional hyperparameter search.")
+    retrain_optuna_seed: int = Field(default=42, ge=0, le=2**31 - 1,
+        description="W90d: seed of that search's TPE sampler.")
+    rollback_margin: float = Field(default=0.05, gt=0.0, le=0.5,
+        description="W90d: a retrained direction model whose average CV accuracy is more than this below the previous one's "
+                    "(5 percentage points) is rolled back.")
     observe_mode_neutral_confidence: float = Field(default=0.60, ge=0.50, le=0.90,
         description="OBSERVE MODE ONLY (entry_gates_enabled=false): the "
                     "confidence a DIRECTION-NEUTRAL structure (iron_condor, "
@@ -1581,6 +1628,12 @@ class MLConfig(_StrictModel):
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Ensemble weights must sum to 1.0, got {total}")
         return v
+
+    @model_validator(mode="after")
+    def _label_balance_is_ordered(self) -> "MLConfig":
+        if not self.label_balance_min < self.label_balance_max:
+            raise ValueError("ml: label_balance_min must be below label_balance_max")
+        return self
 
 
 class RegimeConfig(_StrictModel):
@@ -2524,6 +2577,16 @@ def loaded_cash_yield() -> float:
         return float(load_settings().options.risk_free_rate)
     except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
         return float(DEFAULT_RISK_FREE_RATE)
+
+
+def loaded_ml_config() -> "MLConfig":
+    """W90d: ``ml`` of the loaded settings (the frozen research view inside a research process), else the schema defaults.
+    The one resolver the range / vol-magnitude predictors and the hyperparameter helpers use for their live-shared
+    constants (label thresholds, CV geometry, class-balance limits)."""
+    try:
+        return load_settings().ml
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return MLConfig()
 
 
 def loaded_engine_tuning() -> "EngineTuningConfig":

@@ -362,6 +362,29 @@ ml:
   lookback_days: 504                   # 2 years of trading days
   min_training_samples: 100
   range_min_confidence: 0.65           # Floor for range/vol-mag model-overridden confidence (was hardcoded)
+  # W90d: constants of the live models' labels, validation folds and retrain (were literals in ml/*.py; values unchanged).
+  # Changing a label constant changes what a model learns: a saved model records the band/horizon it was trained at, a
+  # mismatch is flagged, and the next retrain rebuilds it. The research engine does not read the *_pct band keys (it adapts
+  # its range band per window: backtest.walkforward_tuning).
+  range_threshold_pct: 0.05            # live range model: +/- containment band (the wing width the live condor sells)
+  range_min_edge_over_baseline: 0.05   # live range model is used only when its CV edge over the baseline is at least this
+  vol_magnitude_threshold_pct: 0.07    # vol-magnitude model: the 'big move' size ...
+  vol_magnitude_horizon_days: 30       # ... looked for this many days ahead
+  vol_magnitude_min_edge_over_baseline: 0.10
+  direction_label_threshold_pct: 0.01  # direction model: forward return above +this = bullish, below -this = bearish
+  direction_label_horizon_days: 5      # ... over this many days
+  direction_cv_splits: 5               # direction model walk-forward folds
+  direction_cv_gap_days: 5             # purge gap between training and validation
+  cv_min_val_rows: 20                  # smallest validation fold
+  cv_min_train_rows: 50                # a fold with less training data is skipped
+  binary_cv_splits: 4                  # range / vol-magnitude walk-forward folds
+  binary_cv_min_gap_days: 5            # their purge gap is max(this, label horizon)
+  label_balance_min: 0.05              # binary label positive-rate warning band ...
+  label_balance_max: 0.98
+  min_class_samples: 10                # a binary model needs this many rows of each class
+  retrain_optuna_trials: 50            # live retrain hyperparameter search: trials ...
+  retrain_optuna_seed: 42              # ... and sampler seed
+  rollback_margin: 0.05                # roll a retrained direction model back if its CV accuracy fell by more than this
   # 2026-09-01 OBSERVE MODE (PLAN pre-registration). The retrained range model
   # is near coin-flip on SPY/QQQ (CV AUC 0.545/0.545, edge +0.045 vs the 0.05
   # min_edge threshold), so predict() returns None and W2's fail-CLOSED gate

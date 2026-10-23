@@ -324,8 +324,10 @@ class TradingOrchestrator:
         # Vol-magnitude predictor (Tier 1) — used for long straddle confidence
         from ait.ml.vol_magnitude_predictor import VolMagnitudePredictor
         self._vol_mag_predictor = VolMagnitudePredictor(
-            threshold_pct=0.07,  # ±7% (bigger than range threshold)
-            horizon_days=30,
+            # W90d: ml.vol_magnitude_threshold_pct (±7%, bigger than the range band) / ml.vol_magnitude_horizon_days (30);
+            # were literals here, repeated as the predictor's own defaults
+            threshold_pct=settings.ml.vol_magnitude_threshold_pct,
+            horizon_days=settings.ml.vol_magnitude_horizon_days,
         )
         self._vol_mag_predictor.load_models()
 

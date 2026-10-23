@@ -208,6 +208,17 @@ Every saved model (`ensemble.pkl`, `range.pkl`, `vol_magnitude.pkl`, the meta-la
 config is served and logs `model_spec_mismatch` with the differences; an artifact saved before W88c has no `spec` and loads silently. A change to the LIVE values takes effect for live at the next retrain (and bot restart), not by
 editing `config.yaml` alone. The run record stores the resolved settings and the ML seed.
 
+## Model labels, validation folds and retrain constants (W90d; shared by live and research)
+
+The numbers that define what the live models learn and how they are validated are `ml.*` settings, listed in `config.yaml` with the values the code used before (so listing them changed nothing): the range band
+`range_threshold_pct` (0.05) and its edge floor `range_min_edge_over_baseline`; the vol-magnitude move, horizon and edge floor (`vol_magnitude_threshold_pct` 0.07, `vol_magnitude_horizon_days` 30,
+`vol_magnitude_min_edge_over_baseline` 0.10); the direction label (`direction_label_threshold_pct` 0.01 over `direction_label_horizon_days` 5); the walk-forward folds (`direction_cv_splits` / `direction_cv_gap_days` /
+`cv_min_val_rows` / `cv_min_train_rows` for the direction model, `binary_cv_splits` / `binary_cv_min_gap_days` for range and vol-magnitude, whose gap is never shorter than the label horizon); the class-balance guards
+(`label_balance_min` / `label_balance_max` warn, `min_class_samples` refuses); and the retrain (`retrain_optuna_trials`, `retrain_optuna_seed`, `rollback_margin`).
+A change to a LIVE value takes effect at the next bot restart, and a changed label constant needs a retrain: a saved range or vol-magnitude model records the band and horizon it was trained at, and a mismatch is flagged
+(`range_model_spec_mismatch`, CRITICAL) and the model retrained. An artifact written before the spec was recorded is compared as +/-5% / 30 days (range) or +/-7% / 30 days (vol-magnitude), whatever the settings say now. Research does not
+read the band keys (it adapts its range band per window: `backtest.walkforward_tuning`); the other keys it shares with live.
+
 ## Feature windows (W88d; shared by live and research)
 
 The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them

@@ -30,11 +30,9 @@ from sklearn.preprocessing import StandardScaler
 
 from ait.ml.features import FeatureEngine
 from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the label guards
-    MIN_CLASS_SAMPLES,
-    POSITIVE_RATE_MAX,
-    POSITIVE_RATE_MIN,
     default_hyperparams,
     feature_spec_refused,
+    label_balance_limits,
     lgbm_binary_kwargs,
     model_spec,
     warn_on_spec_mismatch,
@@ -43,6 +41,12 @@ from ait.ml.hyperparams import (  # W87a: one owner of the tree settings and the
 from ait.utils.logging import get_logger
 
 log = get_logger("ml.vol_magnitude")
+
+# W90d: facts about ARTIFACTS already on disk, not tunables (see ml/range_predictor.py): a vol_magnitude.pkl written before
+# the spec was recorded carries no threshold / horizon key and was trained at +/-7% over 30 days.
+_LEGACY_ARTIFACT_THRESHOLD = 0.07
+_LEGACY_ARTIFACT_HORIZON = 30
+_SPEC_TOLERANCE = 1e-9
 
 warnings.filterwarnings(
     "ignore",
@@ -86,11 +90,12 @@ class VolMagnitudePredictor:
         # landing here, truncated to 0, disabling the training floor).
         *,
         min_training_samples: int | None = None,
-        threshold_pct: float = 0.07,
-        horizon_days: int = 30,
+        threshold_pct: float | None = None,       # W90d: None -> ml.vol_magnitude_threshold_pct (was 0.07)
+        horizon_days: int | None = None,          # W90d: None -> ml.vol_magnitude_horizon_days (was 30)
         ensemble_weights: dict[str, float] | None = None,
         model_dir: "Path | str | None" = None,
         hyperparams=None,
+        ml_config=None,
     ) -> None:
         # R20b follow-up: was a bare MLConfig() (pydantic field default,
         # never reads config.yaml) despite the comment above claiming this
@@ -98,15 +103,20 @@ class VolMagnitudePredictor:
         # helper (also used by engine.py/walkforward.py/optimizer.py) —
         # this file and range_predictor.py used to hand-roll an identical
         # copy of this block independently.
+        # W90d: ONE read of the ml section (an explicit ml_config wins) for the training floor, the move size and horizon,
+        # the edge floor, the CV geometry and the class-balance limits
+        if ml_config is None:
+            from ait.config.settings import loaded_ml_config
+            ml_config = loaded_ml_config()
+        self._ml = ml_config
         if min_training_samples is None:
-            from ait.config.settings import MLConfig, load_settings, resolve_config_value
-            try:
-                _settings = load_settings()
-            except Exception:  # noqa: BLE001 — never block construction
-                _settings = None
-            min_training_samples = resolve_config_value(
-                None, "ml", "min_training_samples", MLConfig, _settings)
+            min_training_samples = ml_config.min_training_samples
         self._min_training_samples = int(min_training_samples)
+        if threshold_pct is None:
+            threshold_pct = ml_config.vol_magnitude_threshold_pct
+        if horizon_days is None:
+            horizon_days = ml_config.vol_magnitude_horizon_days
+        self._min_edge_over_baseline = float(ml_config.vol_magnitude_min_edge_over_baseline)
         # W88c: tree hyperparameters are ml.hyperparams (an explicit TreeHyperparamsConfig wins)
         self._hp = hyperparams if hyperparams is not None else default_hyperparams()
         self._threshold = threshold_pct
@@ -181,17 +191,18 @@ class VolMagnitudePredictor:
         positive_rate = features["target"].mean()
         n_pos = int(features["target"].sum())
         n_neg = len(features) - n_pos
-        if n_pos < MIN_CLASS_SAMPLES or n_neg < MIN_CLASS_SAMPLES:
+        _pos_min, _pos_max, _min_class = label_balance_limits(self._ml)      # W90d: ml.label_balance_* / min_class_samples
+        if n_pos < _min_class or n_neg < _min_class:
             log.warning(
                 "vol_mag_single_class", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
                 n_big_move=n_pos, n_small_move=n_neg,
-                min_required=MIN_CLASS_SAMPLES,
+                min_required=_min_class,
                 hint=f"±{self._threshold:.0%} threshold produces too few minority-class "
                      f"examples to train reliably — cannot train binary classifier",
             )
             return {}
-        if positive_rate < POSITIVE_RATE_MIN or positive_rate > POSITIVE_RATE_MAX:
+        if positive_rate < _pos_min or positive_rate > _pos_max:
             log.warning(
                 "vol_mag_imbalanced", symbol=symbol,
                 big_move_pct=f"{positive_rate:.1%}",
@@ -286,14 +297,16 @@ class VolMagnitudePredictor:
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
 
-    def _walk_forward_split(self, n: int, n_splits: int = 4, gap: int | None = None):
+    def _walk_forward_split(self, n: int, n_splits: int | None = None, gap: int | None = None):
+        if n_splits is None:
+            n_splits = self._ml.binary_cv_splits         # W90d: was 4
         # Deep-audit ML-F1: labels look self._horizon (30) days forward and
         # OVERLAP; gap=5 leaked ~25 days of label window into every
         # validation fold, inflating the CV accuracy that gates whether
         # long_straddle trades at all. Purge gap must cover the horizon
         # (same bug-class as the fixed range-model item 2.4).
         if gap is None:
-            gap = max(5, int(self._horizon))
+            gap = max(self._ml.binary_cv_min_gap_days, int(self._horizon))     # W90d: was max(5, horizon)
         splits = []
         fold = n // (n_splits + 1)
         for i in range(n_splits):
@@ -359,7 +372,8 @@ class VolMagnitudePredictor:
         except ImportError:
             return 0.0
 
-    MIN_EDGE_OVER_BASELINE = 0.10
+    # W90d: the 0.10 edge floor (was the class attribute MIN_EDGE_OVER_BASELINE) is ml.vol_magnitude_min_edge_over_baseline,
+    # read once in __init__ into self._min_edge_over_baseline.
 
     def predict(
         self,
@@ -389,7 +403,7 @@ class VolMagnitudePredictor:
             if cv_scores:
                 avg_balanced_acc = sum(cv_scores.values()) / len(cv_scores)
                 edge = avg_balanced_acc - 0.50
-                if edge < self.MIN_EDGE_OVER_BASELINE:
+                if edge < self._min_edge_over_baseline:
                     log.debug("vol_mag_no_edge", symbol=symbol,
                               balanced_accuracy=f"{avg_balanced_acc:.2f}",
                               edge=f"{edge:+.2f}")
@@ -505,9 +519,9 @@ class VolMagnitudePredictor:
 
             if feature_spec_refused("vol_magnitude", data.get("spec"), self._feature_engine.spec_hash()):
                 return False                              # W88d: trained under other windows: retrain, never serve
-            loaded_threshold = float(data.get("threshold", 0.07))
-            loaded_horizon = int(data.get("horizon", 30))
-            if (abs(loaded_threshold - self._spec_threshold) > 1e-9
+            loaded_threshold = float(data.get("threshold", _LEGACY_ARTIFACT_THRESHOLD))
+            loaded_horizon = int(data.get("horizon", _LEGACY_ARTIFACT_HORIZON))
+            if (abs(loaded_threshold - self._spec_threshold) > _SPEC_TOLERANCE
                     or loaded_horizon != self._spec_horizon):
                 self._spec_mismatch = True
                 log.critical(

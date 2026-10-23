@@ -124,13 +124,14 @@ class TestHyperparameters:
         assert "random_state" not in first
 
     def test_the_binary_guards_are_shared(self):
+        """W90d: the guards are ml.label_balance_min / label_balance_max / min_class_samples; both binary predictors read them
+        through the one helper (they were module constants copied into both)."""
         from ait.ml import hyperparams as hp
         from ait.ml import range_predictor as rp
         from ait.ml import vol_magnitude_predictor as vp
-        assert (hp.POSITIVE_RATE_MIN, hp.POSITIVE_RATE_MAX, hp.MIN_CLASS_SAMPLES) == (0.05, 0.98, 10)
+        assert hp.label_balance_limits() == (0.05, 0.98, 10)
         for m in (rp, vp):
-            assert m.POSITIVE_RATE_MIN is hp.POSITIVE_RATE_MIN or m.POSITIVE_RATE_MIN == 0.05
-            assert m.POSITIVE_RATE_MAX == 0.98 and m.MIN_CLASS_SAMPLES == 10
+            assert m.label_balance_limits is hp.label_balance_limits
 
 
 # --------------------------------------------------------------------------

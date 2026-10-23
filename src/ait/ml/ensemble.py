@@ -348,7 +348,10 @@ class DirectionPredictor:
         y = features["target"].values.astype(int)
 
         # Time-series cross-validation
-        tscv = TimeSeriesSplit(n_splits=5)
+        # W90d: this was TimeSeriesSplit(n_splits=5), handed to _train_xgboost / _train_lightgbm, which never read it (they
+        # build their own walk-forward folds from ml.direction_cv_* via _walk_forward_split). A dead object with a literal
+        # in it is a setting that does nothing, so it is gone; the parameter stays for the existing signatures.
+        tscv = None
         accuracies = {}
 
         # Train XGBoost — scaler is fit only on training fold to prevent data leakage
@@ -439,6 +442,12 @@ class DirectionPredictor:
     @property
     def fitted_weights(self) -> "dict[str, float] | None":
         return getattr(self, "_fitted_weights", None)
+
+    def _ml(self, name: str):
+        """W90d: ``ml.<name>`` of THIS predictor's config; a stub config without the field degrades to the schema default
+        (label threshold / horizon, CV geometry)."""
+        v = getattr(getattr(self, "_config", None), name, None)       # a partial (__new__) instance has no _config
+        return v if v is not None else MLConfig.model_fields[name].default
 
     def _hyperparams(self):
         """``ml.hyperparams`` of THIS predictor's config (W88c); a stub config without the field degrades to the
@@ -642,28 +651,31 @@ class DirectionPredictor:
         self._cv_scores = dict(scores)
 
     def _create_labels(self, close: pd.Series) -> pd.Series:
-        """Create 3-class labels from 5-day forward returns.
+        """Create 3-class labels from forward returns over ``ml.direction_label_horizon_days`` (5).
 
         Using a 5-day lookahead matches the typical options holding period
         (1-3 weeks) far better than next-day returns. Options need price to
         move meaningfully over several days to overcome theta decay.
 
-        0 = bearish (5-day return < -1.0%)
-        1 = neutral (-1.0% to +1.0%)
-        2 = bullish (5-day return > +1.0%)
+        0 = bearish (forward return < -t)
+        1 = neutral (-t to +t)
+        2 = bullish (forward return > +t)
 
-        Narrower neutral band (±1.0% vs old ±1.5%) reduces class imbalance
-        and gives the model more directional training signal.
+        with t = ``ml.direction_label_threshold_pct`` (1.0%). Narrower neutral band (±1.0% vs old ±1.5%) reduces class
+        imbalance and gives the model more directional training signal. W90d: the 5-day horizon and the 1% band were
+        literals here; they are settings (values unchanged).
         """
-        fwd_return = close.pct_change(5).shift(-5)  # 5-day forward return
+        horizon = int(self._ml("direction_label_horizon_days"))
+        thr = float(self._ml("direction_label_threshold_pct"))
+        fwd_return = close.pct_change(horizon).shift(-horizon)  # forward return over the label horizon
         # Deep-audit ML-F3: initialising to 1 stamped the last 5 rows (whose
         # forward return is unknowable NaN) as NEUTRAL on every retrain —
         # systematically wrong labels at the most regime-relevant rows.
         # NaN-init means dropna(subset=["target"]) removes them instead.
         labels = pd.Series(float("nan"), index=close.index, dtype=float)
-        labels[fwd_return > 0.01] = 2    # Bullish: >+1.0% in 5 days
-        labels[fwd_return < -0.01] = 0   # Bearish: <-1.0% in 5 days
-        labels[(fwd_return <= 0.01) & (fwd_return >= -0.01)] = 1  # Neutral
+        labels[fwd_return > thr] = 2    # Bullish: > +thr over the horizon
+        labels[fwd_return < -thr] = 0   # Bearish: < -thr over the horizon
+        labels[(fwd_return <= thr) & (fwd_return >= -thr)] = 1  # Neutral
         return labels
 
     @staticmethod
@@ -683,7 +695,7 @@ class DirectionPredictor:
         return weights
 
     def _walk_forward_split(
-        self, n_samples: int, n_splits: int = 5, gap: int = 5
+        self, n_samples: int, n_splits: int | None = None, gap: int | None = None
     ) -> list[tuple[np.ndarray, np.ndarray]]:
         """Walk-forward validation splits with purge gap.
 
@@ -694,16 +706,24 @@ class DirectionPredictor:
 
         The gap prevents the model from memorizing recent patterns that
         overlap with the validation period.
+
+        W90d: the fold count (5), the purge gap (5), the smallest validation fold (20) and the smallest training part (50)
+        are ``ml.direction_cv_splits`` / ``direction_cv_gap_days`` / ``cv_min_val_rows`` / ``cv_min_train_rows``.
         """
+        if n_splits is None:
+            n_splits = int(self._ml("direction_cv_splits"))
+        if gap is None:
+            gap = int(self._ml("direction_cv_gap_days"))
+        min_val, min_train = int(self._ml("cv_min_val_rows")), int(self._ml("cv_min_train_rows"))
         splits = []
-        val_size = max(20, n_samples // (n_splits + 2))
+        val_size = max(min_val, n_samples // (n_splits + 2))
 
         for i in range(n_splits):
             val_end = n_samples - (n_splits - 1 - i) * val_size
             val_start = val_end - val_size
             train_end = val_start - gap  # Purge gap
 
-            if train_end < 50:  # Need minimum training data
+            if train_end < min_train:  # Need minimum training data
                 continue
 
             train_idx = np.arange(0, train_end)

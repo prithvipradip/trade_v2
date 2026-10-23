@@ -99,7 +99,8 @@ or the command-line flag.
 
 The neutral value a missing meta-label input takes (`ml.meta_label_neutrals`: RSI 50, volatility 0.20, ...) and the meta-labeler's
 arm-guard limits (`meta_label.min_feature_coverage`, `meta_label.max_artifact_age_days`) are also shared with live (W90c), so they are in
-`config.yaml` too.
+`config.yaml` too. So are the live models' label and validation constants (the range / vol-magnitude bands, the direction label, the walk-forward
+folds, the class-balance guards and the retrain's trials, seed and rollback margin: W90d); RUNBOOK "Model labels, validation folds and retrain constants".
 
 Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared with live, so they are listed in
 `config.yaml`; research differs only if you override them. Details: RUNBOOK "Research tunables" and "Model hyperparameters".
