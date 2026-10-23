@@ -111,6 +111,25 @@ class IBKRClient:
         session's client id would otherwise crash-loop forever: connect
         fails -> bot exits -> supervisor restarts -> same id still held.
         """
+        # W94: .env's IBKR_PORT is the PREFERRED endpoint. When nothing listens there but the other
+        # endpoint of the same account type does (TWS paper 7497 <-> IB Gateway paper 4002, live
+        # 7496 <-> 4001; never across), use that one. 2026-10-23: .env said 7497 while IB Gateway
+        # listened on 4002 and the bot sat deferred. Resolved on every connect, so the reconnect
+        # path (which calls connect()) follows a mid-day TWS <-> Gateway switch too. The paper/live
+        # assertion on managedAccounts() below still guards the account type.
+        # Imported here, not at module top: `ait.data/__init__` imports market_data, which imports THIS
+        # module, so a top-level `from ait.data...` is a circular import whenever this module is the
+        # first one loaded (as it is for `import ait.broker.ibkr_client` / `python -m ait.main`).
+        from ait.data.ib_ports import effective_port, endpoint_label, tcp_listening
+        configured_port = int(self._config.ibkr_port)
+        port = effective_port(
+            configured_port, lambda p: tcp_listening(p, str(self._config.ibkr_host)))
+        if port != configured_port:
+            log.warning(
+                "ibkr_port_fallback", configured=configured_port, using=port,
+                configured_label=endpoint_label(configured_port),
+                using_label=endpoint_label(port),
+                note="update IBKR_PORT in .env (python scripts/sync_ibkr_port.py)")
         base_id = self._config.ibkr_client_id
         # Try the configured id first, then a few deterministic-ish fallbacks.
         # offsets vary per attempt; not random so resume/journaling is stable.
@@ -119,7 +138,7 @@ class IBKRClient:
             try:
                 await self._ib.connectAsync(
                     host=self._config.ibkr_host,
-                    port=self._config.ibkr_port,
+                    port=port,
                     clientId=client_id,
                     timeout=15,
                     readonly=False,
@@ -236,7 +255,8 @@ class IBKRClient:
                 log.info(
                     "ibkr_connected",
                     host=self._config.ibkr_host,
-                    port=self._config.ibkr_port,
+                    port=port,
+                    configured_port=configured_port,
                     account=account,
                     client_id=client_id,
                     fallback=client_id != base_id,
