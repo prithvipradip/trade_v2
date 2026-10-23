@@ -18645,3 +18645,33 @@ to the operator before anything beyond the 38 is converted.
 4. **Process, as agreed with the operator:** a second Claude session works in this same working tree (uncommitted edits in `settings.py`, `config.yaml`, `trainer.py`, `RUNBOOK.md`, `master.py`, ... and a full test run in progress). W90 therefore works in an isolated git worktree on branch `w90` and merges into `main` only after the other session has committed; the two sessions never write the same tree.
 
 ---
+
+## 2026-10-22 - W89 AS PLANNED + AS BUILT: the daily retrain gets its own IB session and never stores Yahoo or partial daily bars (label note: another session's literal-conversion wave is W90; the table unification below is W91)
+
+**FINDING.** `master.retrain_models()` ran an inline script with `MarketDataService(None)` ("W65: no IB client here"), so every daily bar came from Yahoo (`daily_history_ib_miss`) and `ModelTrainer` stored it into `daily_prices` tagged
+`YAHOO_UNADJ`, overwriting the IB tag. 2026-10-22 10:25 ET: 502 rows per symbol (QQQ, SPY, IWM; 2024-10-22..10-22) flipped from IB_TRADES_RTH to Yahoo (volume ~1.5x; closes identical to the cent over 492 overlapping days) and a PARTIAL
+10-22 bar was stored. IB was not down; the retrain never connected. Earlier retrains had not run since ~10-13 (the supervisor was down), which is why the IB rows survived until then.
+
+**OPERATOR DECISIONS (2026-10-22).** The retrain gets its own IB client; no Yahoo for its daily price bars; abort before any write when IB data is missing; client id 94 in `ml.retrain_ib_client_id`. Principle: ONE SOURCE PER DATA FIELD
+(IB for underlying prices and implied vol, Polygon for option prices; macro, dividends, earnings, econ calendar and holdings keep their own sources, each recorded). The live bot's own Yahoo fallback (it stores nothing) is kept.
+
+**AS BUILT** (commit `eaa310d`). `MarketDataService(daily_yahoo_fallback=True)`: False returns None and logs `daily_history_unavailable_no_fallback` (default unchanged). New `orchestration/retrain_ib.py`:
+`connect_for_retrain` / `connect_from_settings` (refuses the bot's id + ladder and the short-DTE id, picks the listening TWS/Gateway twin port, reuses `IBKRClient` unmodified, raises `RetrainIBUnavailable`). The retrain script connects, pre-fetches `^VIX`,
+SPY and the universe with the fallback off, and `sys.exit(3)` BEFORE any model or `daily_prices` write if anything is missing (master's existing "retrain FAILED - models stale" alert). `ait.utils.time.drop_incomplete_session`: the trainer
+persists no row dated today before 16:05 ET (`backfill_historical_data.py` now imports it). RUNBOOK: alert row, client-id convention (bot 1, 90 backfill, 91 short-DTE, 94 retrain, 93/92 ad-hoc), deploy note.
+**VERIFIED.** Live read-only check against TWS 7497 as client 94: `^VIX`, SPY, QQQ, IWM each 504 rows, source IB_TRADES_RTH, fallback off. smoke_deploy: SMOKE PASS (13). Fast lane: 3 failures on the first run, all mine
+(`drop_incomplete_session` on a non-datetime index; the phantom-config-key guard wanted a real-code reader of `retrain_ib_client_id`), fixed; second run **6473 passed / 46 skipped / 153 deselected, 0 failed**. New tests: `tests/test_w89_retrain_ib.py`; `test_w35` updated (the script now connects).
+
+**DATA STEP DONE (bot stopped, backup taken).** `backfill_historical_data.py --mode daily --allow-live-tables --years 2` for QQQ/SPY/IWM, plus the 2024-10-22 row per symbol copied from `research_daily_prices` (IB, identical closes). `daily_prices` now:
+IB_TRADES_RTH 2024-10-09..2026-10-22 (511 rows per symbol, final 10-22 bar, QQQ close 704.47); older rows unchanged and UNRECORDED (QQQ 3,300 from 2011; SPY/IWM 118 from 2024-04-22); stored `implied_vol` kept (493 QQQ rows since 2024-10-09).
+The script's "3283 zero-volume days" validation flag is pre-existing (the UNRECORDED rows).
+
+**FELL SHORT / NOT DONE.** The supervisor still runs the OLD retrain code until a FULL SUPERVISOR RESTART (operator; also carries W88/W90 live-shared changes); until then a retrain would flip the rows back to Yahoo. The 07:30 ET retrain needs TWS/Gateway up.
+Rewriting is still allowed (IB over IB is harmless); append-only is W91.
+
+**NEXT (W91, to be planned first).** (1) Append-only retrain save (never rewrite past completed rows; backfill scripts keep an explicit overwrite). (2) Copy the full IB history from `research_daily_prices`/`research_daily_iv` into `daily_prices`/`daily_iv`
+with a row-by-row comparison and the run-record `data_fingerprint` check. (3) One canonical set of un-prefixed tables incl. econ events, dividends, earnings and QQQ holdings (live twins are empty today; `research_option_*` are empty duplicates), one recorded source per field.
+(4) Point research (`research_table_prefix`) at them; rename the old `research_*` tables for the comparison, drop once it shows zero differences. No study is running, so no ordering constraint with the restart. (5) Research tests on the unified setup. W90 works in a worktree on branch `w90`; W91 should too.
+After the restart: confirm the first IB retrain (`retrain_*.log` has no `daily_history_ib_miss`; sources stay IB), then re-run the option-history refresh with `--since-last`.
+
+---

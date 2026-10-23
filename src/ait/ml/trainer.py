@@ -14,7 +14,7 @@ from ait.data.market_data import MarketDataService
 from ait.ml.drift import DriftDetector
 from ait.ml.ensemble import DirectionPredictor
 from ait.utils.logging import get_logger
-from ait.utils.time import today_et
+from ait.utils.time import drop_incomplete_session, today_et
 
 log = get_logger("ml.trainer")
 
@@ -257,7 +257,8 @@ class ModelTrainer:
                 continue
 
             # W65: persist the provider that served the frame (IB_TRADES_RTH / YAHOO_UNADJ)
-            self._store.save(symbol, df, source=df.attrs.get("source"))
+            # W89: never persist today's mid-session (partial) bar; training still sees `df` as before.
+            self._store.save(symbol, drop_incomplete_session(df), source=df.attrs.get("source"))
             accuracies = self._predictor.train(
                 df, symbol=symbol, market_context=market_context
             )

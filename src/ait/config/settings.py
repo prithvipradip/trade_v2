@@ -1531,6 +1531,11 @@ class MLConfig(_StrictModel):
     ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
+    retrain_ib_client_id: int = Field(default=94, ge=2, le=999_999,
+        description="W89: IB API client id the supervisor's daily retrain connects with, to fetch daily "
+                    "bars from IB (no Yahoo fallback). Must differ from IBKR_CLIENT_ID and its fallback "
+                    "ladder (base+100..base+104) and from data_collection.short_dte_client_id (91); the "
+                    "retrain refuses to run otherwise. 90 = backfill_historical_data.py by convention.")
     min_training_samples: int = Field(default=100, ge=30)
     # ABLATION VERDICT REVERSED 2026-08-08 (rule B1 pre-registered in PLAN).
     # The 08-03 "gates veto nothing" run was VACUOUS: per-window training

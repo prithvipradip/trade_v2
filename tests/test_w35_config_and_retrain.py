@@ -77,7 +77,23 @@ class TestTheRetrainUsesTheLiveRangeSpec:
             return {}
 
         monkeypatch.setattr(ModelTrainer, "train_all_symbols", _no_training)
-        monkeypatch.setattr("ait.data.market_data.MarketDataService", MagicMock())
+        # W89: the script now opens its own IB session and pre-fetches every series, so the
+        # IB boundary is faked (a connected client + a service that returns one bar frame).
+        import pandas as pd
+        from unittest.mock import AsyncMock
+
+        class _Svc:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def get_historical(self, symbol, days=0, **kw):
+                return pd.DataFrame({"Close": [1.0]})
+
+        fake_ib = MagicMock()
+        fake_ib.disconnect = AsyncMock()
+        monkeypatch.setattr("ait.orchestration.retrain_ib.connect_from_settings",
+                            AsyncMock(return_value=fake_ib))
+        monkeypatch.setattr("ait.data.market_data.MarketDataService", _Svc)
         monkeypatch.setattr("ait.data.historical.HistoricalDataStore", MagicMock())
         monkeypatch.chdir(REPO)
         exec(compile(script, "<supervisor retrain script>", "exec"),

@@ -255,8 +255,12 @@ class MarketDataService:
         self,
         ibkr_client: IBKRClient,
         cache_ttl: int = 60,
+        daily_yahoo_fallback: bool = True,
     ) -> None:
         self._ibkr = ibkr_client
+        # W89: the daily retrain passes False -- it must store IB bars or none, never Yahoo's
+        # (different volume scale and source tag). Every other caller keeps the W65 chain.
+        self._daily_yahoo_fallback = daily_yahoo_fallback
         self._cache = TTLCache(default_ttl=cache_ttl)
         # R9 single-flight: per-cache-key asyncio.Lock so N concurrent cache
         # misses for the same key result in ONE network fetch (the rest wait,
@@ -340,6 +344,12 @@ class MarketDataService:
                 else:
                     log.warning("daily_history_ib_miss", symbol=symbol, days=days,
                                 note="IB daily history unavailable/short; using Yahoo")
+
+            # W89: a caller that opted out of the Yahoo daily fallback gets None, loudly.
+            if df is None and interval == "1d" and not self._daily_yahoo_fallback:
+                log.error("daily_history_unavailable_no_fallback", symbol=symbol, days=days,
+                          note="IB daily history unavailable/short and the Yahoo fallback is off")
+                return None
 
             # Fallback to Yahoo
             if df is None:
