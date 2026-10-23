@@ -18720,3 +18720,19 @@ Operator decision (2026-10-23): do group G as its own wave, after W90 was merged
 **Not in scope:** the `Backtester` stop/target divergence (W70 D, the operator's), the table unification (W91).
 
 ---
+
+## 2026-10-23 - W92 AS PLANNED (CORRECTION AND FINAL SCOPE; supersedes the scope in the entry above)
+
+Corrects the W92 AS PLANNED entry above after a fresh read of the code and two operator decisions. A first draft built before planning was DISCARDED (never committed); W92 restarts from the plan below. Built in a worktree on branch `w92`; same gates as W90.
+
+**Findings (read from `main`):**
+1. **`DriftDetector._check_interval` is stored and never read.** The docstring says the check "only runs every N predictions"; the code evaluates on every call. So `ml.drift_check_interval` is NOT a plain setting: it needs the throttle implemented.
+2. **The drift detector is dormant in an iron-condor-only book.** The orchestrator records a prediction on every scan (`orchestrator.py` ~2106) but an outcome only for directional strategies (~1281 skips iron_condor / short_strangle / long_straddle), so no sample ever completes and `check_drift()` always returns an empty report.
+3. **Regime effect on live decisions:** entry override (confidence `>` `ml.regime_override_confidence` 0.80 and HIGH_VOLATILITY -> NEUTRAL; moot for condors) and the exit thesis check (confidence `>` `exit.thesis_regime_shift_confidence` 0.70); also stored as `entry_regime`. Only the HIGH_VOLATILITY band feeds a gate; the other five confidence outputs are reported only.
+4. **Pre-existing quirk, registered and NOT changed:** HIGH_VOLATILITY confidence is `max(0.80, min(0.9, vol / 0.50))` and the entry gate is a strict `>` 0.80, so a VIX-triggered high-vol day with realized vol <= 40% scores exactly 0.80 and does not trigger the override (the R5 comment says the floor was meant to clear the gate). `>` vs `>=` is the operator's decision, separate from W92.
+
+**Operator decisions (2026-10-23):** (a) IMPLEMENT the drift throttle behind a config switch `ml.drift_detection_enabled`, default **Off** (live behaviour identical today because it never fired in the condor book; a directional book would get no drift-triggered retrains unless it is turned on), and expose every drift number with a plain explanation; (b) convert ALL 15 regime numbers (7 trend-score + 8 confidence outputs); (c) every new setting is explained in `config.yaml` (comment plus a pointer to the guide), in `RESEARCH_GUIDE.md` and in the schema `description`, in addition to each other.
+
+**Final scope:** `ml.drift_detection_enabled` (False), `drift_check_interval` (10, now implemented), `drift_min_samples` (20), `drift_min_high_confidence_samples` (5), the four existing `ml.drift_*` (50 / 0.40 / 0.80 / 0.25, comments rewritten), `ml.model_versions_kept` (5), `meta_label.{min_trades_for_training 30, min_class_trades 5, cv_max_splits 5, cv_min_rows_per_split 10}`, `regime.{trend_sma_periods, trend_slope_lookback, trend_slope_scale, trend_deviation_periods, trend_deviation_scale, trend_momentum_days, trend_momentum_scale}` and the eight confidence outputs. The census must end with ZERO `registered_followup`. Out of scope: the `>` vs `>=` gate, the W70 D stop/target divergence, W91.
+
+---
