@@ -18704,3 +18704,19 @@ No bot or supervisor process was running at the merge (no process; last `data/bo
 **NEXT.** (1) **W92 = group G** (label W91 is the table-unification plan above); plan it first, build it in a worktree on a branch (`w92`), same gates. (2) Restart (operator) also carries W88/W89/W90; after it, confirm the first IB retrain (see the W89 entry) and that the real models load without `model_spec_mismatch`. (3) W91 unchanged.
 
 ---
+
+## 2026-10-23 - W92 AS PLANNED: group G, the last live-shared numbers in the census (7 `registered_followup` entries)
+
+Operator decision (2026-10-23): do group G as its own wave, after W90 was merged. Same process as W90: built in a git worktree on branch `w92` (a second session may be editing this tree), one commit, reference dump / `gate_parity_ab` / `ex_div_gate_ab` / smoke byte-identical, mutation check, node-id reconciliation, fast lane, then merge. No bot or supervisor is running; nothing is restarted by this wave.
+
+**Scope (all values unchanged; each becomes a schema field in `config.yaml`, shared with live):**
+- `ml.model_versions_kept` (5): how many saved direction-model versions `DirectionPredictor._save_models` keeps.
+- `ml.drift_check_interval` (10), `ml.drift_min_high_confidence_samples` (5): `DriftDetector` (next to the four `ml.drift_*` it already reads).
+- `meta_label.min_trades_for_training` (30), `min_class_trades` (5), `cv_max_splits` (5), `cv_min_rows_per_split` (10): replaces `MIN_TRADES_FOR_TRAINING` and the inline floors of `MetaLabeler.train` (the meta-labeler is disabled; this only makes the numbers visible).
+- `regime.trend_*` (SMA slope periods 10/20/50, slope look-back 5, scale 100; deviation periods 20/50, scale 10; momentum days 20, scale 5) and the classifier's confidence outputs (`iv_crush_confidence` 0.7, `mean_revert_confidence_floor` 0.6, `low_vol_confidence` 0.7, `trend_confidence_cap` 0.95, `range_confidence_floor` 0.5, `high_vol_confidence_floor`/`_cap`/`_vol_scale` 0.80/0.9/0.50). The regime class and its confidence gate live defensive actions (the HIGH_VOLATILITY direction override), which is why they are in scope and why the wave is separate.
+- Left structural, with notes: estimator definitions (Hurst max lag, IV-rank window, the 20-day vol window) and the neutral priors 0.5.
+
+**Risk and verification.** Values equal today's, so the live behaviour must not move: the regime detector gets a golden-input test (classes and confidences over a seeded price panel, before vs after), the drift detector and the version pruning get perturbation tests, and the real `models/*.pkl` are loaded before/after as in W90d. The census must end with ZERO `registered_followup`.
+**Not in scope:** the `Backtester` stop/target divergence (W70 D, the operator's), the table unification (W91).
+
+---
