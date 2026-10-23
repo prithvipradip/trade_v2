@@ -239,6 +239,10 @@ class TestSchema:
         with pytest.raises(ValueError):
             _cfg(**{f"{group}.{field}": bad})
 
+    def test_a_minimum_equal_to_its_window_is_allowed(self):
+        assert _cfg(**{"market_structure.put_call_min_periods": 10}).market_structure.put_call_min_periods == 10
+        assert _cfg(**{"cross_asset.corr_min_periods": 20}).cross_asset.corr_min_periods == 20
+
     def test_unknown_keys_are_a_startup_error(self):
         with pytest.raises(ValueError):
             FeaturesConfig(macro={"change_dayz": 20})
@@ -408,6 +412,30 @@ class TestEveryWindowChangesTheExpectedColumns:
         g = _fe().compute(short)
         assert g["distance_sma200"].nunique() == 1 and g["distance_sma200"].iloc[0] == 0.0 and g["above_sma200"].iloc[0] == 1.0
 
+    def test_the_neutral_branches_write_the_renamed_columns(self):
+        """When a feed is absent the neutral value goes into the column under its CURRENT (renamed) name."""
+        renamed = {"market_structure.long_sma_window": 150, "market_structure.long_sma_min_periods": 100,
+                   "cross_asset.vix_change_short": 4, "cross_asset.vix_change_long": 15, "cross_asset.rel_short": 4,
+                   "cross_asset.rel_mid": 15, "cross_asset.rel_long": 50, "cross_asset.spy_momentum_days": 8,
+                   "cross_asset.spy_rsi_period": 10, "cross_asset.corr_window": 25, "macro.change_days": 15,
+                   "macro.dxy_change_short": 4, "macro.dxy_change_long": 15}
+        fe = _fe(**renamed)
+        # (a) no market context at all, and a frame shorter than the long SMA window
+        short = fe.compute(BASE_DF.iloc[:140])
+        assert (short["above_sma150"] == 1.0).all() and (short["distance_sma150"] == 0.0).all()
+        for c in ("vix_change_4d", "vix_change_15d", "rel_strength_4d", "rel_strength_15d", "rel_strength_50d",
+                  "spy_momentum_8d", "correlation_spy_25d", "yield_curve_change_15d", "us_10y_change_15d", "dxy_change_4d",
+                  "dxy_change_15d"):
+            assert (short[c] == 0.0).all(), c
+        assert (short["spy_rsi_10"] == 50.0).all()                         # the no-context neutral RSI
+        # (b) VIX / SPY present but too short to use, and no macros
+        thin = {"vix": CTX["vix"].iloc[:15], "spy": CTX["spy"].iloc[:15]}
+        out = fe.compute(BASE_DF, market_context=thin)
+        assert (out["spy_rsi_10"] == 0.5).all()                            # the short-context neutral RSI
+        for c in ("vix_change_4d", "vix_change_15d", "rel_strength_4d", "spy_momentum_8d", "correlation_spy_25d",
+                  "yield_curve_change_15d", "us_10y_change_15d", "dxy_change_4d", "dxy_change_15d"):
+            assert (out[c] == 0.0).all(), c
+
     def test_the_long_sma_minimum_periods_set_the_first_row_kept(self, base):
         f = _fe(**{"market_structure.long_sma_min_periods": 60}).compute(BASE_DF, market_context=CTX)
         assert len(f) > len(base) and f.index[0] < base.index[0]
@@ -540,6 +568,12 @@ class TestIntradayWindows:
         df = self.FRAME
         assert _fe(**{"intraday.hour_bars": 6}).compute_intraday_features(df)["intraday_momentum_1h"] == \
             pytest.approx(float(df["Close"].pct_change(6).iloc[-1]))
+
+    def test_the_intraday_mfdfa_minimum_overrides_the_daily_one_when_lower(self):
+        frame = self.FRAME.iloc[-400:]                                   # 399 returns: below the daily 500
+        assert FeatureEngine().compute_intraday_features(frame)["mfdfa_width_intraday"] == 0.0
+        lowered = _fe(**{"intraday.mfdfa_min_returns": 300}).compute_intraday_features(frame)["mfdfa_width_intraday"]
+        assert lowered != 0.0
 
     def test_the_scale_spread_minimum_gates_the_multiscale_hurst(self, monkeypatch):
         monkeypatch.setattr(FeatureEngine, "_multiscale_hurst", lambda self, s: (0.2, 0.6))
