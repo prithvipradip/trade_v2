@@ -119,6 +119,7 @@ class StrategyOptimizer:
         penalty_on_range_prob: float | None = None,
         hard_min_trades: int | None = None,          # W67 graded objective (None -> config)
         below_floor_gradient: float | None = None,
+        below_floor_score: float | None = None,     # W95: None -> backtest.optimize_below_floor_score (was a -100 literal)
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
@@ -344,6 +345,9 @@ class StrategyOptimizer:
         self._below_floor_gradient = float(_rcv(
             below_floor_gradient, "backtest", "optimize_below_floor_gradient", _BTC2,
             self._settings))
+        self._below_floor_score = float(_rcv(
+            below_floor_score, "backtest", "optimize_below_floor_score", _BTC2,
+            self._settings))                                                                  # W95
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -533,7 +537,7 @@ class StrategyOptimizer:
         trial.set_user_attr("n_trades", int(result.total_trades))
         trial.set_user_attr("entry_funnel_top", _top_rejections(result.entry_funnel))
         if result.total_trades < self._hard_min_trades:
-            return -100.0 + self._below_floor_gradient * (
+            return self._below_floor_score + self._below_floor_gradient * (       # W95: was -100.0
                 result.total_trades / max(self._hard_min_trades, 1))
         if self._min_trades > 0 and result.total_trades < self._min_trades:
             _f = (result.total_trades / self._min_trades) ** 2

@@ -124,7 +124,7 @@ class TestTheShippedFiles:
                          "friction_model", "friction_entry_capture", "friction_exit_capture",
                          "friction_stress_multiplier", "gates_mode", "fractal_veto_spread",
                          "penalty_on_range_prob", "iv_rank_gate", "optimize_hard_min_trades",
-                         "optimize_below_floor_gradient", "budget_aware_wings"}
+                         "optimize_below_floor_gradient", "optimize_below_floor_score", "budget_aware_wings"}
         assert not research_only & set(base), research_only & set(base)
         assert "initial_capital" not in base            # field removed by W63 (extra="forbid")
 

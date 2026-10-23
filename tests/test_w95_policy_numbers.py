@@ -390,6 +390,74 @@ class TestOptimizerMinimum:
         assert not hasattr(om, "_MIN_BACKTEST_ROWS")
 
 
+class TestBelowFloorScore:
+    """The -100 base of the optimizer's graded below-floor ramp is ``backtest.optimize_below_floor_score``."""
+
+    def _score(self, opt, n, monkeypatch):
+        from tests.test_w67_regime_gate import _FakeResult, _FakeTrial
+        monkeypatch.setattr(opt, "_suggest_params", lambda trial: {})
+        monkeypatch.setattr(opt, "_run_backtest", lambda params: _FakeResult(n))
+        return opt._objective_fn(_FakeTrial())
+
+    def test_default_and_files(self):
+        from ait.config.settings import BacktestConfig
+        assert BacktestConfig().optimize_below_floor_score == -100.0 == load_settings().backtest.optimize_below_floor_score
+        research = yaml.safe_load((ROOT / "config_research.yaml").read_text())
+        live = yaml.safe_load((ROOT / "config.yaml").read_text())
+        assert research["backtest"]["optimize_below_floor_score"] == -100.0
+        assert "optimize_below_floor_score" not in live["backtest"]
+
+    def test_bounds_and_the_ramp_must_stay_negative(self):
+        from ait.config.settings import BacktestConfig
+        for bad in (0.0, 5.0, -1001.0):
+            with pytest.raises(Exception):
+                BacktestConfig(optimize_below_floor_score=bad)
+        with pytest.raises(ValueError, match="must stay below 0"):
+            BacktestConfig(optimize_below_floor_score=-10.0, optimize_below_floor_gradient=20.0)
+        with pytest.raises(ValueError, match="must stay below 0"):                  # exactly 0 is refused too
+            BacktestConfig(optimize_below_floor_score=-20.0, optimize_below_floor_gradient=20.0)
+        assert BacktestConfig(optimize_below_floor_score=-30.0, optimize_below_floor_gradient=20.0)
+
+    def test_the_optimizer_scores_a_starved_trial_from_the_setting(self, monkeypatch):
+        from tests.test_w67_regime_gate import _optimizer
+        assert self._score(_optimizer(objective="sharpe_ratio"), 0, monkeypatch) == -100.0
+        moved = _optimizer(objective="sharpe_ratio", below_floor_score=-250.0)
+        assert self._score(moved, 0, monkeypatch) == -250.0
+        assert self._score(moved, 2, monkeypatch) == pytest.approx(-250.0 + 20.0 * 2 / 3)
+
+    def test_the_setting_reaches_the_optimizer_from_the_loaded_config(self, monkeypatch):
+        from tests.test_w67_regime_gate import _optimizer
+        s = load_settings()
+        moved = s.model_copy(update={"backtest": s.backtest.model_copy(update={"optimize_below_floor_score": -300.0})})
+        assert _optimizer(objective="sharpe_ratio", settings=moved)._below_floor_score == -300.0
+
+    def test_the_walk_forward_hands_it_to_the_optimizer(self, monkeypatch, synth_df):
+        import ait.optimization.optimizer as optimizer_mod
+        captured: dict = {}
+
+        class _RecordingOptimizer:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+            def run(self, data, prior_params=None):
+                return SimpleNamespace(best_params={}, best_value=0.0, study=None)
+
+        monkeypatch.setattr(optimizer_mod, "StrategyOptimizer", _RecordingOptimizer)
+        wf = WalkForwardBacktester(["SPY"], ["iron_condor"], config=WalkForwardConfig(
+            train_window_models=False, optimize_below_floor_score=-300.0))
+        wf._optimize_window_params(synth_df, "SPY", 1, ["iron_condor"])
+        assert captured["below_floor_score"] == -300.0
+        assert captured["below_floor_gradient"] == 20.0
+
+    def test_the_walk_forward_passes_it_down(self, monkeypatch):
+        s = load_settings()
+        moved = s.model_copy(update={"backtest": s.backtest.model_copy(update={"optimize_below_floor_score": -300.0})})
+        import ait.config.settings as st
+        monkeypatch.setattr(st, "_FROZEN", moved)
+        assert WalkForwardConfig(train_window_models=False).optimize_below_floor_score == -300.0
+        assert WalkForwardConfig(train_window_models=False, optimize_below_floor_score=-50.0).optimize_below_floor_score == -50.0
+
+
 # --------------------------------------------------------------------------------------------------------------
 # the ninth number: a named constant, and no bare converted number is left behind
 # --------------------------------------------------------------------------------------------------------------

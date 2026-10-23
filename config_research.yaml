@@ -127,7 +127,8 @@ backtest:
   fractal_veto_spread: 0.0             # absolute hurst spread veto for neutral structures (0 = off = live today)
   penalty_on_range_prob: 0.0           # fractal penalty also lowers P(in range) (0 = off = live today)
   optimize_hard_min_trades: 3          # below this a trial scores on the graded floor (not a flat -100)
-  optimize_below_floor_gradient: 20.0  # -100 (0 trades) rising toward -80; 0 restores the flat -100
+  optimize_below_floor_gradient: 20.0  # the score rises from the base below by up to this much as trades approach the floor; 0 = flat
+  optimize_below_floor_score: -100.0   # W95: the score of a trial with ZERO trades (the base of the ramp); must stay far below any real score (see docs/RESEARCH_GUIDE.md, "The optimizer")
 
   # --- W68: IV-rank parity (research up to date with live) ---
   iv_rank_gate: true                   # live's two IV-RANK gates on credit entries: condor refuses rank < ic_iv_rank_floor

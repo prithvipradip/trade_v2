@@ -198,6 +198,7 @@ class WalkForwardConfig:
     optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
     optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
     optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
+    optimize_below_floor_score: float | None = None      # W95: None -> backtest.* (was a -100 literal in the optimizer)
     optimize_seed: int | None = None   # TPESampler seed; None -> backtest.walkforward_tuning.optimize_seed (W90a: was 42)
     # W90b: ``range_threshold_pct`` (0.05) was removed: nothing read it (the per-window range band is computed by
     # _adaptive_range_threshold, whose fallback is backtest.walkforward_tuning.range_threshold_fallback).
@@ -462,6 +463,9 @@ class WalkForwardConfig:
             BacktestConfig, _settings))
         self.optimize_below_floor_gradient = float(resolve_config_value(
             self.optimize_below_floor_gradient, "backtest", "optimize_below_floor_gradient",
+            BacktestConfig, _settings))
+        self.optimize_below_floor_score = float(resolve_config_value(
+            self.optimize_below_floor_score, "backtest", "optimize_below_floor_score",
             BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
@@ -2225,6 +2229,7 @@ class WalkForwardBacktester:
                     penalty_on_range_prob=self._config.penalty_on_range_prob,
                     hard_min_trades=self._config.optimize_hard_min_trades,
                     below_floor_gradient=self._config.optimize_below_floor_gradient,
+                    below_floor_score=self._config.optimize_below_floor_score,
                     economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,

@@ -1106,12 +1106,27 @@ class BacktestConfig(_StrictModel):
                     "Trials below this are penalised quadratically; < 3 trades always scores −100.")
     optimize_hard_min_trades: int = Field(default=3, ge=1, le=50,
         description="W67: below this many trades a trial is scored on the graded floor "
-                    "(-100 + optimize_below_floor_gradient x n/hard_min), not the old flat -100 "
+                    "(optimize_below_floor_score + optimize_below_floor_gradient x n/hard_min), not the old flat -100 "
                     "that left TPE nothing to climb (28 of 30 W65 studies never left it).")
     optimize_below_floor_gradient: float = Field(default=20.0, ge=0.0, le=90.0,
         description="W67: points the below-floor score rises from -100 (0 trades) toward "
-                    "-100 + this value (hard_min_trades - 1 trades), so trading beats not "
-                    "trading. 0 restores the flat -100.")
+                    "optimize_below_floor_score + this value (hard_min_trades - 1 trades), so "
+                    "trading beats not trading. 0 restores a flat score.")
+    optimize_below_floor_score: float = Field(default=-100.0, ge=-1000.0, le=-1.0,
+        description="W95: the score of a trial with ZERO trades, the bottom of the graded below-floor ramp (the base that "
+                    "optimize_below_floor_gradient rises from). It must stay below what any real trial can score, so every "
+                    "starved trial ranks last: -100 is far below any Sharpe / win-rate / profit-factor objective. Change "
+                    "it only if you add an objective whose scores can be that low or lower. The base plus the gradient "
+                    "must stay negative.")
+
+    @model_validator(mode="after")
+    def _below_floor_ramp_stays_negative(self) -> "BacktestConfig":
+        if self.optimize_below_floor_score + self.optimize_below_floor_gradient >= 0:
+            raise ValueError(
+                f"backtest: optimize_below_floor_score ({self.optimize_below_floor_score}) + optimize_below_floor_gradient "
+                f"({self.optimize_below_floor_gradient}) must stay below 0, or a trial with too few trades could outrank "
+                f"a real one")
+        return self
     gates_mode: str = Field(default="observe", pattern="^(observe|enforce)$",
         description="W67: research ML-gate mode. observe = live parity today "
                     "(ml.entry_gates_enabled=false: the range-model floor and fractal veto are "
