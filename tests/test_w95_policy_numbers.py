@@ -66,6 +66,10 @@ def _freeze(monkeypatch, *, eng=None, wt=None, regime=None, lookback=None):
     if lookback is not None:
         vr = s.ml.features.vol_regime.model_copy(update={"iv_rank_lookback": lookback})
         upd["ml"] = s.ml.model_copy(update={"features": s.ml.features.model_copy(update={"vol_regime": vr})})
+        # W97: the context check reads FeatureSpec.longest_lookback() (the longest of ~10 windows, 252 at the defaults), so
+        # a small test context needs that to be small too; the real definition is tested in test_w97_feature_windows.py
+        from ait.ml.feature_spec import FeatureSpec
+        monkeypatch.setattr(FeatureSpec, "longest_lookback", lambda self: lookback)
     moved = s.model_copy(update=upd)
     monkeypatch.setattr(st, "_FROZEN", moved)
     return moved

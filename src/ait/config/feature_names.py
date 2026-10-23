@@ -15,7 +15,8 @@ if TYPE_CHECKING:  # pragma: no cover
 # Bump when the MATHS of a feature group changes (not when a window does): it invalidates every recorded hash.
 FEATURE_SET_VERSION = 1
 
-# The model feature list, in its fixed order. ``{role}`` placeholders are the thirteen window-bearing names.
+# The model feature list, in its fixed order. ``{role}`` placeholders are the window-bearing names (thirteen from W88d, fourteen
+# more from W97: the long-SMA pair, the VIX / relative-strength / SPY / correlation columns and the macro changes).
 _BASE_TEMPLATE: tuple[str, ...] = (
     # Momentum
     "{rsi_long}", "{rsi_short}", "macd", "macd_signal", "macd_hist",
@@ -31,7 +32,7 @@ _BASE_TEMPLATE: tuple[str, ...] = (
     "{slope_fast}", "{slope_mid}",
     "{px_vs_mid}", "{px_vs_slow}",
     "{cross}",
-    "above_sma200", "distance_sma200",
+    "{above_sma_long}", "{distance_sma_long}",
     # Price action
     "daily_return", "gap", "body_size", "upper_wick", "lower_wick",
     "consecutive_up", "consecutive_down",
@@ -42,15 +43,15 @@ _BASE_TEMPLATE: tuple[str, ...] = (
     "iv_rank", "vol_ratio", "vol_trend", "vol_of_vol",
     "vol_regime_expanding", "vol_mean_reversion_signal",
     # Cross-Asset (VIX + relative strength)
-    "vix_level", "vix_change_5d", "vix_change_20d",
+    "vix_level", "{vix_change_short}", "{vix_change_long}",
     "vix_zscore", "vix_term_spread",
-    "rel_strength_5d", "rel_strength_20d", "rel_strength_60d",
-    "spy_momentum_10d", "spy_rsi_14", "correlation_spy_20d",
+    "{rel_short}", "{rel_mid}", "{rel_long}",
+    "{spy_momentum}", "{spy_rsi}", "{corr_spy}",
     # Macro (yield curve + DXY from FRED)
     "us_2y_yield_level", "us_10y_yield_level",
-    "yield_curve_spread", "yield_curve_inverted", "yield_curve_change_20d",
-    "dxy_level_norm", "dxy_change_5d", "dxy_change_20d",
-    "us_10y_change_20d",
+    "yield_curve_spread", "yield_curve_inverted", "{yield_curve_change}",
+    "dxy_level_norm", "{dxy_change_short}", "{dxy_change_long}",
+    "{us10y_change}",
     # Seasonality
     "day_of_week", "month_of_year",
     # Fractal / multi-scale
@@ -75,6 +76,7 @@ _RAW_ROLES = ("sma_fast", "sma_mid", "sma_slow", "ema_fast", "ema_slow", "atr_ra
 def derive_names(cfg: "FeaturesConfig") -> dict[str, str]:
     """role -> column name for every window-bearing column (model features AND raw helper columns)."""
     m, v, vo, tr = cfg.momentum, cfg.volatility, cfg.volume, cfg.trend
+    ms, ca, mc = cfg.market_structure, cfg.cross_asset, cfg.macro                       # W97
     return {
         "rsi_long": f"rsi_{m.rsi_long}", "rsi_short": f"rsi_{m.rsi_short}",
         "roc_short": f"roc_{m.roc_short}", "roc_mid": f"roc_{m.roc_mid}", "roc_long": f"roc_{m.roc_long}",
@@ -86,6 +88,15 @@ def derive_names(cfg: "FeaturesConfig") -> dict[str, str]:
         # raw helper columns (in the frame, not model inputs)
         "sma_fast": f"sma_{tr.sma_fast}", "sma_mid": f"sma_{tr.sma_mid}", "sma_slow": f"sma_{tr.sma_slow}",
         "ema_fast": f"ema_{m.macd_fast}", "ema_slow": f"ema_{m.macd_slow}", "atr_raw": f"atr_{v.atr_window}",
+        # W97: the cross-asset / macro / long-SMA model columns whose name embeds a window
+        "above_sma_long": f"above_sma{ms.long_sma_window}", "distance_sma_long": f"distance_sma{ms.long_sma_window}",
+        "vix_change_short": f"vix_change_{ca.vix_change_short}d", "vix_change_long": f"vix_change_{ca.vix_change_long}d",
+        "rel_short": f"rel_strength_{ca.rel_short}d", "rel_mid": f"rel_strength_{ca.rel_mid}d",
+        "rel_long": f"rel_strength_{ca.rel_long}d",
+        "spy_momentum": f"spy_momentum_{ca.spy_momentum_days}d", "spy_rsi": f"spy_rsi_{ca.spy_rsi_period}",
+        "corr_spy": f"correlation_spy_{ca.corr_window}d",
+        "yield_curve_change": f"yield_curve_change_{mc.change_days}d", "us10y_change": f"us_10y_change_{mc.change_days}d",
+        "dxy_change_short": f"dxy_change_{mc.dxy_change_short}d", "dxy_change_long": f"dxy_change_{mc.dxy_change_long}d",
     }
 
 

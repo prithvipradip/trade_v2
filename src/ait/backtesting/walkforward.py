@@ -80,14 +80,17 @@ def fetched_rows_sufficient(rows: int, minimum: int) -> bool:
 
 
 def check_oos_context_covers_features(context_bars: int, iv_rank_lookback: int) -> None:
-    """W95: refuse an out-of-sample context shorter than the feature spec's IV-rank look-back. A shorter context does not
+    """W95: refuse an out-of-sample context shorter than the feature spec's longest look-back. A shorter context does not
     fail, it silently changes the feature VALUES in the test window (measured: ``iv_rank`` differs below 252 bars,
-    ``distance_sma200`` below 200) so the model is scored on inputs it was not trained on."""
+    ``distance_sma200`` below 200) so the model is scored on inputs it was not trained on.
+
+    W97: the look-back passed in is ``FeatureSpec.longest_lookback()`` (the longest ``ml.features`` window: by default the
+    IV-rank range, ``vol_regime.iv_rank_lookback``, 252)."""
     if context_bars < iv_rank_lookback:
         raise ValueError(
-            f"backtest.walkforward_tuning.oos_feature_context_bars ({context_bars}) is below the feature spec's IV-rank "
-            f"look-back ml.features.vol_regime.iv_rank_lookback ({iv_rank_lookback}): the test-window features would not "
-            f"match the ones the model was trained on. Raise it to at least {iv_rank_lookback}.")
+            f"backtest.walkforward_tuning.oos_feature_context_bars ({context_bars}) is below the feature spec's longest "
+            f"look-back ({iv_rank_lookback}; by default ml.features.vol_regime.iv_rank_lookback): the test-window features "
+            f"would not match the ones the model was trained on. Raise it to at least {iv_rank_lookback}.")
 
 
 @dataclass
@@ -1274,8 +1277,7 @@ class WalkForwardBacktester:
         # W88d: the feature windows (ml.features) every FeatureEngine of this run computes with
         self._fspec = spec_from_config(getattr(getattr(self._settings, "ml", None), "features", None))
         # W95: the test-window context must reach back as far as the IV-rank feature does (refused otherwise)
-        check_oos_context_covers_features(self._tuning.oos_feature_context_bars,
-                                          self._fspec.cfg.vol_regime.iv_rank_lookback)
+        check_oos_context_covers_features(self._tuning.oos_feature_context_bars, self._fspec.longest_lookback())   # W97
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 

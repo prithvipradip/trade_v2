@@ -809,7 +809,8 @@ class WalkForwardTuningConfig(_StrictModel):
                     "default is one trading year: the IV-rank feature looks back ml.features.vol_regime.iv_rank_lookback (252) "
                     "bars. A shorter context does not fail, it changes the feature VALUES the model sees in the test window "
                     "(iv_rank below 252, distance_sma200 below 200) so they differ from the ones it was trained on; for that "
-                    "reason a value below the feature spec's IV-rank look-back is refused when the walk-forward starts. Not "
+                    "reason a value below the feature spec's longest look-back (FeatureSpec.longest_lookback(): by default the IV-rank "
+                    "range, 252) is refused when the walk-forward starts. Not "
                     "backtest.context_bars, which is the engine's own intraday look-back.")
     meta_label_min_window_rows: int = Field(default=60, ge=1, le=5000,
         description="W95: the meta-labeler is trained for a window only when the training window has MORE than this many bars "
@@ -1575,6 +1576,149 @@ class VolRegimeWindows(_StrictModel):
         return self
 
 
+def _min_within(label: str, **pairs: tuple[int, int]) -> None:
+    """W97: raise unless every ``min_periods`` is at most its window (name -> (min_periods, window))."""
+    for name, (mn, win) in pairs.items():
+        if mn > win:
+            raise ValueError(f"features.{label}: {name} min_periods ({mn}) cannot exceed its window ({win})")
+
+
+class MarketStructureWindows(_StrictModel):
+    """W97: windows of the market-structure features (put/call proxy, vol term structure, skew proxy, momentum divergence,
+    the long moving average, range compression). Of these only ``above_sma<n>`` / ``distance_sma<n>`` are model inputs and
+    carry the long window in their name; the other columns stay in the frame under fixed names. Defaults = the pre-W97 literals."""
+
+    put_call_window: int = Field(default=10, ge=2, le=200,
+        description="W97: days the up-volume and down-volume are summed over for the put/call proxy.")
+    put_call_min_periods: int = Field(default=5, ge=1, le=200,
+        description="W97: ... and the fewest days it needs before it reports (the rest read neutral).")
+    term_fast: int = Field(default=5, ge=2, le=200,
+        description="W97: short realized-vol window of the vol term-structure proxy (short vol / long vol).")
+    term_slow: int = Field(default=60, ge=3, le=500, description="W97: long realized-vol window of the same proxy.")
+    skew_window: int = Field(default=20, ge=2, le=400,
+        description="W97: window of the downside / upside volatility ratio (the skew proxy).")
+    skew_min_periods: int = Field(default=10, ge=1, le=400, description="W97: fewest days the skew proxy needs.")
+    divergence_short: int = Field(default=5, ge=1, le=200,
+        description="W97: short return horizon of the momentum divergence (short return minus long return).")
+    divergence_long: int = Field(default=60, ge=2, le=500, description="W97: long return horizon of the same measure.")
+    long_sma_window: int = Field(default=200, ge=20, le=1000,
+        description="W97: the long moving average behind above_sma<n> and distance_sma<n> (the column names carry this "
+                    "number). Also the history needed before they read anything but their neutral value.")
+    long_sma_min_periods: int = Field(default=100, ge=2, le=1000,
+        description="W97: fewest days the long moving average needs before it is defined.")
+    range_fast: int = Field(default=5, ge=1, le=200,
+        description="W97: short window of the range-compression ratio (short average range / long average range).")
+    range_slow: int = Field(default=20, ge=2, le=400, description="W97: long window of the same ratio.")
+
+    @model_validator(mode="after")
+    def _check(self) -> "MarketStructureWindows":
+        _ordered("market_structure.term", term_fast=self.term_fast, term_slow=self.term_slow)
+        _ordered("market_structure.divergence", divergence_short=self.divergence_short, divergence_long=self.divergence_long)
+        _ordered("market_structure.range", range_fast=self.range_fast, range_slow=self.range_slow)
+        _min_within("market_structure", put_call=(self.put_call_min_periods, self.put_call_window),
+                    skew=(self.skew_min_periods, self.skew_window), long_sma=(self.long_sma_min_periods, self.long_sma_window))
+        return self
+
+
+class CrossAssetWindows(_StrictModel):
+    """W97: windows of the cross-asset features (VIX level changes and z-score, relative strength against SPY, SPY momentum
+    and RSI, correlation with SPY). A window that appears in a column name renames the column when changed
+    (``vix_change_5d`` -> ``vix_change_3d``). Defaults = the pre-W97 literals."""
+
+    vix_change_short: int = Field(default=5, ge=1, le=100, description="W97: short VIX change horizon (column vix_change_<n>d).")
+    vix_change_long: int = Field(default=20, ge=2, le=400, description="W97: long VIX change horizon (column vix_change_<n>d).")
+    vix_z_window: int = Field(default=60, ge=5, le=500, description="W97: window of the VIX z-score (vix_zscore).")
+    vix_z_min_periods: int = Field(default=20, ge=2, le=500, description="W97: fewest days the VIX z-score needs.")
+    vix_term_fast: int = Field(default=5, ge=2, le=200,
+        description="W97: fast VIX average of vix_term_spread (fast average minus slow average, over the slow one).")
+    vix_term_slow: int = Field(default=20, ge=3, le=400, description="W97: slow VIX average of vix_term_spread.")
+    rel_short: int = Field(default=5, ge=1, le=100, description="W97: shortest relative-strength horizon (column rel_strength_<n>d).")
+    rel_mid: int = Field(default=20, ge=2, le=200, description="W97: middle relative-strength horizon (column rel_strength_<n>d).")
+    rel_long: int = Field(default=60, ge=3, le=500, description="W97: longest relative-strength horizon (column rel_strength_<n>d).")
+    spy_momentum_days: int = Field(default=10, ge=1, le=200, description="W97: SPY return horizon (column spy_momentum_<n>d).")
+    spy_rsi_period: int = Field(default=14, ge=2, le=200, description="W97: SPY RSI period (column spy_rsi_<n>).")
+    corr_window: int = Field(default=20, ge=3, le=400, description="W97: window of the rolling correlation with SPY (column correlation_spy_<n>d).")
+    corr_min_periods: int = Field(default=10, ge=2, le=400, description="W97: fewest days that correlation needs.")
+    min_context_rows: int = Field(default=20, ge=1, le=2000,
+        description="W97: a VIX or SPY history needs MORE than this many rows to be used (otherwise its columns read neutral).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "CrossAssetWindows":
+        _ordered("cross_asset.vix_change", vix_change_short=self.vix_change_short, vix_change_long=self.vix_change_long)
+        _ordered("cross_asset.vix_term", vix_term_fast=self.vix_term_fast, vix_term_slow=self.vix_term_slow)
+        _ordered("cross_asset.rel", rel_short=self.rel_short, rel_mid=self.rel_mid, rel_long=self.rel_long)
+        _min_within("cross_asset", vix_z=(self.vix_z_min_periods, self.vix_z_window), corr=(self.corr_min_periods, self.corr_window))
+        return self
+
+
+class MacroWindows(_StrictModel):
+    """W97: windows of the macro features (FRED yield curve and the dollar index). Defaults = the pre-W97 literals."""
+
+    change_days: int = Field(default=20, ge=1, le=400,
+        description="W97: horizon of the yield-curve and 10-year-yield changes (columns yield_curve_change_<n>d, us_10y_change_<n>d).")
+    dxy_change_short: int = Field(default=5, ge=1, le=200, description="W97: short dollar-index change horizon (column dxy_change_<n>d).")
+    dxy_change_long: int = Field(default=20, ge=2, le=400, description="W97: long dollar-index change horizon (column dxy_change_<n>d).")
+    dxy_center: float = Field(default=100.0, gt=0.0, le=1000.0,
+        description="W97: the dollar-index level that reads 0 in dxy_level_norm = (dxy - center) / scale.")
+    dxy_scale: float = Field(default=20.0, gt=0.0, le=1000.0,
+        description="W97: points of the dollar index that make 1.0 in dxy_level_norm (clipped to +/-2).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "MacroWindows":
+        _ordered("macro.dxy_change", dxy_change_short=self.dxy_change_short, dxy_change_long=self.dxy_change_long)
+        return self
+
+
+class FractalWindows(_StrictModel):
+    """W97: windows and minimum lengths of the daily fractal group (wavelet Hurst, power-spectrum slope, multi-scale Hurst,
+    multifractal width). The column names do not embed a window. The wavelet family, the MFDFA scales and the clip bounds
+    stay fixed algorithm constants. Defaults = the pre-W97 literals."""
+
+    hurst_short_window: int = Field(default=60, ge=16, le=1000,
+        description="W97: bars of the short Hurst estimate (hurst_short); with fewer bars than the long window only this one is reported.")
+    hurst_long_window: int = Field(default=180, ge=32, le=2000, description="W97: bars of the long Hurst estimate (hurst_long).")
+    hurst_min_len: int = Field(default=50, ge=16, le=1000,
+        description="W97: the wavelet Hurst estimator returns its neutral 0.5 for a series shorter than this.")
+    psd_min_rows: int = Field(default=60, ge=8, le=2000,
+        description="W97: the power-spectrum slope returns its neutral value (beta 2.0) for a series shorter than this.")
+    min_rows: int = Field(default=50, ge=20, le=1000,
+        description="W97: the fractal group is all zeros below this many rows, and its expanding estimate starts at this row.")
+    mfdfa_min_returns: int = Field(default=500, ge=100, le=20000,
+        description="W97: the multifractal width and asymmetry need at least this many returns (else 0).")
+
+    @model_validator(mode="after")
+    def _check(self) -> "FractalWindows":
+        _ordered("fractal.hurst", hurst_short_window=self.hurst_short_window, hurst_long_window=self.hurst_long_window)
+        return self
+
+
+class IntradayWindows(_StrictModel):
+    """W97: bar counts of the intraday (VLMC) features computed from 5-minute bars. The 26 column names are a FIXED list and
+    do not follow these numbers (``intraday_momentum_1h`` keeps its name and then means ``hour_bars`` bars). Defaults = the
+    pre-W97 literals."""
+
+    hour_bars: int = Field(default=12, ge=2, le=78,
+        description="W97: bars that make 'an hour' (12 five-minute bars): the hourly momentum, the recent-range window and the power-hour window.")
+    rsi_period: int = Field(default=7, ge=2, le=100, description="W97: RSI period of intraday_rsi.")
+    atr_period: int = Field(default=14, ge=2, le=100, description="W97: ATR window of intraday_atr_pct.")
+    closing_bars: int = Field(default=3, ge=2, le=20, description="W97: last bars of the session behind the closing-imbalance features.")
+    min_bars: int = Field(default=20, ge=5, le=2000, description="W97: fewer intraday bars than this and no intraday feature is computed.")
+    session_min_rows: int = Field(default=10, ge=1, le=78,
+        description="W97: when per-day features are built from stored bars, a day with fewer bars than this is skipped.")
+    load_buffer_days: int = Field(default=10, ge=0, le=365,
+        description="W97: calendar days added to the feature frame's length when the store can only load 'the last n days' "
+                    "(the fallback loader; stores that load a date range ignore it).")
+    session_min_bars: int = Field(default=3, ge=1, le=78,
+        description="W97: today's session needs at least this many bars for the session-structure features (else they read 0).")
+    hurst_min_bars: int = Field(default=78, ge=16, le=5000, description="W97: bars (one session) the intraday wavelet Hurst needs.")
+    scale_spread_min_bars: int = Field(default=200, ge=32, le=5000,
+        description="W97: bars (about three sessions) the intraday multi-scale Hurst spread needs.")
+    wavelet_min_bars: int = Field(default=40, ge=16, le=5000, description="W97: bars the wavelet-energy features need.")
+    psd_min_bars: int = Field(default=100, ge=8, le=5000, description="W97: bars the intraday power-spectrum slope needs.")
+    mfdfa_min_returns: int = Field(default=500, ge=100, le=20000,
+        description="W97: returns (about seven sessions) the intraday multifractal width needs.")
+
+
 class FeaturesConfig(_StrictModel):
     """W88d: the indicator windows of the core feature groups (``ml/features.py``).
 
@@ -1582,9 +1726,11 @@ class FeaturesConfig(_StrictModel):
     W88d, so ``config.yaml`` need not change anything; research may differ via the overlay or a study. Changing a window
     changes the feature VALUES, and for the thirteen model columns whose name embeds a window it changes the NAME too
     (``rsi_14`` -> ``rsi_10``). Every saved model records a hash of these windows and a model trained under other windows
-    is not served (it is retrained). Not here on purpose: the fractal / wavelet / Hurst group, the VLMC intraday
-    features, cross-asset, macro, seasonality and the market-structure group (fixed; registered), and the 252-day
-    annualisation constant."""
+    is not served (it is retrained). W97 added the market-structure, cross-asset, macro, fractal and intraday groups:
+    their windows are here too, and the spec hash covers them ONLY when one differs from its default, so at the default
+    values the hash (and every saved model) is unchanged. Not here on purpose: clip bounds, scales, neutral values, the
+    wavelet family and the MFDFA scales (algorithm constants), the seasonality encoding, and the 252-day annualisation
+    constant."""
 
     momentum: MomentumWindows = Field(default_factory=MomentumWindows)
     volatility: VolatilityWindows = Field(default_factory=VolatilityWindows)
@@ -1592,6 +1738,12 @@ class FeaturesConfig(_StrictModel):
     trend: TrendWindows = Field(default_factory=TrendWindows)
     multi_timeframe: MultiTimeframeWindows = Field(default_factory=MultiTimeframeWindows)
     vol_regime: VolRegimeWindows = Field(default_factory=VolRegimeWindows)
+    # W97: hashed only when a value differs from its default (ml/feature_spec.py), so listing them changes no saved model
+    market_structure: MarketStructureWindows = Field(default_factory=MarketStructureWindows)
+    cross_asset: CrossAssetWindows = Field(default_factory=CrossAssetWindows)
+    macro: MacroWindows = Field(default_factory=MacroWindows)
+    fractal: FractalWindows = Field(default_factory=FractalWindows)
+    intraday: IntradayWindows = Field(default_factory=IntradayWindows)
 
     @model_validator(mode="after")
     def _check(self) -> "FeaturesConfig":

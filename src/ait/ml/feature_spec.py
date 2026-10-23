@@ -36,9 +36,20 @@ from ait.config.feature_names import (  # noqa: F401 - re-exported: the names ar
     validate_names,
 )
 
+# W97: the groups added after W88d. They are hashed ONLY when a value differs from its default, so a spec at the default
+# values canonicalises exactly as it did before W97 and every saved model keeps the hash it was recorded with (changing
+# a W97 window changes the hash, and the usual refusal / retrain follows). Never remove a name from this tuple.
+_W97_GROUPS = ("market_structure", "cross_asset", "macro", "fractal", "intraday")
+
+
 def _hash(cfg: "FeaturesConfig") -> str:
-    canon = json.dumps({"version": FEATURE_SET_VERSION, "features": cfg.model_dump(mode="json")}, sort_keys=True)
-    return hashlib.sha256(canon.encode()).hexdigest()[:16]
+    features = cfg.model_dump(mode="json", exclude=set(_W97_GROUPS))
+    payload: dict = {"version": FEATURE_SET_VERSION, "features": features}
+    changed = {g: getattr(cfg, g).model_dump(mode="json", exclude_defaults=True) for g in _W97_GROUPS}
+    changed = {g: v for g, v in changed.items() if v}
+    if changed:
+        payload["w97"] = changed
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,17 @@ class FeatureSpec:
 
     def spec_hash(self) -> str:
         return _hash(self.cfg)
+
+    def longest_lookback(self) -> int:
+        """W97: the most history any windowed daily feature looks back over (bars). A walk-forward test window needs that
+        much context in front of it so its features match the ones the model was trained on; the longest of the IV-rank
+        range, the long moving average, the long Hurst window and the longest of the other daily windows (slow SMA, slow
+        volatility, long relative strength, VIX z-score, vol term structure, momentum divergence). 252 at the defaults (the
+        IV-rank range). The single definition: the walk-forward's context check reads it."""
+        c = self.cfg
+        return max(c.vol_regime.iv_rank_lookback, c.market_structure.long_sma_window, c.fractal.hurst_long_window,
+                   c.trend.sma_slow, c.vol_regime.slow, c.cross_asset.rel_long, c.cross_asset.vix_z_window,
+                   c.market_structure.term_slow, c.market_structure.divergence_long)
 
 
 def spec_from_config(cfg: "FeaturesConfig | None") -> FeatureSpec:

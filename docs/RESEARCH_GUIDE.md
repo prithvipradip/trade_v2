@@ -117,7 +117,7 @@ and the defaults are the old numbers, so no result moved.
 |---|---|---|
 | `engine_tuning.drawdown_high_lookback_rows` | 60 | Rows of closes in the rolling high the drawdown entry gate measures the fall from. The result keeps the name `pct_from_60d_high`. |
 | `engine_tuning.replay_lookback_days` | 60 | Calendar days of history the single-trade replay gives the engine before the entry date. 60 calendar days is about 42 trading rows, so a replayed engine's 60-row gates run on a shorter history than in a full run. |
-| `walkforward_tuning.oos_feature_context_bars` | 252 | Bars of the training tail put in front of each test window so the features have their look-back. A shorter context does not fail: it changes the feature values (`iv_rank` below 252 bars, `distance_sma200` below 200), so the model would be scored on inputs it was not trained on. A value below `ml.features.vol_regime.iv_rank_lookback` is refused when the walk-forward starts. Not `backtest.context_bars`, which is the engine's intraday look-back. |
+| `walkforward_tuning.oos_feature_context_bars` | 252 | Bars of the training tail put in front of each test window so the features have their look-back. A shorter context does not fail: it changes the feature values (`iv_rank` below 252 bars, `distance_sma200` below 200), so the model would be scored on inputs it was not trained on. A value below the feature spec's longest look-back (252 by default, the IV-rank range; it grows if you lengthen an `ml.features` window) is refused when the walk-forward starts. Not `backtest.context_bars`, which is the engine's intraday look-back. |
 | `walkforward_tuning.meta_label_min_window_rows` | 60 | The meta-labeler is trained for a window only when the training window has more than this many bars. A guard on length, not a context. |
 | `walkforward_tuning.min_fetched_rows` | 100 | A symbol is used only when more than this many daily bars were fetched. |
 | `walkforward_tuning.min_backtest_rows` | 60 | The optimizer's minimum daily bars: a symbol with fewer is dropped and a trial on fewer raises "insufficient data". With a validation split on, the split needs at least twice this many bars and a validation slice shorter than half of it is dropped. |
@@ -144,7 +144,7 @@ minimum); those are counted now, so a unit conversion (`x 100` shares per contra
 | `epsilon` | a numerical tolerance | `engine.py::Backtester._remark_t`: 0.0001-year floor on time to expiry | it keeps Black-Scholes finite at expiry and has no economic meaning |
 | `dormant_path` | legacy code off the iron-condor path | `engine.py::Backtester._quick_rsi`: period 14, neutral 50 | nothing on the iron-condor path reads it (the tunable legacy numbers are in `backtest.legacy_engine`) |
 | `display` | formatting only | `run_record.py::flatten`: 400-character cut of an MLflow parameter | it changes how a run is recorded, never the result |
-| `registered_followup` | transitional: a research number still in code, to be converted | `ml/features.py::FeatureEngine._add_cross_asset`: the 60-day return and VIX z-score windows | it should be a setting; it is shared with live, so it goes in `ml.features` and changes the feature-spec hash (saved models retrain): planned as W97 |
+| `registered_followup` | transitional: a research number still in code, to be converted | (none now: W97 converted the last of these, the `ml/features.py` windows) | it should be a setting; the category is empty again, and the census test rejects a placeholder note |
 
 **Reading an entry.**
 
@@ -219,9 +219,32 @@ records the values it was trained with, and loading a model trained under other 
 
 **Can I change the indicator windows?** Yes: `ml.features` (RSI, MACD, SMAs, realized vol, ...). The thirteen columns whose name embeds a window are renamed
 (`rsi_14` → `rsi_21`), every saved model records a hash of the windows, and a model trained under other windows is refused and retrained. RUNBOOK "Feature windows" lists what is in
-scope and what stays fixed.
+scope and what stays fixed. Since W97 that includes the cross-asset, macro, market-structure, fractal and intraday windows: see "The remaining feature windows".
 
 **Could a research run overwrite the live model?** No. Window models are throw-away (`persist_artifacts=False`) or go to `models/research/`.
+
+### The remaining feature windows (W97)
+
+**What is it?** Until W97 the windows of five feature groups were bare numbers in `ml/features.py`; they are `ml.features` settings now (`config.yaml`, shared by live and
+research; research differs only through the overlay or a study). The defaults are the old numbers, so nothing moved and **no saved model is refused or retrained**.
+
+| Group (`ml.features.`) | Settings (default) | Columns |
+|---|---|---|
+| `market_structure` | `put_call_window` 10 / `put_call_min_periods` 5, `term_fast` 5 / `term_slow` 60, `skew_window` 20 / `skew_min_periods` 10, `divergence_short` 5 / `divergence_long` 60, `long_sma_window` 200 / `long_sma_min_periods` 100, `range_fast` 5 / `range_slow` 20 | `above_sma<n>`, `distance_sma<n>` (the long window is in the name); `put_call_proxy`, `vix_term_structure`, `skew_proxy`, `momentum_divergence`, `range_compression` |
+| `cross_asset` | VIX change `vix_change_short` 5 / `vix_change_long` 20; VIX z-score `vix_z_window` 60 / `vix_z_min_periods` 20; VIX term `vix_term_fast` 5 / `vix_term_slow` 20; relative strength `rel_short` 5 / `rel_mid` 20 / `rel_long` 60; `spy_momentum_days` 10, `spy_rsi_period` 14; `corr_window` 20 / `corr_min_periods` 10; `min_context_rows` 20 | `vix_change_<n>d`, `rel_strength_<n>d`, `spy_momentum_<n>d`, `spy_rsi_<n>`, `correlation_spy_<n>d`; `vix_zscore`, `vix_term_spread` |
+| `macro` | `change_days` 20, `dxy_change_short` 5 / `dxy_change_long` 20, `dxy_center` 100, `dxy_scale` 20 | `yield_curve_change_<n>d`, `us_10y_change_<n>d`, `dxy_change_<n>d`; `dxy_level_norm` |
+| `fractal` | `hurst_short_window` 60 / `hurst_long_window` 180, `hurst_min_len` 50, `psd_min_rows` 60, `min_rows` 50, `mfdfa_min_returns` 500 | `hurst_*`, `psd_*`, `multifractal_*` (names do not change) |
+| `intraday` | `hour_bars` 12, `rsi_period` 7, `atr_period` 14, `closing_bars` 3, and the minimum-bar guards (`min_bars` 20, `session_min_rows` 10, `session_min_bars` 3, `hurst_min_bars` 78, `scale_spread_min_bars` 200, `wavelet_min_bars` 40, `psd_min_bars` 100, `mfdfa_min_returns` 500), `load_buffer_days` 10 | the 26 VLMC columns |
+
+**What follows a window?** Fourteen model columns carry a window in their name and are renamed with it, as `rsi_14` already was (`rel_long: 90` turns `rel_strength_60d` into `rel_strength_90d`). **The intraday column names are a fixed list and do
+not follow**: `intraday_momentum_1h` and the `power_hour_*` columns keep their names and then mean `hour_bars` bars, not an hour. Clip bounds, the neutral values a missing feed reads, the wavelet family and the MFDFA scales stay fixed algorithm constants.
+
+**Why no retrain?** The feature-spec hash covers the six W88d groups as before and these five groups **only when a value differs from its default**. At the defaults the hash is the same string it always was (`6e0e3f8f922f6b88`, recorded in `models/*.pkl`); change any of these windows and the hash changes, every saved model is refused (retrained), and
+old `entry_signals` snapshots keep the old names. A test pins the default hash and loads the real artifacts.
+
+**Minimums versus windows.** A `*_min_periods` only changes the first rows (they are dropped by the warm-up), so you see it at the start of a frame, not at its end. `long_sma_min_periods` can change how many rows a frame keeps.
+
+**The walk-forward context.** The out-of-sample context (`backtest.walkforward_tuning.oos_feature_context_bars`) must cover the longest window; the check reads `FeatureSpec.longest_lookback()` (the longest of the IV-rank range, the long SMA, the long Hurst window, the slow SMA, the slow vol window, the long relative-strength, VIX z-score, vol term and momentum-divergence windows): 252 by default.
 
 ### Drift detection (live; off by default)
 

@@ -173,7 +173,8 @@ class FeatureEngine:
                     symbol, pd.Timestamp(features.index.min()).date(),
                     pd.Timestamp(features.index.max()).date())
             else:
-                intraday = intraday_store.load_intraday(symbol, days=len(features) + 10)
+                intraday = intraday_store.load_intraday(
+                    symbol, days=len(features) + self._spec.cfg.intraday.load_buffer_days)     # W97: was + 10
             if intraday.empty:
                 return features
 
@@ -182,7 +183,7 @@ class FeatureEngine:
 
             rows: list[dict] = []
             for d, session in intraday.groupby(intraday.index.date):
-                if len(session) < 10:
+                if len(session) < self._spec.cfg.intraday.session_min_rows:     # W97: was 10
                     continue
                 try:
                     feats = self.compute_intraday_features(session)
@@ -227,7 +228,8 @@ class FeatureEngine:
         - 13 VLMC session structure features (VWAP trajectory, volume profile,
           power-hour momentum, closing imbalance)
         """
-        if intraday_df is None or len(intraday_df) < 20:
+        iw = self._spec.cfg.intraday                                  # W97: the bar counts below were literals
+        if intraday_df is None or len(intraday_df) < iw.min_bars:
             return {}
 
         close = intraday_df["Close"]
@@ -248,9 +250,9 @@ class FeatureEngine:
             (close.iloc[-1] - vwap_full.iloc[-1]) / vwap_full.iloc[-1]
         ) if vwap_full.iloc[-1] > 0 else 0.0
 
-        features["intraday_rsi"] = float(self._rsi(close, 7).iloc[-1])
+        features["intraday_rsi"] = float(self._rsi(close, iw.rsi_period).iloc[-1])
         features["intraday_momentum_1h"] = (
-            float(close.pct_change(12).iloc[-1]) if len(close) > 12 else 0.0
+            float(close.pct_change(iw.hour_bars).iloc[-1]) if len(close) > iw.hour_bars else 0.0
         )
 
         tr = pd.concat([
@@ -258,14 +260,14 @@ class FeatureEngine:
             (high - close.shift(1)).abs(),
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean()
+        atr = tr.rolling(iw.atr_period).mean()
         features["intraday_atr_pct"] = (
             float(atr.iloc[-1] / close.iloc[-1]) if close.iloc[-1] > 0 else 0.0
         )
         features["intraday_vol_ratio"] = (
             float(volume.iloc[-1] / volume.mean()) if volume.mean() > 0 else 1.0
         )
-        recent_range = (high.tail(12).max() - low.tail(12).min()) / close.iloc[-1]
+        recent_range = (high.tail(iw.hour_bars).max() - low.tail(iw.hour_bars).min()) / close.iloc[-1]
         session_range = (high.max() - low.min()) / close.iloc[-1]
         features["intraday_range_compression"] = (
             float(recent_range / session_range) if session_range > 0 else 1.0
@@ -281,21 +283,21 @@ class FeatureEngine:
         n = len(log_prices)
 
         # Hurst from wavelet variance on intraday log-prices (min 78 bars = 1 session)
-        if n >= 78:
+        if n >= iw.hurst_min_bars:
             h_intra, _ = self._hurst_wavelet(log_prices)
             features["hurst_wavelet_intraday"] = float(h_intra)
         else:
             features["hurst_wavelet_intraday"] = 0.0
 
         # Multi-scale Hurst spread (min 200 bars ≈ 3 sessions)
-        if n >= 200:
+        if n >= iw.scale_spread_min_bars:
             h_short, h_long = self._multiscale_hurst(log_prices)
             features["hurst_scale_spread_intraday"] = float(abs(h_short - h_long))
         else:
             features["hurst_scale_spread_intraday"] = 0.0
 
         # Wavelet energy at levels 3-5 (40-min, 80-min, 2.7-hour timescales)
-        if n >= 40:
+        if n >= iw.wavelet_min_bars:
             try:
                 coeffs = pywt.wavedec(log_prices, wavelet="db4", mode="periodization")
                 n_levels = len(coeffs) - 1
@@ -318,15 +320,15 @@ class FeatureEngine:
             features["wavelet_L5_energy"] = 0.0
 
         # PSD exponent on intraday log-prices (min 100 bars)
-        if n >= 100:
+        if n >= iw.psd_min_bars:
             beta, _ = self._psd_features(log_prices)
             features["psd_beta_intraday"] = float(beta)
         else:
             features["psd_beta_intraday"] = 0.0
 
         # MFDFA width on intraday log-returns (min 500 bars ≈ 7 sessions)
-        if len(log_returns) >= 500:
-            mf_w, _ = self._mfdfa_features(log_returns)
+        if len(log_returns) >= iw.mfdfa_min_returns:
+            mf_w, _ = self._mfdfa_features(log_returns, iw.mfdfa_min_returns)
             features["mfdfa_width_intraday"] = float(mf_w)
         else:
             features["mfdfa_width_intraday"] = 0.0
@@ -349,7 +351,7 @@ class FeatureEngine:
         ).values
         session = intraday_df[today_mask]
 
-        if len(session) < 3:
+        if len(session) < iw.session_min_bars:
             for key in (
                 "session_vwap_position", "session_vwap_q1", "session_vwap_q2",
                 "session_vwap_q3", "session_high_timing", "session_low_timing",
@@ -400,7 +402,7 @@ class FeatureEngine:
             features["session_volume_shape"]      = float((vol_first - vol_last) / vol_total)
 
             # Power-hour features: last 12 bars (≈60 min)
-            ph_n = min(12, s_n)
+            ph_n = min(iw.hour_bars, s_n)
             ph = session.iloc[-ph_n:]
             ph_close = ph["Close"]
             ph_vol   = ph["Volume"]
@@ -420,7 +422,7 @@ class FeatureEngine:
             )
 
             # Closing imbalance: last 3 bars
-            cb = session.iloc[-3:]
+            cb = session.iloc[-iw.closing_bars:]
             cb_close = cb["Close"]
             cb_high  = cb["High"]
             cb_low   = cb["Low"]
@@ -704,51 +706,51 @@ class FeatureEngine:
         high = df["High"]
         low = df["Low"]
         volume = df["Volume"]
+        ms, nm = self._spec.cfg.market_structure, self._spec.names          # W97: windows and derived column names
 
         # --- Put/Call proxy: ratio of down-volume to up-volume ---
         # Can't get real P/C ratio from OHLCV, but this captures the same fear dynamic
         price_change = close.diff()
         up_vol = volume.where(price_change > 0, 0)
         down_vol = volume.where(price_change < 0, 0)
-        up_vol_ma = up_vol.rolling(10, min_periods=5).sum()
-        down_vol_ma = down_vol.rolling(10, min_periods=5).sum()
+        up_vol_ma = up_vol.rolling(ms.put_call_window, min_periods=ms.put_call_min_periods).sum()
+        down_vol_ma = down_vol.rolling(ms.put_call_window, min_periods=ms.put_call_min_periods).sum()
         df["put_call_proxy"] = (down_vol_ma / up_vol_ma.replace(0, np.nan)).clip(0, 3).fillna(1.0)
 
         # --- VIX term structure proxy: short vol vs long vol ---
         # Contango (short < long) = calm, backwardation (short > long) = fear
         log_returns = np.log(close / close.shift(1))
-        vol_5 = log_returns.rolling(5).std() * np.sqrt(252)
-        vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
-        vol_60 = log_returns.rolling(60).std() * np.sqrt(252)
+        vol_5 = log_returns.rolling(ms.term_fast).std() * np.sqrt(252)
+        vol_60 = log_returns.rolling(ms.term_slow).std() * np.sqrt(252)        # W97: windows were 5 / 60 (an unused 20 is gone)
         df["vix_term_structure"] = (vol_5 / vol_60.replace(0, np.nan)).clip(0, 3).fillna(1.0)
         # > 1 = backwardation (fear), < 1 = contango (calm)
 
         # --- Skew proxy: downside vs upside realized moves ---
         # Real skew measures OTM put vs OTM call IV; this proxies it
         ret = close.pct_change()
-        downside_vol = ret.where(ret < 0, 0).rolling(20, min_periods=10).std() * np.sqrt(252)
-        upside_vol = ret.where(ret > 0, 0).rolling(20, min_periods=10).std() * np.sqrt(252)
+        downside_vol = ret.where(ret < 0, 0).rolling(ms.skew_window, min_periods=ms.skew_min_periods).std() * np.sqrt(252)
+        upside_vol = ret.where(ret > 0, 0).rolling(ms.skew_window, min_periods=ms.skew_min_periods).std() * np.sqrt(252)
         df["skew_proxy"] = (downside_vol / upside_vol.replace(0, np.nan)).clip(0, 3).fillna(1.0)
         # > 1 = more downside fear, < 1 = upside dominance
 
         # --- Sector rotation proxy: relative performance short vs long term ---
         # If recent returns >> long-term returns, momentum is strong
-        ret_5 = close.pct_change(5)
-        ret_60 = close.pct_change(60)
+        ret_5 = close.pct_change(ms.divergence_short)
+        ret_60 = close.pct_change(ms.divergence_long)
         df["momentum_divergence"] = (ret_5 - ret_60).clip(-0.2, 0.2)
 
         # --- Bear market indicator: price vs SMA200 ---
-        if len(close) >= 200:
-            sma_200 = close.rolling(200, min_periods=100).mean()
-            df["above_sma200"] = (close > sma_200).astype(float)
-            df["distance_sma200"] = ((close - sma_200) / sma_200).clip(-0.3, 0.3)
+        if len(close) >= ms.long_sma_window:
+            sma_200 = close.rolling(ms.long_sma_window, min_periods=ms.long_sma_min_periods).mean()
+            df[nm["above_sma_long"]] = (close > sma_200).astype(float)
+            df[nm["distance_sma_long"]] = ((close - sma_200) / sma_200).clip(-0.3, 0.3)
         else:
-            df["above_sma200"] = 1.0
-            df["distance_sma200"] = 0.0
+            df[nm["above_sma_long"]] = 1.0
+            df[nm["distance_sma_long"]] = 0.0
 
         # --- Range compression: narrowing range often precedes big moves ---
-        atr_5 = (high - low).rolling(5).mean()
-        atr_20 = (high - low).rolling(20).mean()
+        atr_5 = (high - low).rolling(ms.range_fast).mean()
+        atr_20 = (high - low).rolling(ms.range_slow).mean()
         df["range_compression"] = (atr_5 / atr_20.replace(0, np.nan)).clip(0, 3).fillna(1.0)
 
         return df
@@ -783,21 +785,22 @@ class FeatureEngine:
         These capture broader market conditions that single-stock technicals miss.
         The model needs to know if it's a risk-on or risk-off environment.
         """
+        ca, nm = self._spec.cfg.cross_asset, self._spec.names               # W97: windows and derived column names
         if not market_context:
             # Fill with neutral defaults so feature count stays consistent.
             # 0.5 = normalised VIX 20 (vix_close/40) — matches the else-branch
             # below and avoids the misleading literal 20.0 appearing in trade logs.
             df["vix_level"] = 0.5
-            df["vix_change_5d"] = 0.0
-            df["vix_change_20d"] = 0.0
+            df[nm["vix_change_short"]] = 0.0
+            df[nm["vix_change_long"]] = 0.0
             df["vix_zscore"] = 0.0
             df["vix_term_spread"] = 0.0
-            df["rel_strength_5d"] = 0.0
-            df["rel_strength_20d"] = 0.0
-            df["rel_strength_60d"] = 0.0
-            df["spy_momentum_10d"] = 0.0
-            df["spy_rsi_14"] = 50.0
-            df["correlation_spy_20d"] = 0.0
+            df[nm["rel_short"]] = 0.0
+            df[nm["rel_mid"]] = 0.0
+            df[nm["rel_long"]] = 0.0
+            df[nm["spy_momentum"]] = 0.0
+            df[nm["spy_rsi"]] = 50.0
+            df[nm["corr_spy"]] = 0.0
             return df
 
         # Normalize index for cross-source compatibility (tz-aware vs tz-naive)
@@ -806,66 +809,67 @@ class FeatureEngine:
 
         # --- VIX Features ---
         vix_df = market_context.get("vix")
-        if vix_df is not None and len(vix_df) > 20:
+        if vix_df is not None and len(vix_df) > ca.min_context_rows:
             vix_df = self._normalize_index(vix_df)
             # Align VIX data to symbol's date index
             vix_close = vix_df["Close"].reindex(df.index, method="ffill")
 
             df["vix_level"] = (vix_close / 40.0).clip(0, 2)  # Normalize: 20 → 0.5, 40 → 1.0
-            df["vix_change_5d"] = vix_close.pct_change(5).clip(-0.5, 0.5)
-            df["vix_change_20d"] = vix_close.pct_change(20).clip(-0.5, 0.5)
+            df[nm["vix_change_short"]] = vix_close.pct_change(ca.vix_change_short).clip(-0.5, 0.5)
+            df[nm["vix_change_long"]] = vix_close.pct_change(ca.vix_change_long).clip(-0.5, 0.5)
 
             # VIX z-score: how extreme is current VIX vs recent history
-            vix_mean = vix_close.rolling(60, min_periods=20).mean()
-            vix_std = vix_close.rolling(60, min_periods=20).std()
+            vix_mean = vix_close.rolling(ca.vix_z_window, min_periods=ca.vix_z_min_periods).mean()
+            vix_std = vix_close.rolling(ca.vix_z_window, min_periods=ca.vix_z_min_periods).std()
             df["vix_zscore"] = ((vix_close - vix_mean) / vix_std.replace(0, np.nan)).clip(-3, 3).fillna(0)
 
             # VIX term structure proxy: short-term vs long-term VIX movement
-            vix_5 = vix_close.rolling(5).mean()
-            vix_20 = vix_close.rolling(20).mean()
+            vix_5 = vix_close.rolling(ca.vix_term_fast).mean()
+            vix_20 = vix_close.rolling(ca.vix_term_slow).mean()
             df["vix_term_spread"] = ((vix_5 - vix_20) / vix_20.replace(0, np.nan)).clip(-1, 1).fillna(0)
         else:
             df["vix_level"] = 0.5
-            df["vix_change_5d"] = 0.0
-            df["vix_change_20d"] = 0.0
+            df[nm["vix_change_short"]] = 0.0
+            df[nm["vix_change_long"]] = 0.0
             df["vix_zscore"] = 0.0
             df["vix_term_spread"] = 0.0
 
         # --- Relative Strength vs SPY ---
         spy_df = market_context.get("spy")
-        if spy_df is not None and len(spy_df) > 20:
+        if spy_df is not None and len(spy_df) > ca.min_context_rows:
             spy_df = self._normalize_index(spy_df)
             spy_close = spy_df["Close"].reindex(df.index, method="ffill")
 
             # Relative strength: stock return - SPY return over various windows
-            stock_ret_5 = close.pct_change(5)
-            stock_ret_20 = close.pct_change(20)
-            stock_ret_60 = close.pct_change(60)
-            spy_ret_5 = spy_close.pct_change(5)
-            spy_ret_20 = spy_close.pct_change(20)
-            spy_ret_60 = spy_close.pct_change(60)
+            # W97: the three horizons are cross_asset.rel_short / rel_mid / rel_long (clip bounds stay with the role)
+            stock_ret_5 = close.pct_change(ca.rel_short)
+            stock_ret_20 = close.pct_change(ca.rel_mid)
+            stock_ret_60 = close.pct_change(ca.rel_long)
+            spy_ret_5 = spy_close.pct_change(ca.rel_short)
+            spy_ret_20 = spy_close.pct_change(ca.rel_mid)
+            spy_ret_60 = spy_close.pct_change(ca.rel_long)
 
-            df["rel_strength_5d"] = (stock_ret_5 - spy_ret_5).clip(-0.2, 0.2)
-            df["rel_strength_20d"] = (stock_ret_20 - spy_ret_20).clip(-0.3, 0.3)
-            df["rel_strength_60d"] = (stock_ret_60 - spy_ret_60).clip(-0.5, 0.5)
+            df[nm["rel_short"]] = (stock_ret_5 - spy_ret_5).clip(-0.2, 0.2)
+            df[nm["rel_mid"]] = (stock_ret_20 - spy_ret_20).clip(-0.3, 0.3)
+            df[nm["rel_long"]] = (stock_ret_60 - spy_ret_60).clip(-0.5, 0.5)
 
             # SPY momentum as market regime signal
-            df["spy_momentum_10d"] = spy_close.pct_change(10).clip(-0.15, 0.15)
+            df[nm["spy_momentum"]] = spy_close.pct_change(ca.spy_momentum_days).clip(-0.15, 0.15)
 
             # SPY RSI — is broader market overbought/oversold?
-            df["spy_rsi_14"] = self._rsi(spy_close, 14) / 100.0  # Normalize 0-1
+            df[nm["spy_rsi"]] = self._rsi(spy_close, ca.spy_rsi_period) / 100.0  # Normalize 0-1
 
             # Rolling correlation with SPY (high = moves with market, low = independent)
             stock_ret = close.pct_change()
             spy_ret = spy_close.pct_change()
-            df["correlation_spy_20d"] = stock_ret.rolling(20, min_periods=10).corr(spy_ret).clip(-1, 1).fillna(0)
+            df[nm["corr_spy"]] = stock_ret.rolling(ca.corr_window, min_periods=ca.corr_min_periods).corr(spy_ret).clip(-1, 1).fillna(0)
         else:
-            df["rel_strength_5d"] = 0.0
-            df["rel_strength_20d"] = 0.0
-            df["rel_strength_60d"] = 0.0
-            df["spy_momentum_10d"] = 0.0
-            df["spy_rsi_14"] = 0.5
-            df["correlation_spy_20d"] = 0.0
+            df[nm["rel_short"]] = 0.0
+            df[nm["rel_mid"]] = 0.0
+            df[nm["rel_long"]] = 0.0
+            df[nm["spy_momentum"]] = 0.0
+            df[nm["spy_rsi"]] = 0.5
+            df[nm["corr_spy"]] = 0.0
 
         return df
 
@@ -877,16 +881,17 @@ class FeatureEngine:
         Yield curve and DXY have known equity-impact patterns the
         technical indicators miss. Defaults to neutral if data missing.
         """
+        mc, nm = self._spec.cfg.macro, self._spec.names                      # W97: windows and derived column names
         defaults = {
             "us_2y_yield_level": 4.0,
             "us_10y_yield_level": 4.0,
             "yield_curve_spread": 0.0,
             "yield_curve_inverted": 0.0,
-            "yield_curve_change_20d": 0.0,
+            nm["yield_curve_change"]: 0.0,
             "dxy_level_norm": 0.0,
-            "dxy_change_5d": 0.0,
-            "dxy_change_20d": 0.0,
-            "us_10y_change_20d": 0.0,
+            nm["dxy_change_short"]: 0.0,
+            nm["dxy_change_long"]: 0.0,
+            nm["us10y_change"]: 0.0,
         }
 
         macros = (market_context or {}).get("macros") if market_context else None
@@ -922,29 +927,29 @@ class FeatureEngine:
 
         if y10 is not None:
             df["us_10y_yield_level"] = y10.fillna(defaults["us_10y_yield_level"])
-            df["us_10y_change_20d"] = y10.diff(20).clip(-2, 2).fillna(0)
+            df[nm["us10y_change"]] = y10.diff(mc.change_days).clip(-2, 2).fillna(0)
         else:
             df["us_10y_yield_level"] = defaults["us_10y_yield_level"]
-            df["us_10y_change_20d"] = 0.0
+            df[nm["us10y_change"]] = 0.0
 
         if curve is not None:
             df["yield_curve_spread"] = curve.fillna(0)
             df["yield_curve_inverted"] = (curve < 0).astype(float)
-            df["yield_curve_change_20d"] = curve.diff(20).clip(-2, 2).fillna(0)
+            df[nm["yield_curve_change"]] = curve.diff(mc.change_days).clip(-2, 2).fillna(0)
         else:
             df["yield_curve_spread"] = 0.0
             df["yield_curve_inverted"] = 0.0
-            df["yield_curve_change_20d"] = 0.0
+            df[nm["yield_curve_change"]] = 0.0
 
         if dxy is not None:
             # Normalize around typical 100 baseline
-            df["dxy_level_norm"] = ((dxy - 100) / 20).clip(-2, 2).fillna(0)
-            df["dxy_change_5d"] = dxy.pct_change(5).clip(-0.1, 0.1).fillna(0)
-            df["dxy_change_20d"] = dxy.pct_change(20).clip(-0.2, 0.2).fillna(0)
+            df["dxy_level_norm"] = ((dxy - mc.dxy_center) / mc.dxy_scale).clip(-2, 2).fillna(0)
+            df[nm["dxy_change_short"]] = dxy.pct_change(mc.dxy_change_short).clip(-0.1, 0.1).fillna(0)
+            df[nm["dxy_change_long"]] = dxy.pct_change(mc.dxy_change_long).clip(-0.2, 0.2).fillna(0)
         else:
             df["dxy_level_norm"] = 0.0
-            df["dxy_change_5d"] = 0.0
-            df["dxy_change_20d"] = 0.0
+            df[nm["dxy_change_short"]] = 0.0
+            df[nm["dxy_change_long"]] = 0.0
 
         return df
 
@@ -988,7 +993,7 @@ class FeatureEngine:
 
         Returns (hurst, fit_r2). Falls back to (0.5, 0.0) when data is too short.
         """
-        if len(series) < 50:
+        if len(series) < self._spec.cfg.fractal.hurst_min_len:          # W97: was 50
             return 0.5, 0.0
         try:
             coeffs = pywt.wavedec(series, wavelet="db4", mode="periodization")
@@ -1024,7 +1029,7 @@ class FeatureEngine:
         β≈2 = Brownian motion (H=0.5). Returns (beta, fit_r2).
         Falls back to (2.0, 0.0) on failure.
         """
-        if len(series) < 60:
+        if len(series) < self._spec.cfg.fractal.psd_min_rows:           # W97: was 60
             return 2.0, 0.0
         try:
             from scipy.signal import periodogram
@@ -1051,8 +1056,9 @@ class FeatureEngine:
         Apply to log-price levels. Returns (hurst_short, hurst_long).
         Fills (0.0, 0.0) when insufficient data.
         """
-        SHORT_WIN = 60
-        LONG_WIN = 180
+        fr = self._spec.cfg.fractal
+        SHORT_WIN = fr.hurst_short_window                               # W97: were 60 / 180
+        LONG_WIN = fr.hurst_long_window
         if len(series) < LONG_WIN:
             if len(series) >= SHORT_WIN:
                 h_short, _ = self._hurst_wavelet(series[-SHORT_WIN:])
@@ -1062,15 +1068,16 @@ class FeatureEngine:
         h_long, _ = self._hurst_wavelet(series[-LONG_WIN:])
         return float(h_short), float(h_long)
 
-    def _mfdfa_features(self, returns: np.ndarray) -> tuple[float, float]:
+    def _mfdfa_features(self, returns: np.ndarray, min_returns: int | None = None) -> tuple[float, float]:
         """Multifractal DFA: compute spectrum width Δα and asymmetry.
 
-        Requires ≥500 data points. Returns (width, asymmetry) = (0.0, 0.0) otherwise.
+        Requires ``min_returns`` data points (W97: ``ml.features.fractal.mfdfa_min_returns``, 500 by default; the intraday
+        caller passes ``intraday.mfdfa_min_returns``). Returns (width, asymmetry) = (0.0, 0.0) otherwise.
 
         width     = h(q_min) - h(q_max)   — breadth of multifractal spectrum
         asymmetry = skew of h(q) curve    — negative → crash-risk signal
         """
-        MIN_BARS = 500
+        MIN_BARS = self._spec.cfg.fractal.mfdfa_min_returns if min_returns is None else min_returns     # W97: was 500
         if len(returns) < MIN_BARS:
             return 0.0, 0.0
         try:
@@ -1122,7 +1129,8 @@ class FeatureEngine:
         insufficient bars for a given estimator. XGBoost/LightGBM learn to ignore
         systematically-zero features for early walk-forward windows.
         """
-        if df is None or len(df) < 50:
+        fr = self._spec.cfg.fractal                                     # W97: the minimum lengths below were literals
+        if df is None or len(df) < fr.min_rows:
             for col in (
                 "hurst_wavelet", "hurst_fit_r2",
                 "psd_beta", "psd_fit_r2", "hurst_psd_divergence",
@@ -1149,15 +1157,15 @@ class FeatureEngine:
         mw_vals  = np.zeros(n)
         ma_vals  = np.zeros(n)
 
-        for i in range(49, n):
+        for i in range(fr.min_rows - 1, n):
             lp = log_prices[:i + 1]          # log-price window up to row i
             lr = log_returns[:i]             # return window (length i)
-            if len(lp) < 50:
+            if len(lp) < fr.min_rows:
                 continue
             hw_vals[i], hr2_vals[i] = self._hurst_wavelet(lp)
             pb_vals[i], pr2_vals[i] = self._psd_features(lp)
             hs_vals[i], hl_vals[i]  = self._multiscale_hurst(lp)
-            if len(lr) >= 500:
+            if len(lr) >= fr.mfdfa_min_returns:
                 mw_vals[i], ma_vals[i] = self._mfdfa_features(lr)
 
         df = df.copy()

@@ -246,8 +246,11 @@ W95 added three more `regime:` keys, `min_history_rows` (60), `iv_rank_min_rows`
 
 The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them
 changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different window there (or in a study); the parity manifest then warns (`ml_features`).
-In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. Fixed (not settings): the fractal / wavelet / Hurst group, the 26 VLMC
-intraday features, cross-asset, macro, seasonality and the market-structure group (including `above_sma200` / `distance_sma200`).
+In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. **W97 added the remaining windows:** `market_structure`
+(including the 200-day SMA behind `above_sma200` / `distance_sma200`), `cross_asset`, `macro`, `fractal` (Hurst short / long, PSD and MFDFA minimums) and `intraday` (hour = 12 bars, the minimum-bar guards), 50 settings listed in
+`config.yaml` with the old values (RESEARCH_GUIDE "The remaining feature windows"). Fourteen more model columns follow their window in the name (`vix_change_5d`, `rel_strength_60d`, `above_sma200`, ...); the 26 VLMC intraday names are a fixed list and do not.
+**The hash rule:** these five groups enter the saved-model hash only when a value differs from its default, so at the defaults nothing is refused or retrained. Fixed (not settings): clip bounds, neutral values, the wavelet family and MFDFA scales, the
+seasonality encoding and the 252 annualisation constant.
 
 **What changes when you change a window.** (1) The feature VALUES. (2) For the thirteen model columns whose name embeds a window the NAME follows it: `rsi_long: 21` turns `rsi_14` into `rsi_21`; `sma_mid: 30` turns `price_vs_sma_20`,
 `sma_20_slope` and `sma_10_20_cross` into `price_vs_sma_30`, `sma_30_slope`, `sma_10_30_cross`. The meta-labeler's inputs, the engine's and the live orchestrator's meta-context keys, and the entry-signals snapshot follow; the dashboard series keep

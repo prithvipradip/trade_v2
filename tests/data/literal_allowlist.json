@@ -798,43 +798,20 @@
     0.5,
     3,
     3,
-    5,
-    5,
-    5,
-    5,
-    10,
-    10,
-    14,
-    20,
-    20,
-    20,
-    20,
-    20,
-    20,
-    20,
-    20,
-    20,
     40.0,
     50.0,
-    60,
-    60,
-    60,
-    60,
     100.0
    ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the 60-day return windows and the 60-day VIX z-score window belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.cross_asset); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._add_fractal_features": {
    "values": [
     0.05,
-    0.95,
-    49,
-    50,
-    50,
-    500
+    0.95
    ],
-   "category": "fixed_feature_group"
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.fractal); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._add_iv_features": {
    "values": [
@@ -856,16 +833,10 @@
     0.2,
     0.2,
     4.0,
-    4.0,
-    5,
-    20,
-    20,
-    20,
-    20,
-    100
+    4.0
    ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the DXY normalization centre of 100 belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.macro); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._add_market_structure": {
    "values": [
@@ -877,32 +848,13 @@
     3,
     3,
     3,
-    5,
-    5,
-    5,
-    5,
-    5,
-    10,
-    10,
-    10,
-    10,
-    20,
-    20,
-    20,
-    20,
-    60,
-    60,
-    100,
-    200,
-    200,
-    252,
     252,
     252,
     252,
     252
    ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the 60-day return and volatility windows and the SMA-200 min_periods of 100 belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.market_structure); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._add_seasonality": {
    "values": [
@@ -931,17 +883,10 @@
     0.5,
     0.9,
     3,
-    4,
-    50
+    4
    ],
-   "category": "fixed_feature_group"
-  },
-  "src/ait/ml/features.py::FeatureEngine._merge_intraday_features": {
-   "values": [
-    10,
-    10
-   ],
-   "category": "fixed_feature_group"
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.fractal); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._mfdfa_features": {
    "values": [
@@ -963,18 +908,10 @@
     16,
     32,
     64,
-    128,
-    500
+    128
    ],
-   "category": "fixed_feature_group"
-  },
-  "src/ait/ml/features.py::FeatureEngine._multiscale_hurst": {
-   "values": [
-    60,
-    180
-   ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the 60-bar short Hurst window belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.fractal); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._psd_features": {
    "values": [
@@ -982,11 +919,10 @@
     0.5,
     0.8,
     4,
-    4.0,
-    60
+    4.0
    ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the 60-row minimum belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.fractal); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/features.py::FeatureEngine._rsi": {
    "values": [
@@ -1016,29 +952,14 @@
     3,
     3,
     3,
-    3,
-    3,
     4,
     4,
     4,
     4,
-    5,
-    7,
-    12,
-    12,
-    12,
-    12,
-    12,
-    14,
-    20,
-    40,
-    78,
-    100,
-    200,
-    500
+    5
    ],
-   "category": "registered_followup",
-   "note": "W95 review (operator): the 12-bar intraday windows and the 100-row minimum belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+   "category": "fixed_feature_group",
+   "note": "W97: the period lengths and minimum lengths of this function are ml.features settings (ml.features.intraday); what is left here are clip bounds, neutral values, scales and algorithm constants, which stay fixed"
   },
   "src/ait/ml/hyperparams.py::lgbm_multiclass_kwargs": {
    "values": [

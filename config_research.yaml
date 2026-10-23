@@ -272,7 +272,7 @@ backtest:
     min_windows: 3                     # a run with fewer walk-forward windows aborts / is flagged as too few to judge
     window_score_full_credit_trades: 5 # a window's score = win rate x sqrt(min(1, trades / this))
     # W95 (explained in docs/RESEARCH_GUIDE.md, "Where the history and row-count minimums are set")
-    oos_feature_context_bars: 252      # bars of the training tail put in front of each test window so the features have their look-back; refused below ml.features.vol_regime.iv_rank_lookback
+    oos_feature_context_bars: 252      # bars of the training tail put in front of each test window so the features have their look-back; refused below the feature spec's longest ml.features look-back (252 by default)
     meta_label_min_window_rows: 60     # the meta-labeler is trained only for a training window with MORE than this many bars
     min_fetched_rows: 100              # a symbol is used only when MORE than this many daily bars were fetched
     min_backtest_rows: 60              # the optimizer's minimum daily bars (symbol dropped / trial refused below it; validation split needs twice this)
