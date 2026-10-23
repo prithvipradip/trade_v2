@@ -1311,15 +1311,7 @@ class WalkForwardBacktester:
         windows = self._generate_windows(data)
         windows = self._limit_windows(windows)
         self._check_vlmc_coverage(data)
-        if len(windows) < 3:
-            _spans = {k: (str(v.index[0].date()), str(v.index[-1].date()), len(v))
-                      for k, v in data.items() if not v.empty}
-            log.error("walk_forward_too_few_windows", windows=len(windows),
-                      minimum=3, spans=_spans,
-                      note="the common date range of all symbols is too short for "
-                           "train_days + gap + test_days; run the research backfill "
-                           "(scripts/backfill_historical_data.py --mode research) or "
-                           "lengthen history (backtest.history_start_date / history_days)")
+        self._warn_if_too_few_windows(windows, data)
         log.info("walk_forward_windows", count=len(windows))
 
         # Run each window — parallel or sequential depending on optimize_n_jobs
@@ -1378,7 +1370,7 @@ class WalkForwardBacktester:
                     window_results.append(wr)
                     if curr_best_params is not None:
                         br = wr.backtest_result
-                        score = br.win_rate * (min(1.0, br.total_trades / 5) ** 0.5)
+                        score = self._window_score(br)
                         if score > self._global_best_score:
                             self._global_best_score = score
                             self._global_best_params = curr_best_params
@@ -1406,7 +1398,7 @@ class WalkForwardBacktester:
                     window_results.append(wr)
                     if curr_best_params is not None:
                         br = wr.backtest_result
-                        score = br.win_rate * (min(1.0, br.total_trades / 5) ** 0.5)
+                        score = self._window_score(br)
                         if score > self._global_best_score:
                             self._global_best_score = score
                             self._global_best_params = curr_best_params
@@ -2314,7 +2306,7 @@ class WalkForwardBacktester:
         test_df: pd.DataFrame,
         symbol: str,
         threshold_pct: float | None = None,     # W90b: None -> backtest.walkforward_tuning.range_threshold_fallback (was 0.05)
-        horizon_days: int = 30,
+        horizon_days: int | None = None,        # W90e: None -> the horizon the window's range model was trained at (was 30)
         precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
         """Evaluate range predictor accuracy on OOS test data.
@@ -2332,11 +2324,13 @@ class WalkForwardBacktester:
 
         if threshold_pct is None:
             threshold_pct = self._tuning.range_threshold_fallback
+        if horizon_days is None:
+            horizon_days = self._range_label_horizon()
         try:
             # ----------------------------------------------------------------
             # 1. Build OOS range labels and realized-vol series
             # ----------------------------------------------------------------
-            if len(test_df) <= horizon_days + 5:
+            if len(test_df) <= horizon_days + self._tuning.oos_range_min_extra_rows:      # W90e: was + 5
                 return {}
 
             close = test_df["Close"].values
@@ -2568,7 +2562,7 @@ class WalkForwardBacktester:
         predictor: "Any",
         test_df: "pd.DataFrame",
         symbol: str,
-        horizon_days: int = 30,
+        horizon_days: int | None = None,        # W90e: None -> backtest.max_hold_days (was 30)
         return_threshold_pct: float | None = None,   # W90b: None -> walkforward_tuning.oos_direction_return_threshold (0.02)
         precomputed_features: "pd.DataFrame | None" = None,
     ) -> dict:
@@ -2586,6 +2580,8 @@ class WalkForwardBacktester:
         """
         import numpy as _np
 
+        if horizon_days is None:
+            horizon_days = int(self._config.max_hold_days)
         if return_threshold_pct is None:
             return_threshold_pct = self._tuning.oos_direction_return_threshold
         _nbins = self._tuning.oos_calibration_bins
@@ -2611,7 +2607,7 @@ class WalkForwardBacktester:
             # Build forward-return labels for each bar (3-class)
             close = test_df["Close"].values
             n_label = len(close) - horizon_days
-            if n_label < 10:
+            if n_label < self._tuning.oos_min_labelled_rows:      # W90e: was 10
                 return {}
 
             y_class = []  # 0=bearish, 1=neutral, 2=bullish
@@ -2771,6 +2767,26 @@ class WalkForwardBacktester:
         rvol_annual = float(recent.std() * np.sqrt(252))
         raw = rvol_annual * np.sqrt(horizon_days / 252) * multiplier
         return float(np.clip(raw, low_clip, high_clip))
+
+    def _warn_if_too_few_windows(self, windows: list, data: dict) -> bool:
+        """Log (never abort) when the common date range yields fewer walk-forward windows than
+        ``backtest.walkforward_tuning.min_windows`` (W90e: was 3): too few to judge anything. True when it logged."""
+        if len(windows) >= self._tuning.min_windows:
+            return False
+        _spans = {k: (str(v.index[0].date()), str(v.index[-1].date()), len(v))
+                  for k, v in data.items() if not v.empty}
+        log.error("walk_forward_too_few_windows", windows=len(windows),
+                  minimum=self._tuning.min_windows, spans=_spans,
+                  note="the common date range of all symbols is too short for "
+                       "train_days + gap + test_days; run the research backfill "
+                       "(scripts/backfill_historical_data.py --mode research) or "
+                       "lengthen history (backtest.history_start_date / history_days)")
+        return True
+
+    def _window_score(self, br) -> float:
+        """A window's score for the global best parameters: win rate x sqrt(min(1, trades / N)), so a window with few
+        trades counts for less. N is ``walkforward_tuning.window_score_full_credit_trades`` (W90e: was 5)."""
+        return br.win_rate * (min(1.0, br.total_trades / self._tuning.window_score_full_credit_trades) ** 0.5)
 
     def _pool_limits(self) -> dict:
         """The shared-account limits the pool applies (live's aggregate-risk and open-position caps), from the LOADED
@@ -2953,7 +2969,7 @@ class WalkForwardBacktester:
         train_df: pd.DataFrame,
         symbol: str,
         window_id: int,
-        max_hold_days: int = 30,
+        max_hold_days: int | None = None,       # W90e: None -> the reachable range-label horizon (was 30)
         model_subdir: "str | None" = None,
     ) -> "tuple[Any | None, str, float]":
         """Train range predictor on this window's training data.
@@ -2964,6 +2980,8 @@ class WalkForwardBacktester:
 
         Returns (predictor, status, threshold_used).
         """
+        if max_hold_days is None:
+            max_hold_days = self._range_label_horizon()
         threshold_pct = self._adaptive_range_threshold(train_df, horizon_days=max_hold_days)
         return self._train_window_range_model_inprocess(
             train_df, symbol, window_id, max_hold_days, threshold_pct,

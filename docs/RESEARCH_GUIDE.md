@@ -94,8 +94,8 @@ or the command-line flag.
 | `learner` | Thresholds of the research learner |
 | `legacy_engine` | Constants of the engine's dormant paths |
 | `objectives` | Weights of the Optuna objectives |
-| `engine_tuning` | The engine's IV-skew coefficients (`put_skew_coefficient` 0.10, `call_skew_coefficient` 0.02), the look-backs of the realized-vol and IV-rank-rise entry gates, and the minimum history before the first decision (W90c) |
-| `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins; also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
+| `engine_tuning` | The engine's IV-skew coefficients (`put_skew_coefficient` 0.10, `call_skew_coefficient` 0.02), the look-backs of the realized-vol and IV-rank-rise entry gates, the minimum history before the first decision (W90c), and the fallback volatility used when a position has no entry IV (`fallback_iv`, W90e) |
+| `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins and minimums, the minimum number of windows (`min_windows`) and the window-score shrink (W90e); also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
 
 The neutral value a missing meta-label input takes (`ml.meta_label_neutrals`: RSI 50, volatility 0.20, ...) and the meta-labeler's
 arm-guard limits (`meta_label.min_feature_coverage`, `meta_label.max_artifact_age_days`) are also shared with live (W90c), so they are in

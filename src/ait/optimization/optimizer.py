@@ -137,7 +137,7 @@ class StrategyOptimizer:
         iv_floor: float | None = None,
         delta_iv_scale: float | None = None,       # W70: None -> backtest.delta_iv_scale
         patience: int = 0,
-        min_trades: int = 10,
+        min_trades: int | None = None,       # W90e: None -> backtest.optimize_min_trades (was a 10 literal repeating it)
         max_concurrent_positions: int | None = None,   # W86: None -> backtest.max_concurrent_positions
         max_entry_vol_annual: float | None = None,   # W70: None -> backtest.max_entry_vol_annual
         # R20 #2: baseline values for the two iron_condor gate params Optuna
@@ -239,7 +239,7 @@ class StrategyOptimizer:
         self._dropped_params: set[str] = set()
         # self._iv_floor resolved below once _bt_cfg exists (R20b review follow-up)
         self._patience = patience
-        self._min_trades = min_trades
+        self._min_trades_arg = min_trades     # resolved below, once the settings are loaded (W90e)
         # R20b (pre-registered PLAN 2026-08-21): resolve the config-backed
         # trial BASELINES once, from the same loaded settings live reads
         # (mirrors Backtester's R20 None->load_settings pattern). These feed
@@ -338,6 +338,8 @@ class StrategyOptimizer:
             fractal_veto_spread, "backtest", "fractal_veto_spread", _BTC2, self._settings))
         self._penalty_on_range_prob = float(_rcv(
             penalty_on_range_prob, "backtest", "penalty_on_range_prob", _BTC2, self._settings))
+        self._min_trades = int(_rcv(
+            self._min_trades_arg, "backtest", "optimize_min_trades", _BTC2, self._settings))        # W90e
         self._hard_min_trades = int(_rcv(
             hard_min_trades, "backtest", "optimize_hard_min_trades", _BTC2, self._settings))
         self._below_floor_gradient = float(_rcv(

@@ -18,22 +18,6 @@
    "category": "structural",
    "note": "probe DTEs that sample one rung of the take-profit ladder"
   },
-  "run_backtest.py::run_backtest": {
-   "values": [
-    3
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE E: fewer than 3 windows is reported as too few to judge (same number as the walk-forward's own minimum)"
-  },
-  "src/ait/backtesting/dte_report.py::<module>": {
-   "values": [
-    7,
-    14,
-    45
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: DEFAULT_BAND_EDGES (2, 7, 14, 45) repeats parity.dte_band_upper_edges; read the setting"
-  },
   "src/ait/backtesting/dte_report.py::summarise_study": {
    "values": [
     0.1,
@@ -62,19 +46,18 @@
     0.015,
     0.02,
     0.05,
-    0.1,
-    5
+    0.1
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: the partial-engine class default _ex_div_k = 5 repeats backtest.ex_div_entry_k_days (same value); should reference the schema default"
+   "category": "structural",
+   "note": "partial-engine class defaults: mirrors of the schema defaults for an instance built without __init__ (W90e: _ex_div_k now reads the schema default)"
   },
   "src/ait/backtesting/engine.py::Backtester.__init__": {
    "values": [
     0.5,
     10
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: stop_loss_pct default 0.50 repeats backtest.stop_loss_pct (a stale second copy, the W90a class); resolve from the setting. The 10 is a date slice"
+   "category": "structural",
+   "note": "W70 D (registered, NOT resolved): stop_loss_pct 0.50 / profit_target_pct 1.00 are explicit harness defaults that deliberately differ from the config baselines 0.35 / 0.50, a divergence the operator is to revisit (PLAN.md W70); every research entry point passes its own. The 10 is a date slice"
   },
   "src/ait/backtesting/engine.py::Backtester._build_credit_position": {
    "values": [
@@ -113,29 +96,20 @@
    "category": "registered_followup",
    "note": "CANDIDATE D: 25% of capital cap on a debit structure's cost"
   },
-  "src/ait/backtesting/engine.py::Backtester._check_exit": {
-   "values": [
-    0.25
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv"
-  },
   "src/ait/backtesting/engine.py::Backtester._check_intraday_exit": {
    "values": [
-    0.25,
     10
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv; the 10 is a date slice"
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string (the 0.25 fallback IV is engine_tuning.fallback_iv)"
   },
   "src/ait/backtesting/engine.py::Backtester._check_intraday_exit_realistic": {
    "values": [
-    0.25,
     5,
     10
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv; 5 is the 5-minute bar length and 10 a date slice"
+   "category": "structural",
+   "note": "5 = the 5-minute bar length of the research intraday store, [:10] ISO-date slice (the 0.25 fallback IV is engine_tuning.fallback_iv)"
   },
   "src/ait/backtesting/engine.py::Backtester._close_pending_settlement": {
    "values": [
@@ -166,13 +140,6 @@
    ],
    "category": "registered_followup",
    "note": "CANDIDATE D: 25% of capital cap on a spread's cost"
-  },
-  "src/ait/backtesting/engine.py::Backtester._force_close": {
-   "values": [
-    0.25
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv"
   },
   "src/ait/backtesting/engine.py::Backtester._position_dte": {
    "values": [
@@ -244,12 +211,10 @@
     0.5,
     0.5,
     0.5,
-    0.5,
-    0.5,
     10
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE C: the meta-label decision record writes threshold 0.5 whatever the labeler's min_probability is; the other 0.5s are a binary flag cut (vol_regime_expanding > 0.5) and the sqrt exponent, the 10 a date slice"
+   "category": "structural",
+   "note": "binary flag cut vol_regime_expanding > 0.5, the sqrt exponent of the annualization, [:10] date slice (the meta-label threshold record reads the labeler's min_probability)"
   },
   "src/ait/backtesting/engine.py::_session_close": {
    "values": [
@@ -257,13 +222,6 @@
    ],
    "category": "structural",
    "note": "lru_cache size"
-  },
-  "src/ait/backtesting/ex_div.py::ex_div_blocks": {
-   "values": [
-    5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: k_days default 5 repeats backtest.ex_div_entry_k_days; resolve from the setting"
   },
   "src/ait/backtesting/friction.py::<module>": {
    "values": [
@@ -394,11 +352,10 @@
   },
   "src/ait/backtesting/pricing.py::realized_vol": {
    "values": [
-    0.25,
     20
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE B: 0.25 default volatility when there are too few prices (the same fallback IV the engine uses)"
+   "category": "structural",
+   "note": "default look-back window of 20 (callers pass theirs); the too-few-prices fallback is engine_tuning.fallback_iv"
   },
   "src/ait/backtesting/range_bank.py::RangeModelBank.get": {
    "values": [
@@ -561,23 +518,19 @@
    "values": [
     0.5,
     0.5,
-    0.5,
-    10,
-    30
+    0.5
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE E: n_label < 10 minimum labelled rows of the OOS direction evaluation; CANDIDATE A: horizon_days default 30 repeats backtest.max_hold_days. The 0.5s are default model weights and the AUROC-style chance level"
+   "category": "structural",
+   "note": "0.5 = default equal model weight (the horizon default, labelled-row minimum and bins are walkforward_tuning settings)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_range_model_oos": {
    "values": [
     0.5,
     0.5,
-    0.5,
-    5,
-    30
+    0.5
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE E: the +5 margin of rows beyond the horizon; CANDIDATE A: horizon_days default 30 repeats backtest.max_hold_days. The 0.5s are default model weights"
+   "category": "structural",
+   "note": "0.5 = default equal model weight (the horizon default and the extra-rows margin are settings)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._prob_score_metrics": {
    "values": [
@@ -586,23 +539,12 @@
    "category": "structural",
    "note": "0.5 probability cut for balanced accuracy and the 0.5 chance level"
   },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._train_window_range_model": {
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._window_score": {
    "values": [
-    30
+    0.5
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: max_hold_days default 30 repeats backtest.max_hold_days; resolve from the config"
-  },
-  "src/ait/backtesting/walkforward.py::WalkForwardBacktester.run": {
-   "values": [
-    0.5,
-    0.5,
-    3,
-    5,
-    5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE E: fewer than 3 windows aborts (also run_backtest), and the window score shrinks win rate by sqrt(trades / 5); the 0.5s are the sqrt exponent and a default"
+   "category": "structural",
+   "note": "0.5 = the sqrt exponent of the window-score shrink (the full-credit trade count is walkforward_tuning.window_score_full_credit_trades)"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardConfig.__post_init__": {
    "values": [
@@ -1001,13 +943,6 @@
    "category": "registered_followup",
    "note": "CANDIDATE G: MIN_TRADES_FOR_TRAINING = 30 (the meta-labeler is disabled; the 3 is the repo-root parent count)"
   },
-  "src/ait/ml/meta_label.py::MetaLabeler.__init__": {
-   "values": [
-    0.5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: min_probability default 0.50 repeats meta_label.min_probability; resolve from the setting"
-  },
   "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest": {
    "values": [
     10
@@ -1049,8 +984,8 @@
     0.5,
     30
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: horizon_days default 30 is a bare-constructor copy (live passes the derived horizon); the 0.5s are equal prior model weights"
+   "category": "structural",
+   "note": "horizon_days = 30 is the bare-constructor default (every real caller passes the horizon live_range_spec derives); 0.5s are the equal prior model weights"
   },
   "src/ait/ml/range_predictor.py::RangePredictor.predict": {
    "values": [
@@ -1229,13 +1164,6 @@
    ],
    "category": "structural",
    "note": "minimum fetch period days"
-  },
-  "src/ait/optimization/optimizer.py::StrategyOptimizer.__init__": {
-   "values": [
-    10
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE A: min_trades default 10 repeats backtest.optimize_min_trades (a stale second copy); resolve from the setting"
   },
   "src/ait/optimization/optimizer.py::StrategyOptimizer._suggest_one": {
    "values": [

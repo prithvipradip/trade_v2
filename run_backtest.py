@@ -543,6 +543,11 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
         print(f"\n  ! run record not written ({type(exc).__name__}: {exc})")
 
 
+def too_few_windows(n_windows: int, tuning) -> bool:
+    """True when a run produced fewer walk-forward windows than ``backtest.walkforward_tuning.min_windows`` (W90e: was 3)."""
+    return n_windows < int(tuning.min_windows)
+
+
 def resolve_walkforward_args(args: argparse.Namespace, tuning) -> None:
     """W90b: fill the window lengths and the per-window trial count the operator did not pass from
     ``backtest.walkforward_tuning`` of the research view (config_research.yaml / a study); an explicit flag wins."""
@@ -694,7 +699,7 @@ async def run_backtest(args: argparse.Namespace) -> None:
     result = await bt.run(data=data)
     run_time = time.time() - t0
     print(f"  Completed in {run_time:.1f}s")
-    if len(result.windows) < 3:
+    if too_few_windows(len(result.windows), _research_cfg.backtest.walkforward_tuning):      # W90e: was < 3
         print("\n" + "!" * 60)
         print(f"  WARNING: only {len(result.windows)} walk-forward window(s) produced trades/results. "
               "Check the data span above (windows need train+gap+test days of history\n"

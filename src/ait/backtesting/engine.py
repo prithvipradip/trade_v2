@@ -116,8 +116,10 @@ NEUTRAL_CREDIT_GATED = (
 # `_resolve_setting(...)` call in this file needs no change.
 from ait.config.settings import (
     DEFAULT_RISK_FREE_RATE,
+    BacktestConfig,
     EngineTuningConfig,
     LegacyEngineConfig,
+    MetaLabelConfig,
     MetaLabelNeutralsConfig,
     resolve_account_capital,
     resolve_position_size_pct,
@@ -594,6 +596,8 @@ class Backtester:
         self._eng = (getattr(getattr(_settings, "backtest", None), "engine_tuning", None) or EngineTuningConfig())
         self._neutrals = (getattr(getattr(_settings, "ml", None), "meta_label_neutrals", None)
                           or MetaLabelNeutralsConfig())
+        self._meta_min_probability = float(getattr(getattr(_settings, "meta_label", None), "min_probability",
+                                                   MetaLabelConfig().min_probability))
         # W88d: the feature column names the engine reads (price_vs_sma_20, rsi_14, ...) follow ml.features
         self._fspec = spec_from_config(getattr(getattr(_settings, "ml", None), "features", None))
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
@@ -824,6 +828,12 @@ class Backtester:
     # Public API
     # ------------------------------------------------------------------
 
+    def _meta_threshold(self) -> float:
+        """The probability cut the meta-label gate applies, for the entry-decision record. W90e: the record said 0.5 whatever
+        the labeler's ``min_probability`` was; it now reports the labeler's own cut, else ``meta_label.min_probability``."""
+        mp = getattr(self._meta_labeler, "min_probability", None)
+        return float(mp if mp is not None else self._meta_min_probability)
+
     def _reject(self, reason: str) -> None:
         """W66: record that an evaluated day ended in this entry rejection.
 
@@ -979,7 +989,7 @@ class Backtester:
                 "direction_conf": round(float(confidence), 4),
                 "range_gate": {"prob": None, "threshold": self._range_min_confidence, "pass": None},
                 "vol_gate": {"vol_10d": None, "max": self._max_entry_vol_annual, "pass": True},
-                "meta_label": {"take": True, "prob": None, "threshold": 0.5},
+                "meta_label": {"take": True, "prob": None, "threshold": self._meta_threshold()},
                 "fractal_gate": {"hurst_spread": 0.0, "threshold": self._hurst_regime_threshold, "pass": True},
                 "regime": "range_bound",
                 "earnings_skip": False,
@@ -1070,7 +1080,7 @@ class Backtester:
                         _entry_decision["meta_label"] = {
                             "take": bool(meta_signal.take_trade),
                             "prob": round(float(getattr(meta_signal, "probability", 0.5)), 4),
-                            "threshold": 0.5,
+                            "threshold": self._meta_threshold(),
                         }
                         if not meta_signal.take_trade:
                             self._reject("meta_label")
@@ -1773,7 +1783,7 @@ class Backtester:
 
         days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
         remaining_dte = max(0, (expiry - current_date).days)
-        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", 0.25)), remaining_dte)
+        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", self._eng.fallback_iv)), remaining_dte)
 
         for row in session_bars.itertuples(index=True):
             underlying = row.Close
@@ -1830,7 +1840,7 @@ class Backtester:
         expiry = date.fromisoformat(str(expiry_str)[:10])
         days_held = (current_date - date.fromisoformat(pos["entry_date"])).days
         remaining_dte = max(0, (expiry - current_date).days)
-        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", 0.25)), remaining_dte)
+        exit_half_spread = self._options_half_spread(float(pos.get("entry_iv", self._eng.fallback_iv)), remaining_dte)
         bar_len = pd.Timedelta(minutes=5)
 
         for row in session_bars.itertuples(index=True):
@@ -2150,13 +2160,14 @@ class Backtester:
     _regime_up: float = 0.02
     # W84: a partial engine has no ex-dividend block (the schema default).
     _ex_div_mode: str = "off"
-    _ex_div_k: int = 5
+    _ex_div_k: int = BacktestConfig.model_fields["ex_div_entry_k_days"].default     # W90e: the schema default, not a copy
     _ex_dates: list | None = None
     _research_table_prefix: str = "research_"
     _risk_free_rate: float = DEFAULT_RISK_FREE_RATE
     _legacy: LegacyEngineConfig = LegacyEngineConfig()      # W88b: a partial engine keeps the schema defaults
     _eng: EngineTuningConfig = EngineTuningConfig()         # W90c: ... and the engine-tuning defaults
     _neutrals: MetaLabelNeutralsConfig = MetaLabelNeutralsConfig()
+    _meta_min_probability: float = MetaLabelConfig().min_probability
     _fspec: FeatureSpec = spec_from_config(None)            # W88d: feature windows / column names (schema defaults)
     _settlement_stats: dict | None = None
 
@@ -3383,7 +3394,7 @@ class Backtester:
                 pnl_pct = 0.0
 
         # Apply per-leg bid-ask spread at exit (scales with current IV and remaining DTE)
-        exit_iv = float(pos.get("entry_iv", 0.25))
+        exit_iv = float(pos.get("entry_iv", self._eng.fallback_iv))        # W90e: engine_tuning.fallback_iv (was 0.25)
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - current_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)
@@ -3857,7 +3868,7 @@ class Backtester:
         current_value = self._reprice_position(pos, last_row["Close"], days_held, hist, _eod_asof)
 
         trade_type = pos.get("trade_type", "debit")
-        exit_iv = float(pos.get("entry_iv", 0.25))
+        exit_iv = float(pos.get("entry_iv", self._eng.fallback_iv))        # W90e: engine_tuning.fallback_iv (was 0.25)
         expiry = date.fromisoformat(pos["expiry_date"])
         remaining_dte = max(0, (expiry - last_date).days)
         exit_half_spread = self._options_half_spread(exit_iv, remaining_dte)

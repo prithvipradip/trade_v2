@@ -192,9 +192,15 @@ def ic_leg_marks_from_ivs(
     )
 
 
-def realized_vol(close_prices: np.ndarray, window: int = 20) -> float:
-    """Calculate annualized realized volatility from close prices."""
+def realized_vol(close_prices: np.ndarray, window: int = 20, fallback: float | None = None) -> float:
+    """Calculate annualized realized volatility from close prices.
+
+    With too few prices it returns ``fallback``; W90e: ``None`` -> ``backtest.engine_tuning.fallback_iv`` of the loaded
+    settings (it was a literal 0.25)."""
     if len(close_prices) < window + 1:
-        return 0.25  # Default 25%
+        if fallback is None:
+            from ait.config.settings import loaded_engine_tuning
+            fallback = loaded_engine_tuning().fallback_iv
+        return float(fallback)
     log_returns = np.diff(np.log(close_prices[-window - 1:]))
     return float(np.std(log_returns) * np.sqrt(252))

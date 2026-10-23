@@ -793,6 +793,16 @@ class WalkForwardTuningConfig(_StrictModel):
         description="W90b: probability bins of the out-of-sample range-model reliability chart.")
     oos_min_extra_rows: int = Field(default=20, ge=0, le=500,
         description="W90b: the out-of-sample direction evaluation needs this many bars beyond its label horizon.")
+    oos_min_labelled_rows: int = Field(default=10, ge=2, le=500,
+        description="W90e: ... and at least this many labelled rows, else it reports nothing for the window.")
+    oos_range_min_extra_rows: int = Field(default=5, ge=0, le=500,
+        description="W90e: the out-of-sample RANGE evaluation needs this many bars beyond its label horizon.")
+    min_windows: int = Field(default=3, ge=1, le=100,
+        description="W90e: a walk-forward run with fewer windows than this aborts (and run_backtest.py warns that too few "
+                    "windows produced results): too few to judge anything.")
+    window_score_full_credit_trades: int = Field(default=5, ge=1, le=500,
+        description="W90e: a window's score for the global best parameters is win rate x sqrt(min(1, trades / this)), so a "
+                    "window with fewer trades than this counts for proportionally less.")
 
     @model_validator(mode="after")
     def _clips(self) -> "WalkForwardTuningConfig":
@@ -821,6 +831,9 @@ class EngineTuningConfig(_StrictModel):
     min_history_bars: int = Field(default=20, ge=5, le=252,
         description="The engine takes no decision before this many bars of history (the larger of this and "
                     "backtest.context_bars is skipped at the start).")
+    fallback_iv: float = Field(default=0.25, ge=0.01, le=3.0,
+        description="W90e: the annualized volatility the engine assumes when it has nothing better: a position that carries "
+                    "no entry_iv (exit repricing, half-spread model) and a realized-vol estimate with too few prices.")
 
 
 class BacktestConfig(_StrictModel):

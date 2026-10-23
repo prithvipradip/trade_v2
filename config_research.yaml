@@ -204,6 +204,7 @@ backtest:
     iv_rank_rise_lookback_rows: 11     # rows the IV-rank-rise veto looks at (11 = a 10-day rise)
     vol_gate_lookback_rows: 11         # closes the realized-vol entry gate measures (11 = 10 returns)
     min_history_bars: 20               # no decision before this many bars of history
+    fallback_iv: 0.25                  # volatility assumed for a position with no entry_iv, and by realized_vol with too few prices
 
   # --- walk-forward / optimizer constants ---
   walkforward_tuning:
@@ -237,6 +238,10 @@ backtest:
     oos_calibration_bins: 8            # reliability-chart bins, direction model
     prob_score_bins: 9                 # reliability-chart bins, range model
     oos_min_extra_rows: 20             # bars beyond the label horizon the OOS direction evaluation needs
+    oos_min_labelled_rows: 10          # ... and at least this many labelled rows
+    oos_range_min_extra_rows: 5        # bars beyond the label horizon the OOS range evaluation needs
+    min_windows: 3                     # a run with fewer walk-forward windows aborts / is flagged as too few to judge
+    window_score_full_credit_trades: 5 # a window's score = win rate x sqrt(min(1, trades / this))
 
 # --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
 # Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.

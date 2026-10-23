@@ -23,22 +23,32 @@ import statistics
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-DEFAULT_BAND_EDGES: tuple[int, ...] = (2, 7, 14, 45)   # = parity.dte_band_upper_edges
+
+def default_band_edges() -> tuple[int, ...]:
+    """The DTE band upper edges the report uses: ``parity.dte_band_upper_edges`` of the loaded settings (schema default
+    without a config). W90e: this was a ``DEFAULT_BAND_EDGES = (2, 7, 14, 45)`` constant repeating that setting."""
+    try:
+        from ait.config.settings import load_settings
+        return tuple(int(e) for e in load_settings().parity.dte_band_upper_edges)
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
+        from ait.config.settings import ParityConfig
+        return tuple(int(e) for e in ParityConfig().dte_band_upper_edges)
+
 _DTE_NAMES = ("entry_dte",)
 
 
-def band_label(dte: int, edges: Iterable[int] = DEFAULT_BAND_EDGES) -> str:
+def band_label(dte: int, edges: Iterable[int] | None = None) -> str:
     lo = 0
-    for hi in edges:
+    for hi in (default_band_edges() if edges is None else edges):
         if dte <= hi:
             return f"{lo}-{hi}"
         lo = hi + 1
     return f"{lo}+"
 
 
-def band_order(edges: Iterable[int] = DEFAULT_BAND_EDGES) -> list[str]:
+def band_order(edges: Iterable[int] | None = None) -> list[str]:
     out, lo = [], 0
-    for hi in edges:
+    for hi in (default_band_edges() if edges is None else edges):
         out.append(f"{lo}-{hi}")
         lo = hi + 1
     out.append(f"{lo}+")
@@ -70,9 +80,9 @@ def _scored(trials: Iterable[Mapping[str, Any]]) -> list[dict]:
 
 
 def summarise_window(trials: Iterable[Mapping[str, Any]], *, top_frac: float = 0.10,
-                     edges: Iterable[int] = DEFAULT_BAND_EDGES) -> dict | None:
+                     edges: Iterable[int] | None = None) -> dict | None:
     """One window's findings, or None when no trial carries a DTE and a finite objective."""
-    edges = tuple(edges)
+    edges = tuple(default_band_edges() if edges is None else edges)
     rows = _scored(trials)
     if not rows:
         return None
@@ -101,10 +111,10 @@ def summarise_window(trials: Iterable[Mapping[str, Any]], *, top_frac: float = 0
 
 
 def summarise_study(trials_by_window: Mapping[Any, Iterable[Mapping[str, Any]]], *,
-                    top_frac: float = 0.10, edges: Iterable[int] = DEFAULT_BAND_EDGES,
+                    top_frac: float = 0.10, edges: Iterable[int] | None = None,
                     min_window_share: float = 2.0 / 3.0) -> dict:
     """Aggregate across windows (``{window_id: [trials]}``)."""
-    edges = tuple(edges)
+    edges = tuple(default_band_edges() if edges is None else edges)
     windows = {}
     for wid, trials in trials_by_window.items():
         s = summarise_window(trials, top_frac=top_frac, edges=edges)

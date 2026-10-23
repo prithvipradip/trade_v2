@@ -55,7 +55,7 @@ def ex_dates_in_window(ex_dates: Sequence[date], start: date, end: date) -> list
 
 
 def ex_div_blocks(mode: str, ex_dates: Sequence[date], entry: date, expiry: date,
-                  k_days: int = 5) -> tuple[bool, date | None]:
+                  k_days: int | None = None) -> tuple[bool, date | None]:
     """(blocked, the ex-date that decides it) for an entry on ``entry`` expiring ``expiry``.
 
     ``ex_dates`` are ALL stored ex-dates for the symbol, ascending. ``live`` uses only the
@@ -64,6 +64,13 @@ def ex_div_blocks(mode: str, ex_dates: Sequence[date], entry: date, expiry: date
     date is the projected one in ``live`` mode (blocked or not), else the first real ex-date
     in the window (or the K-window), or None.
     """
+    if k_days is None:      # W90e: backtest.ex_div_entry_k_days of the loaded settings (was a 5 literal repeating it)
+        try:
+            from ait.config.settings import load_settings
+            k_days = int(load_settings().backtest.ex_div_entry_k_days)
+        except Exception:  # noqa: BLE001 - no config.yaml -> the schema default
+            from ait.config.settings import BacktestConfig
+            k_days = int(BacktestConfig.model_fields["ex_div_entry_k_days"].default)
     if mode not in MODES:
         raise ValueError(f"unknown ex_div_entry_gate mode {mode!r}; expected one of {MODES}")
     if mode == MODE_OFF:

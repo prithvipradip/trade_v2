@@ -163,12 +163,15 @@ class MetaLabeler:
     Uses market context features available at entry time.
     """
 
-    def __init__(self, min_probability: float = 0.50, hyperparams=None,
+    def __init__(self, min_probability: float | None = None, hyperparams=None,
                  feature_spec: "FeatureSpec | None" = None,
                  neutrals: "MetaLabelNeutralsConfig | None" = None,
                  meta_label_config: "MetaLabelConfig | None" = None,
                  regime_thresholds: "tuple[float, float] | None" = None) -> None:
-        self._min_probability = min_probability
+        # W90e: None -> meta_label.min_probability of the loaded settings (a bare MetaLabeler(), as the walk-forward builds
+        # one, used a literal 0.50 that repeated it)
+        self._min_probability = (float(min_probability) if min_probability is not None
+                                 else float(_loaded_meta_label_config().min_probability))
         # W90c: neutral values of missing inputs (ml.meta_label_neutrals), the arm-guard coverage floor and the
         # artifact-age limit (meta_label.*), and the regime fallback's thresholds (backtest.regime_*) are settings
         self._neutrals = neutrals if neutrals is not None else loaded_meta_label_neutrals()
@@ -190,6 +193,11 @@ class MetaLabeler:
         self._training_stats: dict = {}
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def min_probability(self) -> float:
+        """The P(profitable) a signal needs to be taken."""
+        return self._min_probability
 
     @property
     def is_trained(self) -> bool:
