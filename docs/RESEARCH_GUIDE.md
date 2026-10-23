@@ -129,9 +129,11 @@ The live regime classifier has its own three (`regime.min_history_rows`, `iv_ran
 **What is it?** `scripts/literal_census.py` walks the research code (`backtesting/`, `optimization/`, `ml/`, `run_backtest.py`,
 `run_optimizer.py`: 37 modules) and lists, per function, the numeric literals written inside it. `tests/data/literal_allowlist.json`
 is the accepted list, and `tests/test_w88_literal_census.py` fails when a number appears, changes or disappears without that list being
-updated, so a research number cannot be added or removed unseen. It ignores only unit-like values (0, 1, 2, 100, 252, 365, 12, 24, 60, 1000: the
-`TRIVIAL` set in the script), booleans, `round()` digits, log / `print` arguments, and docstrings and comments. Until W90e it also ignored 3, 4, 5, 7,
-10, 30, 0.5 and 0.25, which hid real windows and thresholds; those are counted now.
+updated, so a research number cannot be added or removed unseen. It ignores only 0, 1, 2 and -1 (the `TRIVIAL` set in the script), booleans, `round()`
+digits, log / `print` arguments, and docstrings and comments. It used to ignore more: 3, 4, 5, 7, 10, 30, 0.5 and 0.25 until W90e, and the unit-like
+12, 24, 60, 100, 252, 365 and 1000 until W95. Both lists hid real windows and thresholds (a 5-day lookback, a 60-day high, a 252-bar context, a 100-row
+minimum); those are counted now, so a unit conversion (`x 100` shares per contract, `/ 365` days to years, `sqrt(252)`) is listed too and is classified
+`structural`.
 
 **Categories.** Every function in the list has one:
 
@@ -142,7 +144,7 @@ updated, so a research number cannot be added or removed unseen. It ignores only
 | `epsilon` | a numerical tolerance | `engine.py::Backtester._remark_t`: 0.0001-year floor on time to expiry | it keeps Black-Scholes finite at expiry and has no economic meaning |
 | `dormant_path` | legacy code off the iron-condor path | `engine.py::Backtester._quick_rsi`: period 14, neutral 50 | nothing on the iron-condor path reads it (the tunable legacy numbers are in `backtest.legacy_engine`) |
 | `display` | formatting only | `run_record.py::flatten`: 400-character cut of an MLflow parameter | it changes how a run is recorded, never the result |
-| `registered_followup` | transitional: a research number still in code, to be converted | `ml/trainer.py::ModelTrainer._should_rollback`: rollback margin 0.05 | it should be a setting; W90d converts the last of these, after which the category is empty |
+| `registered_followup` | transitional: a research number still in code, to be converted | `ml/features.py::FeatureEngine._add_cross_asset`: the 60-day return and VIX z-score windows | it should be a setting; it is shared with live, so it goes in `ml.features` and changes the feature-spec hash (saved models retrain): planned as W97 |
 
 **Reading an entry.**
 
@@ -352,6 +354,12 @@ strategy disabling is unreachable. Symbol disabling and the confidence raise do 
 **How is a trial scored?** By the objective: `sharpe_ratio`, `composite`, `profit_factor` or `win_rate`. The composite is
 `0.4 × Sharpe + 0.4 × win rate − 0.2 × |max drawdown|` (weights in `backtest.objectives`). Fewer than 3 trades scores on a graded floor, so the
 search has something to climb.
+
+**What is the graded floor?** A trial with fewer trades than `backtest.optimize_hard_min_trades` (3) scores
+`optimize_below_floor_score + optimize_below_floor_gradient × trades / hard_min`: -100 for zero trades, rising by up to 20 (`optimize_below_floor_gradient`),
+so trading always beats not trading and a starved trial always ranks below a real one. The base (`optimize_below_floor_score`, W95) was a literal -100
+in the optimizer. Keep it far below any objective's real scores (it is bounded to -1000..-1, and base plus gradient must stay negative). All three
+are in `config_research.yaml`.
 
 **What is searched, and can I change it?** The ranges are in `optimization/param_spaces.py`. A study can override one range
 (`search_space:` in the study file). It is validated (known dimension, `low < high`, inside the hard limits), hashed, and a stored Optuna

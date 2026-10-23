@@ -78,10 +78,48 @@
     4,
     4,
     4,
-    4
+    4,
+    100,
+    100,
+    100,
+    100.0,
+    100,
+    100,
+    100,
+    100,
+    100,
+    365.0,
+    365.0,
+    365.0,
+    365.0,
+    365.0,
+    365.0
    ],
    "category": "structural",
-   "note": "leg-count arithmetic of the multi-leg builders (/4, /3, n_legs), the sqrt exponent of the expected move, and the 0.5 floor of the iron-condor research budget cap (mirrors live's _vol_scaled_width); the spread sizing numbers are backtest.spread_tuning (W90f)"
+   "note": "leg-count arithmetic of the multi-leg builders (/4, /3, n_legs), the sqrt exponent of the expected move, and the 0.5 floor of the iron-condor research budget cap (mirrors live's _vol_scaled_width); the spread sizing numbers are backtest.spread_tuning (W90f); W95: also x 100 shares per contract, dte / 365 years, and the naked-margin x 100"
+  },
+  "src/ait/backtesting/engine.py::Backtester._build_debit_position": {
+   "values": [
+    100,
+    100
+   ],
+   "category": "structural",
+   "note": "x 100 shares per contract (a per-share premium in dollars)"
+  },
+  "src/ait/backtesting/engine.py::Backtester._build_position": {
+   "values": [
+    365.0
+   ],
+   "category": "structural",
+   "note": "dte / 365.0: calendar days to years for the Black-Scholes time to expiry"
+  },
+  "src/ait/backtesting/engine.py::Backtester._calc_pnl": {
+   "values": [
+    100,
+    100
+   ],
+   "category": "structural",
+   "note": "x 100 shares per contract (a per-share price move in dollars)"
   },
   "src/ait/backtesting/engine.py::Backtester._check_intraday_exit": {
    "values": [
@@ -121,6 +159,29 @@
    "category": "structural",
    "note": "[:10] ISO-date slice of a stored date string"
   },
+  "src/ait/backtesting/engine.py::Backtester._finalize_spread_position": {
+   "values": [
+    100
+   ],
+   "category": "structural",
+   "note": "x 100 shares per contract (a per-share net cost in dollars)"
+  },
+  "src/ait/backtesting/engine.py::Backtester._finish_settlement": {
+   "values": [
+    100,
+    100
+   ],
+   "category": "structural",
+   "note": "x 100 shares per contract (a per-share settlement value and fees in dollars)"
+  },
+  "src/ait/backtesting/engine.py::Backtester._get_iv": {
+   "values": [
+    100.0,
+    100.0
+   ],
+   "category": "structural",
+   "note": "VIX level in percent to a fraction: / 100"
+  },
   "src/ait/backtesting/engine.py::Backtester._position_dte": {
    "values": [
     10,
@@ -132,10 +193,13 @@
   "src/ait/backtesting/engine.py::Backtester._quick_rsi": {
    "values": [
     14,
-    50.0
+    50.0,
+    100.0,
+    100.0,
+    100.0
    ],
    "category": "dormant_path",
-   "note": "legacy fallback RSI (period 14, neutral 50)"
+   "note": "legacy fallback RSI (period 14, neutral 50); W95: also the RSI definition 100 - 100 / (1 + rs)"
   },
   "src/ait/backtesting/engine.py::Backtester._remaining_dte": {
    "values": [
@@ -148,10 +212,11 @@
   "src/ait/backtesting/engine.py::Backtester._remark_t": {
    "values": [
     0.0001,
-    10
+    10,
+    365.0
    ],
    "category": "epsilon",
-   "note": "floor on time-to-expiry in years"
+   "note": "floor on time-to-expiry in years; W95: also dte / 365 (calendar days to years)"
   },
   "src/ait/backtesting/engine.py::Backtester._reprice_ic_legs": {
    "values": [
@@ -191,10 +256,11 @@
     0.5,
     0.5,
     0.5,
-    10
+    10,
+    252
    ],
    "category": "structural",
-   "note": "binary flag cut vol_regime_expanding > 0.5, the sqrt exponent of the annualization, [:10] date slice (the meta-label threshold record reads the labeler's min_probability)"
+   "note": "binary flag cut vol_regime_expanding > 0.5, the sqrt exponent of the annualization, [:10] date slice (the meta-label threshold record reads the labeler's min_probability); W95: also the 252 ** 0.5 annualization of the 10-day realized vol"
   },
   "src/ait/backtesting/engine.py::_session_close": {
    "values": [
@@ -262,11 +328,24 @@
    "category": "structural",
    "note": "a rank correlation needs at least 10 pairs to be reported"
   },
+  "src/ait/backtesting/iv_rank_compare.py::veto_vs_live": {
+   "values": [
+    100.0,
+    100.0,
+    100.0
+   ],
+   "category": "structural",
+   "note": "scale conversion between the feature IV rank (0 to 1) and the stored IV rank (0 to 100 percent)"
+  },
   "src/ait/backtesting/iv_surface.py::IVSurface.iv": {
    "values": [
-    1e-08
+    1e-08,
+    365.0,
+    365.0,
+    365.0
    ],
-   "category": "epsilon"
+   "category": "epsilon",
+   "note": "W95: also days / 365 (calendar days to years)"
   },
   "src/ait/backtesting/learner.py::<module>": {
    "values": [
@@ -281,6 +360,13 @@
    ],
    "category": "structural",
    "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/backtesting/pool.py::_per_contract_risk": {
+   "values": [
+    100.0
+   ],
+   "category": "structural",
+   "note": "x 100 shares per contract"
   },
   "src/ait/backtesting/pricing.py::black_scholes_price": {
    "values": [
@@ -307,10 +393,18 @@
   },
   "src/ait/backtesting/pricing.py::realized_vol": {
    "values": [
-    20
+    20,
+    252
    ],
    "category": "structural",
-   "note": "default look-back window of 20 (callers pass theirs); the too-few-prices fallback is engine_tuning.fallback_iv"
+   "note": "default look-back window of 20 (callers pass theirs); the too-few-prices fallback is engine_tuning.fallback_iv; W95: also sqrt(252) annualization"
+  },
+  "src/ait/backtesting/pricing.py::skewed_leg_iv": {
+   "values": [
+    100.0
+   ],
+   "category": "structural",
+   "note": "log-moneyness to percent out of the money: x 100 (the skew slope is per percent OTM)"
   },
   "src/ait/backtesting/range_bank.py::RangeModelBank.get": {
    "values": [
@@ -328,6 +422,13 @@
    ],
    "category": "structural",
    "note": "session-close and settle-bar times (ET)"
+  },
+  "src/ait/backtesting/replay.py::ReplayTrade.actual_credit": {
+   "values": [
+    100.0
+   ],
+   "category": "structural",
+   "note": "100 shares per contract: dollars to a per-share credit"
   },
   "src/ait/backtesting/replay.py::ReplayTrade.condor_roles": {
    "values": [
@@ -379,10 +480,12 @@
    "values": [
     0.0001,
     0.0001,
-    0.5
+    0.5,
+    365.0,
+    365.0
    ],
    "category": "epsilon",
-   "note": "floor on time-to-expiry"
+   "note": "floor on time-to-expiry; W95: also dte / 365 (calendar days to years)"
   },
   "src/ait/backtesting/replay.py::implied_vol_from_price": {
    "values": [
@@ -405,17 +508,35 @@
   "src/ait/backtesting/replay.py::settlement_replay": {
    "values": [
     9,
-    30
+    30,
+    100,
+    100.0,
+    100.0
    ],
    "category": "structural",
-   "note": "09:30 ET open"
+   "note": "09:30 ET open; W95: also 100 shares per contract"
   },
   "src/ait/backtesting/replay.py::t_clean": {
    "values": [
+    365.0,
     86400.0
    ],
    "category": "structural",
-   "note": "seconds per day"
+   "note": "seconds per day; W95: also 365 * 86400 (seconds per year)"
+  },
+  "src/ait/backtesting/replay.py::t_engine": {
+   "values": [
+    365.0
+   ],
+   "category": "structural",
+   "note": "calendar days to years: / 365"
+  },
+  "src/ait/backtesting/result.py::<module>": {
+   "values": [
+    252.0
+   ],
+   "category": "structural",
+   "note": "SHARPE_ANNUALIZATION_CAP = 252.0: a fixed methodology convention (W95; RESEARCH_GUIDE 'Sharpe annualization'), deliberately not a setting"
   },
   "src/ait/backtesting/result.py::BacktestResult.cash_drag_adjusted_return": {
    "values": [
@@ -424,6 +545,13 @@
    ],
    "category": "structural",
    "note": "years floor 0.01 and 365.25 days/year; the cash yield is options.risk_free_rate (W90a)"
+  },
+  "src/ait/backtesting/result.py::annualization_factor": {
+   "values": [
+    365.0
+   ],
+   "category": "structural",
+   "note": "trades per year = trades x 365 / span in days; the cap is SHARPE_ANNUALIZATION_CAP"
   },
   "src/ait/backtesting/result.py::annualization_factor._dt": {
    "values": [
@@ -464,10 +592,19 @@
     0.05,
     0.05,
     0.3,
+    60,
     100000.0
    ],
    "category": "structural",
-   "note": "named, documented study floors (W87a)"
+   "note": "named, documented study floors (W87a); W95: also STUDY_SCAN_INTERVAL_MINUTES = 60, a named study-harness constant; the engine does not read the scan interval yet (W96 plans that)"
+  },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._adaptive_range_threshold": {
+   "values": [
+    252,
+    252
+   ],
+   "category": "structural",
+   "note": "annualization: sqrt(252) trading days, and horizon_days / 252 back to the horizon"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_direction_model_oos": {
    "values": [
@@ -482,10 +619,11 @@
    "values": [
     0.5,
     0.5,
-    0.5
+    0.5,
+    252
    ],
    "category": "structural",
-   "note": "0.5 = default equal model weight (the horizon default and the extra-rows margin are settings)"
+   "note": "0.5 = default equal model weight (the horizon default and the extra-rows margin are settings); W95: also sqrt(252) annualization"
   },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._prob_score_metrics": {
    "values": [
@@ -523,10 +661,12 @@
     5,
     6,
     8,
+    12,
+    12,
     13
    ],
    "category": "display",
-   "note": "string slicing offsets of the funnel summary"
+   "note": "string slicing offsets of the funnel summary; W95: also the [:12] / > 12 cut of the starved-window list"
   },
   "src/ait/backtesting/walkforward.py::_save_window_timeseries": {
    "values": [
@@ -579,9 +719,11 @@
     0.8,
     0.975,
     1.2,
-    20
+    20,
+    252
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "W95: also TRADING_DAYS = 252 (a named constant)"
   },
   "src/ait/ml/excursion.py::barrier_no_touch": {
    "values": [
@@ -673,9 +815,15 @@
     20,
     20,
     40.0,
-    50.0
+    50.0,
+    60,
+    60,
+    60,
+    60,
+    100.0
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the 60-day return windows and the 60-day VIX z-score window belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
   },
   "src/ait/ml/features.py::FeatureEngine._add_fractal_features": {
    "values": [
@@ -692,9 +840,14 @@
    "values": [
     3,
     3,
-    3
+    3,
+    252,
+    252,
+    252,
+    252
    ],
-   "category": "fixed_feature_group"
+   "category": "fixed_feature_group",
+   "note": "W95: also sqrt(252) annualization"
   },
   "src/ait/ml/features.py::FeatureEngine._add_macro": {
    "values": [
@@ -708,9 +861,11 @@
     20,
     20,
     20,
-    20
+    20,
+    100
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the DXY normalization centre of 100 belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
   },
   "src/ait/ml/features.py::FeatureEngine._add_market_structure": {
    "values": [
@@ -735,18 +890,37 @@
     20,
     20,
     20,
+    60,
+    60,
+    100,
     200,
-    200
+    200,
+    252,
+    252,
+    252,
+    252,
+    252
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the 60-day return and volatility windows and the SMA-200 min_periods of 100 belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
   },
   "src/ait/ml/features.py::FeatureEngine._add_seasonality": {
    "values": [
     0.5,
     0.5,
-    4.0
+    4.0,
+    12.0
    ],
-   "category": "fixed_feature_group"
+   "category": "fixed_feature_group",
+   "note": "W95: also month / 12 (a 0-1 normalization)"
+  },
+  "src/ait/ml/features.py::FeatureEngine._add_volatility": {
+   "values": [
+    252,
+    252
+   ],
+   "category": "fixed_feature_group",
+   "note": "annualization: sqrt(252) trading days"
   },
   "src/ait/ml/features.py::FeatureEngine._hurst_wavelet": {
    "values": [
@@ -796,9 +970,11 @@
   },
   "src/ait/ml/features.py::FeatureEngine._multiscale_hurst": {
    "values": [
+    60,
     180
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the 60-bar short Hurst window belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
   },
   "src/ait/ml/features.py::FeatureEngine._psd_features": {
    "values": [
@@ -806,9 +982,19 @@
     0.5,
     0.8,
     4,
-    4.0
+    4.0,
+    60
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the 60-row minimum belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
+  },
+  "src/ait/ml/features.py::FeatureEngine._rsi": {
+   "values": [
+    100,
+    100
+   ],
+   "category": "fixed_feature_group",
+   "note": "the RSI definition: 100 - 100 / (1 + rs)"
   },
   "src/ait/ml/features.py::FeatureEngine.compute": {
    "values": [
@@ -838,14 +1024,21 @@
     4,
     5,
     7,
+    12,
+    12,
+    12,
+    12,
+    12,
     14,
     20,
     40,
     78,
+    100,
     200,
     500
    ],
-   "category": "fixed_feature_group"
+   "category": "registered_followup",
+   "note": "W95 review (operator): the 12-bar intraday windows and the 100-row minimum belong in the configuration. They are shared with live, so they go in ml.features (config.yaml), and adding them changes the feature-spec hash, so every saved model is refused and retrained: a wave of its own (W97), not part of W95."
   },
   "src/ait/ml/hyperparams.py::lgbm_multiclass_kwargs": {
    "values": [
@@ -969,17 +1162,27 @@
    "values": [
     0.5,
     0.5,
-    20
+    20,
+    252
    ],
    "category": "structural",
-   "note": "estimator definition: 20-day realized-vol percentile (the 252-day window and 60-row minimum are unit-like values the census ignores); 0.5 when unavailable"
+   "note": "estimator definition: 20-day realized-vol percentile (the 252-day window and 60-row minimum are unit-like values the census ignores); 0.5 when unavailable; W95: also sqrt(252) annualization (the history minimum and window are regime.iv_rank_* settings)"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_volatility": {
    "values": [
-    20
+    20,
+    252
    ],
    "category": "structural",
-   "note": "estimator definition: 20-day realized volatility, annualized"
+   "note": "estimator definition: 20-day realized volatility, annualized; W95: also sqrt(252) annualization"
+  },
+  "src/ait/ml/regime.py::RegimeDetector._rsi": {
+   "values": [
+    100,
+    100
+   ],
+   "category": "structural",
+   "note": "the RSI definition: 100 - 100 / (1 + rs)"
   },
   "src/ait/ml/regime.py::RegimeDetector.analyze": {
    "values": [
@@ -1066,6 +1269,13 @@
    ],
    "category": "structural",
    "note": "minimum fetch period days"
+  },
+  "src/ait/optimization/optimizer.py::StrategyOptimizer._maybe_drop_inert_params": {
+   "values": [
+    365.0
+   ],
+   "category": "structural",
+   "note": "dte / 365: calendar days to years in the expected-move formula"
   },
   "src/ait/optimization/optimizer.py::StrategyOptimizer._suggest_one": {
    "values": [
