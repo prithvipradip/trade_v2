@@ -18794,3 +18794,29 @@ smoke_deploy SMOKE PASS (13). Fast lane **6682 passed / 46 skipped / 153 deselec
 **NEXT.** Restart the supervisor on the new code outside RTH; then `grep ib_port_fallback logs/orchestrator.log` should stay empty while `.env` and the app agree. W91 (append-only retrain save and one set of history tables) is still to be planned.
 
 ---
+
+## 2026-10-23 - W93 AS BUILT: regime override "at or above"; the bare engine follows the config (W70 D closed); measure-only pass on the unit-like numbers
+
+Planned in the W93 AS PLANNED entry above. Built in a worktree on branch `w93` (plan approved before building), commit `eb228c6`, merged into `main` by FAST-FORWARD after merging the other session's W94 into the branch (`069be82`; clean, no conflicts). Nothing pushed.
+
+**AS BUILT.**
+- **Regime gate:** `ml.regime.regime_forces_neutral(analysis, threshold)` = HIGH_VOLATILITY and `confidence >= threshold`; the orchestrator's entry rule calls it (it was an inlined strict `>`). Closes the W92 finding: the classifier's high-vol floor is exactly 0.80 = `ml.regime_override_confidence`, so a VIX-only trigger scored 0.80 and `0.80 > 0.80` never fired. `IronCondor.generate_signals` does not read `market_direction`, so the condor book is unaffected (only the direction printed in two log lines and the counterfactual record); it matters for direction-sensitive strategies, none enabled. Schema descriptions, `config.yaml` comments and the RESEARCH_GUIDE "Watch the pair" paragraph say "at or above" (config.yaml: comments only, NO new keys).
+- **W70 D closed (operator decision):** `Backtester(stop_loss_pct=None, profit_target_pct=None)` resolve `backtest.stop_loss_pct` / `profit_target_pct` (config 0.35 / 0.50; they were harness defaults 0.50 / 1.00). Only DEBIT trades read them (`_check_exit_fixed` / `_check_exit_trailing`) and every research entry point already passed the config values, so only a bare `Backtester()` changed; condor trades are independent of them (tested). `test_w70 ... test_explicit_stop_and_target_stay_harness_defaults` pinned the old rule and was rewritten (`test_stop_and_target_follow_the_config`); the W92 must-agree-pair test was renamed.
+
+**VERIFIED.** Reference dump, `gate_parity_ab`, `ex_div_gate_ab` and the walk-forward smoke byte-identical to `main` (iron-condor path); 12 new tests (`tests/test_w93_gate_and_bare_engine.py`: boundary table, wiring through the hot-path rig, moved threshold, bare engine follows config / overlay / explicit, debit exit levels, condor independence), 9/9 mutants caught; fast lane on the merged tree 6693 passed / 46 skipped / 153 deselected / 1 failed (the worktree-only `test_w72 ... git_ignored`); compileall, typecheck, `smoke_deploy` clean.
+**PROCESS.** The pre-merge process check (new rule after W92) found a bot (`ait.main --paper`, PID 11554) and its supervisor running, so the merge waited for the operator ("merge as long as it is safe"). Safety was re-checked immediately before the fast-forward: `main` an ancestor of the branch, only 10 files touched, no new `config.yaml` keys (comments only), no new modules for the running bot to import lazily; afterwards the bot, the supervisor and the dashboards were still up (200). The running bot keeps the old orchestrator in memory; the change takes effect at its next restart.
+
+**MEASURE-ONLY PASS (nothing changed; the scanner is untouched).** Removing the unit-like values (60, 252, 365, 12, 24, 100, 1000) from the census ignore list would make 102 more literals visible (117 -> 138 functions, 404 -> 506 literals): `100` x40, `252` x22, `365` x17, `60` x15, `12` x8 (`24`, `1000` hide nothing). 31 are in `ml/features.py` (already `fixed_feature_group`). Of the other 71: about 34 are `x 100` conversions (100 shares per contract, percent <-> fraction, the RSI formula), 17 `/ 365` time conversions, about 11 `sqrt(252)` annualizations, 2 display slices. **Nine are policy numbers hidden by "unit-like", registered for a later decision (none converted):**
+1. `backtesting/engine.py` ~1322: the 60-day rolling high of the drawdown gate (`pct_from_60d_high_threshold` names the window but it is fixed).
+2. `backtesting/walkforward.py` ~3131: meta-labeler `context_bars = 60`.
+3. `backtesting/walkforward.py` ~1718: feature `context_bars = min(252, len(train_df))`.
+4. `backtesting/walkforward.py` ~3463: `len(df) > 100`, the minimum fetched rows.
+5. `backtesting/replay.py` ~574: the 60-day scan look-back.
+6. `backtesting/study_harness.py`: `STUDY_SCAN_INTERVAL_MINUTES = 60`.
+7. `optimization/optimizer.py`: `_MIN_BACKTEST_ROWS = 60`.
+8. `ml/regime.py`: the 60-row minimum history, the 60-row IV-rank minimum and the 252-day IV-rank window.
+9. `backtesting/result.py` ~330: the `min(252, trades per year)` cap of the Sharpe annualization (a methodology choice).
+
+**NEXT.** (1) Decide whether any of the nine become settings (and whether the scanner's ignore list should narrow further). (2) A bot restart carries W93 (and W88-W94) into the live process; no value changes for the condor book. (3) W91 (table unification) unchanged.
+
+---
