@@ -60,7 +60,8 @@ class TestContent:
         assert "0.4 × Sharpe + 0.4 × win rate − 0.2" in TEXT
 
     def test_every_research_only_block_is_mentioned(self):
-        for block in ("learner", "legacy_engine", "objectives", "walkforward_tuning", "engine_tuning"):
+        for block in ("learner", "legacy_engine", "objectives", "walkforward_tuning", "engine_tuning", "surface_tuning", "friction_fit",
+                      "spread_tuning"):
             assert f"`{block}`" in TEXT, block
 
     def test_the_walk_forward_defaults_quoted_are_the_real_ones(self):

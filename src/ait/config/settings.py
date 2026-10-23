@@ -836,6 +836,69 @@ class EngineTuningConfig(_StrictModel):
                     "no entry_iv (exit repricing, half-spread model) and a realized-vol estimate with too few prices.")
 
 
+class SurfaceTuningConfig(_StrictModel):
+    """W90f: the acceptance rules of the research IV surface (``backtesting/iv_surface.py``), which prices legs from real option
+    bars when ``backtest.pricing_source`` is ``surface``. RESEARCH ONLY. Defaults = the pre-W90f module constants. A surface is
+    cached on disk; the fit rules are part of its cache key, so changing one rebuilds it."""
+
+    min_volume: int = Field(default=10, ge=0, le=100000,
+        description="A bar needs at least this daily volume to enter a smile fit (thin bars have noisy solved IVs).")
+    min_price: float = Field(default=0.05, ge=0.0, le=10.0,
+        description="... and a close of at least this many dollars (below it the IV is tick noise).")
+    max_abs_moneyness: float = Field(default=0.10, gt=0.0, le=1.0,
+        description="Only strikes within |ln(K/S)| of this are fitted (10% either side of the money).")
+    min_points: int = Field(default=5, ge=3, le=1000,
+        description="A (date, expiry) smile is fitted only from at least this many bars (a quadratic needs 3; more makes it stable).")
+    min_span: float = Field(default=0.01, ge=0.0, le=1.0,
+        description="... and only when the fitted bars cover at least this much log-moneyness (1%).")
+    iv_lower_bound: float = Field(default=0.03, gt=0.0, lt=5.0,
+        description="Solved implied vols below this are discarded as unsolvable / noise.")
+    iv_upper_bound: float = Field(default=2.5, gt=0.0, le=10.0,
+        description="... and above this.")
+    clamp_margin: float = Field(default=0.01, ge=0.0, le=1.0,
+        description="A smile is evaluated at most this far (in log-moneyness) outside the range it was fitted on; beyond it the "
+                    "edge value is held flat.")
+    max_stale_days: int = Field(default=5, ge=0, le=60,
+        description="A query may use a surface dated at most this many calendar days before it (weekends and holidays); older is "
+                    "treated as no surface.")
+
+    @model_validator(mode="after")
+    def _bounds(self) -> "SurfaceTuningConfig":
+        if not self.iv_lower_bound < self.iv_upper_bound:
+            raise ValueError("surface_tuning: iv_lower_bound must be below iv_upper_bound")
+        return self
+
+
+class FrictionFitConfig(_StrictModel):
+    """W90f: the minimum data a leg-spread (friction) model needs to be fitted (``backtesting/friction.py``). Used by the offline
+    calibration (``scripts/calibrate_option_spreads.py``, the short-DTE collector), not by a backtest. RESEARCH ONLY. Defaults =
+    the pre-W90f literals."""
+
+    min_samples: int = Field(default=5, ge=3, le=100000,
+        description="Fewer usable (mid, half-spread) samples than this and no model is fitted at all.")
+    min_sessions_for_cv: int = Field(default=3, ge=2, le=1000,
+        description="Leave-one-session-out cross-validation needs at least this many trading days; with fewer the forms are "
+                    "compared in-sample.")
+    min_train_rows: int = Field(default=3, ge=1, le=100000,
+        description="A cross-validation fold whose training part has fewer rows than this is skipped.")
+    min_affine_points: int = Field(default=3, ge=2, le=100000,
+        description="The affine form (a + b * mid) is fitted only from at least this many points, else it falls back to a constant.")
+
+
+class SpreadTuningConfig(_StrictModel):
+    """W90f: sizing numbers of the research engine's single-structure builders: the put / call credit spreads, the iron butterfly,
+    the jade lizard and the debit structures. The iron-condor builder does not read them (it sizes from the risk budget and
+    ``wing_k``). RESEARCH ONLY: the live selector trades iron condors only, so these are for studies of the other structures
+    before any of them is made live. Defaults = the pre-W90f literals."""
+
+    max_cost_fraction_of_capital: float = Field(default=0.25, gt=0.0, le=1.0,
+        description="A single spread's max loss (credit structures) or cost (debit structures) per contract may not exceed this "
+                    "fraction of capital; a larger one is not opened.")
+    wing_expected_move_fraction: float = Field(default=0.5, gt=0.0, le=5.0,
+        description="Wing width of the iron butterfly, put / call credit spreads and jade lizard = wing_k x expected move x this "
+                    "(floored at the wing floor). 0.5 = half an expected move.")
+
+
 class BacktestConfig(_StrictModel):
     @field_validator("default_symbols")
     @classmethod
@@ -1213,6 +1276,12 @@ class BacktestConfig(_StrictModel):
         description="W88b: constants of the engine's legacy / dormant paths (listed in full in the research overlay file).")
     objectives: ObjectivesConfig = Field(default_factory=ObjectivesConfig,
         description="W88b: constants of the Optuna objectives (composite weights, profit-factor cap).")
+    surface_tuning: SurfaceTuningConfig = Field(default_factory=SurfaceTuningConfig,
+        description="W90f: acceptance rules of the research IV surface (listed in full in the research overlay file).")
+    friction_fit: FrictionFitConfig = Field(default_factory=FrictionFitConfig,
+        description="W90f: minimum data for fitting a leg-spread model (listed in full in the research overlay file).")
+    spread_tuning: SpreadTuningConfig = Field(default_factory=SpreadTuningConfig,
+        description="W90f: sizing numbers of the non-condor single-structure builders (listed in full in the research overlay file).")
     engine_tuning: EngineTuningConfig = Field(default_factory=EngineTuningConfig,
         description="W90c: IV-skew coefficients, gate look-backs and the minimum history of the research engine "
                     "(listed in full in the research overlay file).")
@@ -2605,6 +2674,22 @@ def loaded_ml_config() -> "MLConfig":
         return load_settings().ml
     except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
         return MLConfig()
+
+
+def loaded_surface_tuning() -> "SurfaceTuningConfig":
+    """W90f: ``backtest.surface_tuning`` of the loaded settings (the frozen research view in a research process), else defaults."""
+    try:
+        return load_settings().backtest.surface_tuning
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return SurfaceTuningConfig()
+
+
+def loaded_friction_fit() -> "FrictionFitConfig":
+    """W90f: ``backtest.friction_fit`` of the loaded settings, else the schema defaults."""
+    try:
+        return load_settings().backtest.friction_fit
+    except Exception:  # noqa: BLE001 - no config.yaml -> the schema defaults
+        return FrictionFitConfig()
 
 
 def loaded_engine_tuning() -> "EngineTuningConfig":

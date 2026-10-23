@@ -94,6 +94,9 @@ or the command-line flag.
 | `learner` | Thresholds of the research learner |
 | `legacy_engine` | Constants of the engine's dormant paths |
 | `objectives` | Weights of the Optuna objectives |
+| `surface_tuning` | The acceptance rules of the research IV surface (min volume 10, min price 0.05, |moneyness| 0.10, 5 points, 1% span, IV bounds, clamp margin, 5 stale days); part of the surface cache key, so a changed rule rebuilds it (W90f) |
+| `friction_fit` | The minimum data a leg-spread (friction) model needs to be fitted: samples, sessions for cross-validation, training rows, affine points. Offline calibration only (W90f) |
+| `spread_tuning` | Sizing numbers of the non-condor builders (put / call credit spreads, iron butterfly, jade lizard, debit structures): max cost as a share of capital (25%) and the wing as a fraction of the expected move (0.5). The iron-condor builder does not read them (W90f) |
 | `engine_tuning` | The engine's IV-skew coefficients (`put_skew_coefficient` 0.10, `call_skew_coefficient` 0.02), the look-backs of the realized-vol and IV-rank-rise entry gates, the minimum history before the first decision (W90c), and the fallback volatility used when a position has no entry IV (`fallback_iv`, W90e) |
 | `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins and minimums, the minimum number of windows (`min_windows`) and the window-score shrink (W90e); also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
 

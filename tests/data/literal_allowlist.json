@@ -61,11 +61,6 @@
   },
   "src/ait/backtesting/engine.py::Backtester._build_credit_position": {
    "values": [
-    0.25,
-    0.25,
-    0.5,
-    0.5,
-    0.5,
     0.5,
     0.5,
     0.5,
@@ -86,15 +81,8 @@
     4,
     4
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE D: 25% of capital cap on the non-condor structures and the 0.5 half-expected-move wing factor; the rest is leg-count arithmetic (/4, /3, n_legs) and the sqrt exponent 0.5"
-  },
-  "src/ait/backtesting/engine.py::Backtester._build_debit_position": {
-   "values": [
-    0.25
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE D: 25% of capital cap on a debit structure's cost"
+   "category": "structural",
+   "note": "leg-count arithmetic of the multi-leg builders (/4, /3, n_legs), the sqrt exponent of the expected move, and the 0.5 floor of the iron-condor research budget cap (mirrors live's _vol_scaled_width); the spread sizing numbers are backtest.spread_tuning (W90f)"
   },
   "src/ait/backtesting/engine.py::Backtester._check_intraday_exit": {
    "values": [
@@ -133,13 +121,6 @@
    ],
    "category": "structural",
    "note": "[:10] ISO-date slice of a stored date string"
-  },
-  "src/ait/backtesting/engine.py::Backtester._finalize_spread_position": {
-   "values": [
-    0.25
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE D: 25% of capital cap on a spread's cost"
   },
   "src/ait/backtesting/engine.py::Backtester._position_dte": {
    "values": [
@@ -239,11 +220,10 @@
   "src/ait/backtesting/friction.py::_fit_one": {
    "values": [
     1e-09,
-    1e-09,
-    3
+    1e-09
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE F: an affine fit needs at least 3 points; 1e-9 are floors against dividing by zero"
+   "category": "epsilon",
+   "note": "1e-9 floors against dividing by zero / a flat mid range (the affine-form point minimum is backtest.friction_fit.min_affine_points)"
   },
   "src/ait/backtesting/friction.py::band_dte_range": {
    "values": [
@@ -251,15 +231,6 @@
    ],
    "category": "structural",
    "note": "open-ended band sentinel"
-  },
-  "src/ait/backtesting/friction.py::fit_leg_spread_models": {
-   "values": [
-    3,
-    3,
-    5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE F: minimum samples to fit a friction model (5), minimum sessions for grouped CV (3) and minimum training rows per fold (3)"
   },
   "src/ait/backtesting/gate_parity.py::one_sided_gate_warnings": {
    "values": [
@@ -291,21 +262,6 @@
    ],
    "category": "structural",
    "note": "a rank correlation needs at least 10 pairs to be reported"
-  },
-  "src/ait/backtesting/iv_surface.py::<module>": {
-   "values": [
-    0.01,
-    0.01,
-    0.03,
-    0.05,
-    0.1,
-    2.5,
-    5,
-    5,
-    10
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE F: the quote-surface acceptance rules (MIN_VOLUME 10, MIN_POINTS 5, MAX_STALE_DAYS 5 and the price / moneyness / span / IV bounds) decide which quotes build the surface"
   },
   "src/ait/backtesting/iv_surface.py::IVSurface.iv": {
    "values": [

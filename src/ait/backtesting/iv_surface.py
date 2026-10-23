@@ -37,16 +37,39 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from ait.config.settings import DEFAULT_RISK_FREE_RATE  # W88b: one schema default for r
+from ait.config.settings import (  # W88b: one schema default for r; W90f: the acceptance rules are backtest.surface_tuning
+    DEFAULT_RISK_FREE_RATE,
+    SurfaceTuningConfig,
+    loaded_surface_tuning,
+)
 
-MIN_VOLUME = 10
-MIN_PRICE = 0.05
-MAX_ABS_M = 0.10
-MIN_POINTS = 5
-MIN_SPAN = 0.01          # the fit must cover at least 1% of log-moneyness
-IV_BOUNDS = (0.03, 2.5)
-CLAMP_MARGIN = 0.01      # evaluate at most this far outside the fitted range
-MAX_STALE_DAYS = 5       # calendar days a surface date may lag the query date
+# W90f: these were literals (10 / 0.05 / 0.10 / 5 / 0.01 / (0.03, 2.5) / 0.01 / 5). They are the SCHEMA DEFAULTS of
+# ``backtest.surface_tuning`` now (aliases kept for importers); a research run passes the loaded values through
+# ``fit_params`` / ``lookup_params`` instead of relying on them.
+_DEFAULTS = {name: f.default for name, f in SurfaceTuningConfig.model_fields.items()}
+MIN_VOLUME = _DEFAULTS["min_volume"]
+MIN_PRICE = _DEFAULTS["min_price"]
+MAX_ABS_M = _DEFAULTS["max_abs_moneyness"]
+MIN_POINTS = _DEFAULTS["min_points"]
+MIN_SPAN = _DEFAULTS["min_span"]
+IV_BOUNDS = (_DEFAULTS["iv_lower_bound"], _DEFAULTS["iv_upper_bound"])
+CLAMP_MARGIN = _DEFAULTS["clamp_margin"]
+MAX_STALE_DAYS = _DEFAULTS["max_stale_days"]
+
+
+def fit_params(tuning: "SurfaceTuningConfig | None" = None) -> dict:
+    """The keyword arguments of ``IVSurface.from_bars`` / ``usable_rows`` / ``fit_smile`` that decide WHICH bars are fitted, from
+    ``tuning`` (default: the loaded ``backtest.surface_tuning``). They are part of the on-disk cache key."""
+    t = tuning if tuning is not None else loaded_surface_tuning()
+    return {"min_volume": int(t.min_volume), "min_price": float(t.min_price), "max_abs_m": float(t.max_abs_moneyness),
+            "min_points": int(t.min_points), "min_span": float(t.min_span),
+            "iv_bounds": [float(t.iv_lower_bound), float(t.iv_upper_bound)]}
+
+
+def lookup_params(tuning: "SurfaceTuningConfig | None" = None) -> dict:
+    """The keyword arguments of ``IVSurface`` that change how a fitted surface is QUERIED (not what is fitted)."""
+    t = tuning if tuning is not None else loaded_surface_tuning()
+    return {"clamp_margin": float(t.clamp_margin), "max_stale_days": int(t.max_stale_days)}
 
 
 @dataclass(frozen=True)
@@ -62,9 +85,9 @@ class SmileFit:
     rmse: float
     r: float                    # the rate the bar IVs were solved with
 
-    def iv_at(self, m: float) -> float:
-        """Smile IV at log-moneyness ``m``, clamped to just outside the fitted range."""
-        mm = min(max(m, self.m_lo - CLAMP_MARGIN), self.m_hi + CLAMP_MARGIN)
+    def iv_at(self, m: float, clamp_margin: float = CLAMP_MARGIN) -> float:
+        """Smile IV at log-moneyness ``m``, clamped to just outside the fitted range (``clamp_margin``, W90f: a setting)."""
+        mm = min(max(m, self.m_lo - clamp_margin), self.m_hi + clamp_margin)
         return self.a + self.b * mm + self.c * mm * mm
 
     @property
@@ -89,12 +112,12 @@ def fit_smile(m: np.ndarray, iv: np.ndarray, w: np.ndarray, *, min_points: int =
 
 
 def usable_rows(bars: pd.DataFrame, *, min_volume: int = MIN_VOLUME, min_price: float = MIN_PRICE,
-                max_abs_m: float = MAX_ABS_M) -> pd.DataFrame:
+                max_abs_m: float = MAX_ABS_M, iv_bounds: tuple[float, float] = IV_BOUNDS) -> pd.DataFrame:
     """Filter raw option_daily_bars rows down to what a smile should be fit on."""
     b = bars
     ok = (b["iv_outcome"] == "solved") & (b["volume"] >= min_volume) & (b["close"] >= min_price) \
         & (b["underlying_close"] > 0) & (b["dte"] >= 1) \
-        & b["iv"].between(IV_BOUNDS[0], IV_BOUNDS[1])
+        & b["iv"].between(iv_bounds[0], iv_bounds[1])
     b = b[ok].copy()
     b["m"] = np.log(b["strike"].astype(float) / b["underlying_close"].astype(float))
     otm = ((b["right"] == "P") & (b["m"] <= 0.0)) | ((b["right"] == "C") & (b["m"] >= 0.0))
@@ -105,7 +128,10 @@ def usable_rows(bars: pd.DataFrame, *, min_volume: int = MIN_VOLUME, min_price: 
 class IVSurface:
     """Per-(date, expiry) smiles with sticky-moneyness lookup."""
 
-    def __init__(self, fits: Iterable[SmileFit]) -> None:
+    def __init__(self, fits: Iterable[SmileFit], *, clamp_margin: float = CLAMP_MARGIN,
+                 max_stale_days: int = MAX_STALE_DAYS) -> None:
+        self._clamp_margin = float(clamp_margin)           # W90f: how a fitted surface is queried (backtest.surface_tuning)
+        self._max_stale_days = int(max_stale_days)
         self._fits: dict[tuple[date, date], SmileFit] = {}
         self._by_date: dict[date, list[date]] = {}
         for f in fits:
@@ -119,10 +145,11 @@ class IVSurface:
     @classmethod
     def from_bars(cls, bars: pd.DataFrame, **kw) -> IVSurface:
         rows = usable_rows(bars, **{k: v for k, v in kw.items()
-                                    if k in ("min_volume", "min_price", "max_abs_m")})
+                                    if k in ("min_volume", "min_price", "max_abs_m", "iv_bounds")})
+        lookup = {k: v for k, v in kw.items() if k in ("clamp_margin", "max_stale_days")}
         fits: list[SmileFit] = []
         if rows.empty:
-            return cls(fits)
+            return cls(fits, **lookup)
         rate_col = "risk_free_rate" if "risk_free_rate" in rows.columns else None
         for (d, e), g in rows.groupby(["date", "expiry"], sort=False):
             m = g["m"].to_numpy(dtype=float)
@@ -136,7 +163,7 @@ class IVSurface:
             r = float(g[rate_col].median()) if rate_col else DEFAULT_RISK_FREE_RATE
             fits.append(SmileFit(_as_date(d), _as_date(e), a, b, c, int(len(g)),
                                  float(m.min()), float(m.max()), rmse, r))
-        return cls(fits)
+        return cls(fits, **lookup)
 
     # ---- inspection ---------------------------------------------------
     def __len__(self) -> int:
@@ -151,8 +178,10 @@ class IVSurface:
     def smile(self, as_of: date, expiry: date) -> SmileFit | None:
         return self._fits.get((as_of, expiry))
 
-    def latest_on_or_before(self, d: date, max_stale_days: int = MAX_STALE_DAYS) -> date | None:
-        """The newest surface date <= ``d`` within ``max_stale_days`` calendar days."""
+    def latest_on_or_before(self, d: date, max_stale_days: int | None = None) -> date | None:
+        """The newest surface date <= ``d`` within ``max_stale_days`` calendar days (default: this surface's setting)."""
+        if max_stale_days is None:
+            max_stale_days = self._max_stale_days
         lo, hi = 0, len(self._dates)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -181,7 +210,7 @@ class IVSurface:
         m = math.log(strike / spot)
         own = self._fits.get((d, expiry))
         if own is not None:
-            return own.iv_at(m)
+            return own.iv_at(m, self._clamp_margin)
         exps = self._by_date.get(d, [])
         if not exps:
             return None
@@ -193,13 +222,13 @@ class IVSurface:
         if lo is not None and hi is not None:
             t_lo = max((lo.expiry - d).days, 1) / 365.0
             t_hi = max((hi.expiry - d).days, 1) / 365.0
-            w_lo = lo.iv_at(m) ** 2 * t_lo
-            w_hi = hi.iv_at(m) ** 2 * t_hi
+            w_lo = lo.iv_at(m, self._clamp_margin) ** 2 * t_lo
+            w_hi = hi.iv_at(m, self._clamp_margin) ** 2 * t_hi
             frac = (t_q - t_lo) / (t_hi - t_lo) if t_hi > t_lo else 0.0
             var = (w_lo + frac * (w_hi - w_lo)) / t_q
             return math.sqrt(max(var, 1e-8))
         edge = lo or hi
-        return None if edge is None else edge.iv_at(m)
+        return None if edge is None else edge.iv_at(m, self._clamp_margin)
 
     # ---- persistence --------------------------------------------------
     def to_frame(self) -> pd.DataFrame:
@@ -209,11 +238,11 @@ class IVSurface:
         } for f in self._fits.values()])
 
     @classmethod
-    def from_frame(cls, df: pd.DataFrame) -> IVSurface:
-        return cls(SmileFit(date.fromisoformat(r.as_of), date.fromisoformat(r.expiry),
-                            float(r.a), float(r.b), float(r.c), int(r.n), float(r.m_lo),
-                            float(r.m_hi), float(r.rmse), float(r.r))
-                   for r in df.itertuples(index=False))
+    def from_frame(cls, df: pd.DataFrame, **lookup) -> IVSurface:
+        return cls((SmileFit(date.fromisoformat(r.as_of), date.fromisoformat(r.expiry),
+                             float(r.a), float(r.b), float(r.c), int(r.n), float(r.m_lo),
+                             float(r.m_hi), float(r.rmse), float(r.r))
+                    for r in df.itertuples(index=False)), **lookup)
 
 
 def _as_date(x) -> date:
@@ -257,7 +286,14 @@ def build_or_load(db_path: str | Path, underlying: str, cache_dir: str | Path,
 
     The cache is stamped with the bars' row count and newest date, so it rebuilds
     exactly when the backfill has added rows. Cache lives under ``data/`` (git-ignored).
+
+    W90f: the fit rules (``backtest.surface_tuning``: volume / price / moneyness / points / span / IV bounds) default to the
+    loaded settings and are part of the stamp, so changing one rebuilds the surface instead of serving a stale one. The
+    lookup rules (clamp margin, staleness) change how a surface is queried, not what is fitted, so they are NOT in the stamp.
     """
+    fit_kw = {**fit_params(), **{k: v for k, v in kw.items() if k in fit_params()}}
+    lookup_kw = {**lookup_params(), **{k: v for k, v in kw.items() if k in ("clamp_margin", "max_stale_days")}}
+    kw = {**fit_kw, **lookup_kw}
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     stem = f"iv_surface_{underlying}"
@@ -266,11 +302,11 @@ def build_or_load(db_path: str | Path, underlying: str, cache_dir: str | Path,
         n, last = c.execute(
             "SELECT COUNT(*), MAX(date) FROM option_daily_bars WHERE underlying = ?",
             (underlying,)).fetchone()
-    stamp = {"rows": int(n), "max_date": str(last), "params": {k: kw[k] for k in sorted(kw)}}
+    stamp = json.loads(json.dumps({"rows": int(n), "max_date": str(last), "params": {k: fit_kw[k] for k in sorted(fit_kw)}}))
     if meta_p.exists() and data_p.exists():
         try:
             if json.loads(meta_p.read_text()) == stamp:
-                return IVSurface.from_frame(pd.read_parquet(data_p))
+                return IVSurface.from_frame(pd.read_parquet(data_p), **lookup_kw)
         except Exception:  # noqa: BLE001 - a corrupt cache is just rebuilt
             pass
     surf = IVSurface.from_bars(load_bars(db_path, underlying), **kw)

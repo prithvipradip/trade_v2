@@ -192,6 +192,11 @@ fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit 
 | `legacy_engine` | Constants of the dormant paths: fallback direction model, naked-margin fraction, bearish margin, thesis-invalidation confidence, vol-regime ratio. None is on the iron-condor path under `engine_model: realistic`. | `backtesting/engine.py` |
 | `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
 | `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
+| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink. | `backtesting/walkforward.py`, `run_backtest.py`, `run_optimizer.py` |
+| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e). | `backtesting/engine.py`, `pricing.py` |
+| `surface_tuning` | The acceptance rules of the research IV surface (volume, price, moneyness, points, span, IV bounds, clamp margin, stale days). The fit rules are in the surface cache key. | `backtesting/iv_surface.py`, `engine.py` (W90f) |
+| `friction_fit` | Minimum samples, sessions, training rows and affine points to fit a leg-spread model. Offline calibration only. | `backtesting/friction.py` (W90f) |
+| `spread_tuning` | Max cost as a share of capital (0.25) and the wing as a fraction of the expected move (0.5) in the non-condor builders; the iron-condor builder does not read them. | `backtesting/engine.py` (W90f) |
 
 **A new research number goes in a setting, not in code (W88e).** `tests/test_w88_literal_census.py` compares the non-trivial numeric literals of the result-affecting research modules
 (`scripts/literal_census.py` lists them: `backtesting/`, `optimization/`, the ML modules, `run_backtest.py`, `run_optimizer.py`) with `tests/data/literal_allowlist.json`. A function whose literals differ from its entry

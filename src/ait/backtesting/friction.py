@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ait.config.settings import loaded_friction_fit
+
 FORMS = ("const_usd", "pct", "affine_usd")  # ordered simplest -> most flexible
 MIN_HALF_SPREAD_USD = 0.005  # half of the $0.01 option tick: nothing quotes tighter
 # A more flexible form must beat a simpler one's CV error by this fraction to be chosen
@@ -58,13 +60,16 @@ class LegSpreadModel:
                    b=float(row.get("b") or 0.0))
 
 
-def _fit_one(form: str, mid: np.ndarray, hs: np.ndarray) -> LegSpreadModel:
-    """Fit one form. Median-based where the loss is MAE (robust to quote flickers)."""
+def _fit_one(form: str, mid: np.ndarray, hs: np.ndarray, min_affine_points: int | None = None) -> LegSpreadModel:
+    """Fit one form. Median-based where the loss is MAE (robust to quote flickers). ``min_affine_points`` (default
+    ``backtest.friction_fit.min_affine_points``, W90f: was 3) is the fewest points the affine form is fitted from."""
+    if min_affine_points is None:
+        min_affine_points = loaded_friction_fit().min_affine_points
     if form == "const_usd":
         return LegSpreadModel("const_usd", a=float(np.median(hs)))
     if form == "pct":
         return LegSpreadModel("pct", b=float(np.median(hs / np.maximum(mid, 1e-9))))
-    if len(mid) < 3 or float(np.ptp(mid)) < 1e-9:
+    if len(mid) < min_affine_points or float(np.ptp(mid)) < 1e-9:
         return LegSpreadModel("affine_usd", a=float(np.median(hs)), b=0.0)
     b, a = np.polyfit(mid, hs, 1)
     # Physical constraints: a spread cannot shrink as the option gets dearer, nor go negative.
@@ -78,24 +83,28 @@ def _model_mae(model: LegSpreadModel, mid: np.ndarray, hs: np.ndarray) -> float:
     return float(np.mean(np.abs(pred - hs)))
 
 
-def fit_leg_spread_models(mid, half_spread_usd, session) -> dict:
+def fit_leg_spread_models(mid, half_spread_usd, session, fit_config=None) -> dict:
     """Fit every form and pick one by leave-one-session-out CV.
+
+    W90f: the minimum data (samples, sessions for grouped CV, training rows per fold, points for the affine form) is
+    ``fit_config`` (a ``FrictionFitConfig``; default the loaded ``backtest.friction_fit``): 5 / 3 / 3 / 3 were literals.
 
     ``session`` groups samples (the trading day): hourly bars of one day are strongly
     correlated, so a random K-fold would leak a day into its own validation set.
     Returns ``{"best": LegSpreadModel, "cv_mae": {form: float}, "n": int, "n_sessions":
     int, "cv": "grouped"|"insample"}``.
     """
+    cfg = fit_config if fit_config is not None else loaded_friction_fit()
     mid = np.asarray(mid, dtype=float)
     hs = np.asarray(half_spread_usd, dtype=float)
     sess = np.asarray(session)
     ok = np.isfinite(mid) & np.isfinite(hs) & (hs > 0) & (mid >= 0)
     mid, hs, sess = mid[ok], hs[ok], sess[ok]
-    if len(mid) < 5:
-        raise ValueError(f"need >= 5 usable samples to fit a friction model, got {len(mid)}")
+    if len(mid) < cfg.min_samples:
+        raise ValueError(f"need >= {cfg.min_samples} usable samples to fit a friction model, got {len(mid)}")
 
     groups = sorted(set(sess.tolist()))
-    grouped = len(groups) >= 3
+    grouped = len(groups) >= cfg.min_sessions_for_cv
     cv: dict[str, float] = {}
     for form in FORMS:
         if grouped:
@@ -103,20 +112,20 @@ def fit_leg_spread_models(mid, half_spread_usd, session) -> dict:
             for g in groups:
                 te = sess == g
                 tr = ~te
-                if tr.sum() < 3:
+                if tr.sum() < cfg.min_train_rows:
                     continue
-                m = _fit_one(form, mid[tr], hs[tr])
+                m = _fit_one(form, mid[tr], hs[tr], cfg.min_affine_points)
                 errs.append(_model_mae(m, mid[te], hs[te]))
                 weights.append(int(te.sum()))
             cv[form] = float(np.average(errs, weights=weights))
         else:
-            cv[form] = _model_mae(_fit_one(form, mid, hs), mid, hs)
+            cv[form] = _model_mae(_fit_one(form, mid, hs, cfg.min_affine_points), mid, hs)
 
     best_form = FORMS[0]
     for form in FORMS[1:]:
         if cv[form] < cv[best_form] * (1.0 - PARSIMONY_MARGIN):
             best_form = form
-    return {"best": _fit_one(best_form, mid, hs), "cv_mae": cv, "n": int(len(mid)),
+    return {"best": _fit_one(best_form, mid, hs, cfg.min_affine_points), "cv_mae": cv, "n": int(len(mid)),
             "n_sessions": len(groups), "cv": "grouped" if grouped else "insample"}
 
 

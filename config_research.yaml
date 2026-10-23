@@ -206,6 +206,31 @@ backtest:
     min_history_bars: 20               # no decision before this many bars of history
     fallback_iv: 0.25                  # volatility assumed for a position with no entry_iv, and by realized_vol with too few prices
 
+  # --- W90f: the research IV surface's acceptance rules (used when pricing_source is "surface"); part of the surface cache key ---
+  surface_tuning:
+    min_volume: 10                     # a bar needs this daily volume to enter a smile fit
+    min_price: 0.05                    # ... and this close (below it the IV is tick noise)
+    max_abs_moneyness: 0.10            # only strikes within |ln(K/S)| of this are fitted
+    min_points: 5                      # a (date, expiry) smile needs this many bars
+    min_span: 0.01                     # ... covering at least this much log-moneyness
+    iv_lower_bound: 0.03               # solved IVs outside [lower, upper] are discarded
+    iv_upper_bound: 2.5
+    clamp_margin: 0.01                 # a smile is evaluated at most this far outside its fitted range
+    max_stale_days: 5                  # a query may use a surface dated at most this many calendar days earlier
+
+  # --- W90f: minimum data for fitting a leg-spread (friction) model (offline calibration, not a backtest) ---
+  friction_fit:
+    min_samples: 5                     # fewer usable samples and no model is fitted
+    min_sessions_for_cv: 3             # leave-one-session-out CV needs this many trading days (else in-sample)
+    min_train_rows: 3                  # a CV fold with fewer training rows is skipped
+    min_affine_points: 3               # the affine form needs this many points (else a constant)
+
+  # --- W90f: sizing of the single-structure builders (credit spreads, iron butterfly, jade lizard, debit structures); the
+  # iron-condor builder does not read these ---
+  spread_tuning:
+    max_cost_fraction_of_capital: 0.25 # max loss / cost per contract may not exceed this share of capital
+    wing_expected_move_fraction: 0.5   # wing = wing_k x expected move x this (iron butterfly, credit spreads, jade lizard)
+
   # --- walk-forward / optimizer constants ---
   walkforward_tuning:
     warm_start_min_win_rate: 0.75      # warm-start a window's study from the PRIOR window's best params only above this OOS win rate

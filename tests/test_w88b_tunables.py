@@ -19,6 +19,9 @@ from ait.config.settings import (
     DEFAULT_RISK_FREE_RATE,
     BacktestConfig,
     EngineTuningConfig,
+    FrictionFitConfig,
+    SpreadTuningConfig,
+    SurfaceTuningConfig,
     LearnerConfig,
     LegacyEngineConfig,
     ObjectivesConfig,
@@ -374,7 +377,9 @@ class TestRiskFreeRateSingleSource:
 
 class TestResearchYamlIsComplete:
     BLOCKS = {"learner": LearnerConfig, "legacy_engine": LegacyEngineConfig, "objectives": ObjectivesConfig,
-              "walkforward_tuning": WalkForwardTuningConfig, "engine_tuning": EngineTuningConfig}   # W90c: + engine_tuning
+              "walkforward_tuning": WalkForwardTuningConfig, "engine_tuning": EngineTuningConfig,   # W90c: + engine_tuning
+              "surface_tuning": SurfaceTuningConfig, "friction_fit": FrictionFitConfig,         # W90f: + surface / friction / spread
+              "spread_tuning": SpreadTuningConfig}
     raw = yaml.safe_load((ROOT / "config_research.yaml").read_text())
 
     @pytest.mark.parametrize("block", sorted(BLOCKS))

@@ -121,6 +121,8 @@ from ait.config.settings import (
     LegacyEngineConfig,
     MetaLabelConfig,
     MetaLabelNeutralsConfig,
+    SpreadTuningConfig,
+    SurfaceTuningConfig,
     resolve_account_capital,
     resolve_position_size_pct,
 )
@@ -598,6 +600,10 @@ class Backtester:
                           or MetaLabelNeutralsConfig())
         self._meta_min_probability = float(getattr(getattr(_settings, "meta_label", None), "min_probability",
                                                    MetaLabelConfig().min_probability))
+        # W90f: the IV surface's acceptance rules and the non-condor builders' sizing numbers (backtest.surface_tuning / spread_tuning)
+        _bt_s = getattr(_settings, "backtest", None)
+        self._surf = getattr(_bt_s, "surface_tuning", None) or SurfaceTuningConfig()
+        self._spr = getattr(_bt_s, "spread_tuning", None) or SpreadTuningConfig()
         # W88d: the feature column names the engine reads (price_vs_sma_20, rsi_14, ...) follow ml.features
         self._fspec = spec_from_config(getattr(getattr(_settings, "ml", None), "features", None))
         self._pct_from_60d_high_threshold = pct_from_60d_high_threshold
@@ -2168,6 +2174,8 @@ class Backtester:
     _eng: EngineTuningConfig = EngineTuningConfig()         # W90c: ... and the engine-tuning defaults
     _neutrals: MetaLabelNeutralsConfig = MetaLabelNeutralsConfig()
     _meta_min_probability: float = MetaLabelConfig().min_probability
+    _surf: SurfaceTuningConfig = SurfaceTuningConfig()
+    _spr: SpreadTuningConfig = SpreadTuningConfig()
     _fspec: FeatureSpec = spec_from_config(None)            # W88d: feature windows / column names (schema defaults)
     _settlement_stats: dict | None = None
 
@@ -2456,7 +2464,7 @@ class Backtester:
 
             contracts = int(capital * self._position_size_pct / cost_per_contract)
             if contracts < 1:
-                if cost_per_contract <= capital * 0.25:
+                if cost_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
                     contracts = 1
                 else:
                     return None
@@ -2860,7 +2868,8 @@ class Backtester:
             short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
 
             expected_move = S * iv * (dte / 365.0) ** 0.5
-            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            wing = max(self._wing_k * expected_move * self._spr.wing_expected_move_fraction,      # W90f: was 0.5
+                       self._wing_floor_dollars)
 
             long_put_strike = short_put_strike - wing
 
@@ -2890,7 +2899,7 @@ class Backtester:
             size_pct = self._position_size_pct
             contracts = int(capital * size_pct / max_loss_per_contract)
             if contracts < 1:
-                if max_loss_per_contract <= capital * 0.25:
+                if max_loss_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
                     contracts = 1
                 else:
                     return None
@@ -2919,7 +2928,8 @@ class Backtester:
             # SHADOW R2: bearish twin of put_credit_spread.
             short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
             expected_move = S * iv * (dte / 365.0) ** 0.5
-            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            wing = max(self._wing_k * expected_move * self._spr.wing_expected_move_fraction,      # W90f: was 0.5
+                       self._wing_floor_dollars)
             long_call_strike = short_call_strike + wing
             short_call_price = black_scholes_price(S, short_call_strike, t, r,
                 self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
@@ -2939,7 +2949,7 @@ class Backtester:
                 return None
             contracts = int(capital * self._position_size_pct / max_loss_per_contract)
             if contracts < 1:
-                if max_loss_per_contract <= capital * 0.25:
+                if max_loss_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
                     contracts = 1
                 else:
                     return None
@@ -2964,7 +2974,8 @@ class Backtester:
             short_put_strike = find_strike_by_delta(S, t, iv, -self._delta_short, OptionType.PUT, r)
             short_call_strike = find_strike_by_delta(S, t, iv, self._delta_short, OptionType.CALL, r)
             expected_move = S * iv * (dte / 365.0) ** 0.5
-            wing = max(self._wing_k * expected_move * 0.5, self._wing_floor_dollars)
+            wing = max(self._wing_k * expected_move * self._spr.wing_expected_move_fraction,      # W90f: was 0.5
+                       self._wing_floor_dollars)
             long_call_strike = short_call_strike + wing
             short_put_price = black_scholes_price(S, short_put_strike, t, r,
                 self._get_leg_iv(iv, short_put_strike, S, OptionType.PUT), OptionType.PUT)
@@ -3063,7 +3074,7 @@ class Backtester:
         contracts = int(capital * size_pct / cost_per_contract)
         if contracts < 1:
             # Allow 1 contract only if affordable within 25% of capital
-            if cost_per_contract <= capital * 0.25:
+            if cost_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
                 contracts = 1
             else:
                 return None
@@ -3105,7 +3116,11 @@ class Backtester:
             from ait.backtesting.iv_surface import build_or_load
             from ait.data.historical import DB_PATH
             db = Path(self._db_path) if self._db_path is not None else DB_PATH
-            surf = build_or_load(db, sym, db.parent / "research_cache")
+            from ait.backtesting.iv_surface import fit_params, lookup_params
+            # W90f: the surface's acceptance rules are backtest.surface_tuning of THIS engine's settings (an overlay or a study
+            # reaches them); they are part of the cache key, so a changed rule rebuilds the surface
+            surf = build_or_load(db, sym, db.parent / "research_cache",
+                                 **fit_params(self._surf), **lookup_params(self._surf))
         except Exception as exc:  # noqa: BLE001 - research must degrade loudly, not crash
             log.warning("surface_pricing_unavailable", symbol=sym, error=str(exc),
                         fallback="bs_legacy")
