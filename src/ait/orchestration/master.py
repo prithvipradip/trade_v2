@@ -384,6 +384,66 @@ def _port_hint(configured: int) -> str:
     return ""
 
 
+def _configured_ib_port(default: int = 4002) -> int:
+    """W94: the ONE read of IBKR_PORT in this module (a class guard pins that)."""
+    return int(os.environ.get("IBKR_PORT") or default)
+
+
+_IB_ENDPOINT_LAST: tuple[int, int] | None = None
+
+
+def _note_ib_endpoint(configured: int, using: int) -> None:
+    """W94: record which IB endpoint the supervisor actually uses vs what .env names.
+
+    Writes data/ib_endpoint.json when the (configured, using) pair changes, logs
+    `ib_port_fallback` and sends ONE Telegram note per process (throttled 24h) when they differ.
+    The status page and the daily digest read the file, so a wrong .env stays visible. Never
+    raises, never touches .env.
+    """
+    global _IB_ENDPOINT_LAST
+    # Same rule as the log sink (R16 #56): a test run on the live host must not plant a record in the
+    # REAL data/ dir (the status page would show a false mismatch). Tests point DATA_DIR at a tmp dir.
+    if os.environ.get("PYTEST_CURRENT_TEST") and DATA_DIR == ROOT / "data":
+        return
+    try:
+        pair = (configured, using)
+        if pair == _IB_ENDPOINT_LAST:
+            return
+        # configured == using with nothing listening means "unknown", not "in sync": do not
+        # clear an earlier mismatch record on the strength of an outage.
+        if using == configured and not _gateway_listening(configured):
+            return
+        _IB_ENDPOINT_LAST = pair
+        from ait.data.ib_endpoint import (
+            ENDPOINT_FILE_NAME, endpoint_mismatch_text, read_endpoint_state, write_endpoint_state)
+        from ait.data.ib_ports import endpoint_label
+        path = DATA_DIR / ENDPOINT_FILE_NAME
+        write_endpoint_state(path, configured, using)
+        if using != configured:
+            note = endpoint_mismatch_text(read_endpoint_state(path))
+            _log("warn", "ib_port_fallback", configured=configured, using=using,
+                 configured_label=endpoint_label(configured), using_label=endpoint_label(using))
+            if _alert_gate("ib_port_fallback", 24 * 3600):
+                _alert(f"IB port fallback: {note}")
+    except Exception as e:  # noqa: BLE001 - a note must never break the health loop
+        _log("warning", "ib_endpoint_note_failed", error=str(e))
+
+
+def _ib_port() -> int:
+    """W94: the IB endpoint to check and start the bot against.
+
+    The configured IBKR_PORT when something listens there, else its same-account-type twin
+    (paper 7497 <-> 4002, live 7496 <-> 4001) when THAT listens, else the configured port
+    (so "down" is reported against what .env says). 2026-10-23: .env said 7497 (TWS) while IB
+    Gateway listened on 4002, and the bot was deferred behind a hint for ~40 minutes.
+    """
+    from ait.data.ib_ports import effective_port
+    configured = _configured_ib_port()
+    using = effective_port(configured, _gateway_listening)
+    _note_ib_endpoint(configured, using)
+    return using
+
+
 def _acquire_singleton_lock(lock_path: Path | None = None) -> bool:
     """Atomically claim the single-orchestrator lock. False = already held."""
     global _singleton_lock_handle, _singleton_lock_status
@@ -848,7 +908,7 @@ class BotManager:
         the bot is down.
         """
         try:
-            gw_port = int(os.environ.get("IBKR_PORT", "4002"))
+            gw_port = _ib_port()
             if _gateway_listening(gw_port):
                 self._note_gateway_up()
                 return
@@ -908,7 +968,7 @@ class BotManager:
 
         # Ensure IB Gateway is running before starting bot
         from ait.orchestration.gateway import ensure_gateway
-        gw_port = int(os.environ.get("IBKR_PORT", "4002"))
+        gw_port = _ib_port()
         if not ensure_gateway(port=gw_port, log_dir=LOGS_DIR):
             _log("error", "bot_start_aborted", reason="gateway_not_available")
             # Alert at most once per 30 min so a long Gateway outage pings
@@ -1181,7 +1241,7 @@ class BotManager:
         # indefinitely and alert once. Spending budget here is what repeatedly
         # tripped max_restarts and left the bot dead for whole sessions
         # (incl. FOMC eve 2026-06-16 and FOMC morning 2026-06-17).
-        gw_port = int(os.environ.get("IBKR_PORT", "4002"))
+        gw_port = _ib_port()
         if not _gateway_listening(gw_port):
             _log("info", "bot_restart_deferred_gateway_down", port=gw_port,
                  other_ib_port_open=(_port_hint(gw_port) or "none"))
@@ -1705,7 +1765,7 @@ def collect_short_dte_friction():
 
         cfg = _data_collection_cfg()
         env = IBKREnvConfig()
-        port = int(os.environ.get("IBKR_PORT") or env.ibkr_port)
+        port = _configured_ib_port(env.ibkr_port)
         base_id = int(os.environ.get("IBKR_CLIENT_ID") or env.ibkr_client_id)
         try:
             min_sessions = int(load_settings().backtest.friction_min_sessions_per_band)
@@ -1957,6 +2017,15 @@ def daily_digest():
             age = (datetime.now() - datetime.fromtimestamp(
                 hb.stat().st_mtime)).total_seconds() / 60
             parts.append(f"heartbeat {age:.0f}m")
+        # W94: a standing reminder while .env names a different IB endpoint than the one in use.
+        try:
+            from ait.data.ib_endpoint import (
+                ENDPOINT_FILE_NAME, endpoint_mismatch_text, read_endpoint_state)
+            _ep = endpoint_mismatch_text(read_endpoint_state(DATA_DIR / ENDPOINT_FILE_NAME))
+            if _ep:
+                parts.append("IB endpoint: " + _ep)
+        except Exception:  # noqa: BLE001 - the digest must go out regardless
+            pass
         # R14 #11: report the MIRROR's CONTENT, not a local snapshot's mtime.
         # The mirror (off-box, the real recovery copy) is what silently went a
         # full run stale on 07-14 while every mtime check read green — and

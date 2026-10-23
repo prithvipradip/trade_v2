@@ -18771,3 +18771,26 @@ Built in a worktree on branch `w93` (plan approved before building); same gates 
 **Pre-merge rule (lesson from W92):** check for a running bot / supervisor before the fast-forward; if one is running, STOP and ask the operator when to merge. This wave adds no new `config.yaml` keys. No new settings, no restart.
 
 ---
+
+## 2026-10-23 - W94 AS PLANNED + AS BUILT: the bot and the supervisor fall back to the other IB endpoint of the SAME account type; a wrong .env stays visible (label note: W93 is another session's wave)
+
+**INCIDENT.** 2026-10-23 06:09 ET: `.env` said `IBKR_PORT=7497` (TWS paper) while the operator ran IB Gateway paper on 4002. The supervisor was up but never started the bot (`bot_restart_deferred_gateway_down`
+every 2 minutes, ~40 minutes; its W18 hint named 4002). Same failure W18 recorded earlier (9h47m). The history collector, short-DTE job and the W89 retrain already used the twin endpoint (`ait.data.ib_ports`);
+the bot and the supervisor's own checks did not. The operator edited nothing: Claude, at the operator's request while away, set `.env` `IBKR_PORT=4002` and restarted the supervisor (graceful SIGTERM, then
+`python run_orchestrator.py` under nohup); the bot then connected on 4002 as client 1.
+
+**OPERATOR DECISIONS.** Add a fallback so it cannot recur. TWS and Gateway are not run together. On the `.env` residual risk: make it visible and give a one-command fix; do NOT auto-rewrite `.env` (credentials file, live/paper switch).
+
+**AS BUILT** (commit after `a766703`). `ait.data.ib_ports.effective_port` (configured port if up, else its twin if up, else configured; never crosses account type). `IBKRClient.connect()` resolves it on every connect, so the reconnect
+path follows a mid-day TWS<->Gateway switch; WARNING `ibkr_port_fallback` when it differs; the import is LAZY (a top-level import was a circular import whenever `ibkr_client` loaded first, e.g. `python -m ait.main`: caught by the live check,
+now pinned by a fresh-interpreter import test). Supervisor: `_configured_ib_port()` is the ONE reader of `IBKR_PORT` (AST class guard) and `_ib_port()` replaces the three health-check reads, so "gateway down" means neither endpoint is up;
+`ib_port_fallback` log + one Telegram note per process; `data/ib_endpoint.json` (new `ait.data.ib_endpoint`, kept out of the pure `ib_ports` module that a W82 test pins) feeds a status-page row ("IB endpoint", :8503), the
+`status.py` CLI and a line in both daily digests; not written to the real data dir under pytest. `scripts/sync_ibkr_port.py`: dry run by default, `--apply` rewrites ONLY the IBKR_PORT value (comment, CRLF and every other line
+byte-identical, atomic, refuses a cross-account-type target, prints no other line). RUNBOOK alert row. NOT built, on purpose: automatic `.env` rewriting.
+**VERIFIED.** Live read-only: `IBKREnvConfig` with `ibkr_port=7497` (closed) -> `ibkr_port_fallback configured=7497 using=4002`, connected as client 95 on the paper account. `sync_ibkr_port.py` dry run on the real `.env`: in sync.
+smoke_deploy SMOKE PASS (13). Fast lane **6682 passed / 46 skipped / 153 deselected, 0 failed** (first run: 1 failure, `test_w82 ... test_module_is_pure_stdlib`, fixed by moving the state-file helpers out of `ib_ports`).
+**FALLS SHORT / CAVEATS.** The running supervisor and bot still run the OLD code until a full supervisor restart (operator's call); a mismatch note only appears after it. `master.py` still defaults a missing `IBKR_PORT` to 4002 while
+`IBKREnvConfig` defaults to 7497 (harmless with the resolver, not changed). Also confirmed today: the first real IB-only retrain (07:30 ET, client 94 on 4002) trained SPY/QQQ/IWM, saved 504 rows each, no Yahoo, exit 0 (W89 end to end).
+**NEXT.** Restart the supervisor on the new code outside RTH; then `grep ib_port_fallback logs/orchestrator.log` should stay empty while `.env` and the app agree. W91 (append-only retrain save and one set of history tables) is still to be planned.
+
+---

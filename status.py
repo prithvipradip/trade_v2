@@ -82,6 +82,13 @@ def _last_heartbeat() -> str:
     return "none"
 
 
+def _ib_endpoint() -> dict:
+    """W94: the bot's IB endpoint vs .env (data/ib_endpoint.json, written by the supervisor)."""
+    from ait.data.ib_endpoint import ENDPOINT_FILE_NAME, endpoint_mismatch_text, read_endpoint_state
+    rec = read_endpoint_state(ROOT / "data" / ENDPOINT_FILE_NAME)
+    return {"record": rec, "mismatch": endpoint_mismatch_text(rec)}
+
+
 def _last_connect() -> str:
     for ln in reversed(_tail_lines(LOGS / "ait.log", 3000)):
         if "ibkr_connected" in ln:
@@ -145,6 +152,7 @@ def get_status() -> dict:
         "procs": nproc,
         "last_heartbeat": _last_heartbeat(),
         "last_connect": _last_connect(),
+        "ib_endpoint": _ib_endpoint(),
         "crashes": _crash_count(),
         "keeper_relaunches": _keeper_relaunches(),
         "readonly": _readonly_recent(),
@@ -218,6 +226,8 @@ def main() -> None:
     print(f"  running          : {'YES' if s['running'] else 'NO'}  ({s['procs']} procs)")
     print(f"  last heartbeat   : {s['last_heartbeat']}")
     print(f"  last IBKR connect: {s['last_connect']}")
+    if s["ib_endpoint"]["mismatch"]:
+        print(f"  IB endpoint      : {s['ib_endpoint']['mismatch']}")
     print(f"  native crashes   : {s['crashes']}")
     print(f"  keeper relaunches: {s['keeper_relaunches']}")
     print(f"  read-only recent : {'YES — orders may be rejected!' if s['readonly'] else 'no'}")

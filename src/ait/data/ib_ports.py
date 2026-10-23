@@ -32,6 +32,19 @@ def pick_listening_port(configured: int, is_listening: Callable[[int], bool]) ->
     return None
 
 
+def effective_port(configured: int, is_listening: Callable[[int], bool] | None = None) -> int:
+    """W94: the endpoint of the configured account type that is actually up.
+
+    The configured port when something listens on it (it always wins), else its twin when that
+    listens, else the configured port unchanged ("nothing is up" must still be reported against
+    what the operator configured). Never crosses account type (see TWIN_PORTS). One definition for
+    the bot's connect, the supervisor's health checks, and `scripts/sync_ibkr_port.py`; the
+    2026-10-23 incident was `.env` saying 7497 (TWS) while IB Gateway listened on 4002.
+    """
+    picked = pick_listening_port(configured, is_listening or tcp_listening)
+    return int(configured) if picked is None else picked
+
+
 def endpoint_label(port: int) -> str:
     """Human label for logs: 'IB Gateway (paper)' / 'TWS (live)' / 'port 1234'."""
     p = int(port)
