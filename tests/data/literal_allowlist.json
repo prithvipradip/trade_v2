@@ -10,6 +10,7 @@
  "entries": {
   "run_backtest.py::<module>": {
    "values": [
+    3,
     8,
     15,
     25
@@ -17,17 +18,26 @@
    "category": "structural",
    "note": "probe DTEs that sample one rung of the take-profit ladder"
   },
+  "run_backtest.py::run_backtest": {
+   "values": [
+    3
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE E: fewer than 3 windows is reported as too few to judge (same number as the walk-forward's own minimum)"
+  },
   "src/ait/backtesting/dte_report.py::<module>": {
    "values": [
+    7,
     14,
     45
    ],
-   "category": "structural",
-   "note": "report DTE band edges"
+   "category": "registered_followup",
+   "note": "CANDIDATE A: DEFAULT_BAND_EDGES (2, 7, 14, 45) repeats parity.dte_band_upper_edges; read the setting"
   },
   "src/ait/backtesting/dte_report.py::summarise_study": {
    "values": [
-    0.1
+    0.1,
+    3.0
    ],
    "category": "structural",
    "note": "report threshold for a flat DTE dimension"
@@ -52,17 +62,125 @@
     0.015,
     0.02,
     0.05,
-    0.1
+    0.1,
+    5
    ],
-   "category": "structural",
-   "note": "partial-engine class defaults mirroring BacktestConfig (settlement, regime) so a Backtester.__new__ test engine keeps the legacy behaviour"
+   "category": "registered_followup",
+   "note": "CANDIDATE A: the partial-engine class default _ex_div_k = 5 repeats backtest.ex_div_entry_k_days (same value); should reference the schema default"
+  },
+  "src/ait/backtesting/engine.py::Backtester.__init__": {
+   "values": [
+    0.5,
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: stop_loss_pct default 0.50 repeats backtest.stop_loss_pct (a stale second copy, the W90a class); resolve from the setting. The 10 is a date slice"
+  },
+  "src/ait/backtesting/engine.py::Backtester._build_credit_position": {
+   "values": [
+    0.25,
+    0.25,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE D: 25% of capital cap on the non-condor structures and the 0.5 half-expected-move wing factor; the rest is leg-count arithmetic (/4, /3, n_legs) and the sqrt exponent 0.5"
+  },
+  "src/ait/backtesting/engine.py::Backtester._build_debit_position": {
+   "values": [
+    0.25
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE D: 25% of capital cap on a debit structure's cost"
+  },
+  "src/ait/backtesting/engine.py::Backtester._check_exit": {
+   "values": [
+    0.25
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv"
+  },
+  "src/ait/backtesting/engine.py::Backtester._check_intraday_exit": {
+   "values": [
+    0.25,
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv; the 10 is a date slice"
+  },
+  "src/ait/backtesting/engine.py::Backtester._check_intraday_exit_realistic": {
+   "values": [
+    0.25,
+    5,
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv; 5 is the 5-minute bar length and 10 a date slice"
   },
   "src/ait/backtesting/engine.py::Backtester._close_pending_settlement": {
    "values": [
-    9
+    9,
+    30
    ],
    "category": "structural",
    "note": "09:30 ET market open"
+  },
+  "src/ait/backtesting/engine.py::Backtester._entry_ts": {
+   "values": [
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/backtesting/engine.py::Backtester._exit_instant": {
+   "values": [
+    10,
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/backtesting/engine.py::Backtester._finalize_spread_position": {
+   "values": [
+    0.25
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE D: 25% of capital cap on a spread's cost"
+  },
+  "src/ait/backtesting/engine.py::Backtester._force_close": {
+   "values": [
+    0.25
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE B: 0.25 fallback IV when a position carries no entry_iv"
+  },
+  "src/ait/backtesting/engine.py::Backtester._position_dte": {
+   "values": [
+    10,
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
   },
   "src/ait/backtesting/engine.py::Backtester._quick_rsi": {
    "values": [
@@ -72,12 +190,29 @@
    "category": "dormant_path",
    "note": "legacy fallback RSI (period 14, neutral 50)"
   },
+  "src/ait/backtesting/engine.py::Backtester._remaining_dte": {
+   "values": [
+    10,
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
   "src/ait/backtesting/engine.py::Backtester._remark_t": {
    "values": [
-    0.0001
+    0.0001,
+    10
    ],
    "category": "epsilon",
    "note": "floor on time-to-expiry in years"
+  },
+  "src/ait/backtesting/engine.py::Backtester._reprice_ic_legs": {
+   "values": [
+    10,
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
   },
   "src/ait/backtesting/engine.py::Backtester._select_strategy": {
    "values": [
@@ -88,11 +223,33 @@
   },
   "src/ait/backtesting/engine.py::Backtester._simple_direction": {
    "values": [
+    5,
+    5,
     20,
     20
    ],
    "category": "dormant_path",
    "note": "legacy fallback direction: 5/20-day return lookbacks (weights are backtest.legacy_engine)"
+  },
+  "src/ait/backtesting/engine.py::Backtester._surface_leg_ivs": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "tuple index of the fourth leg"
+  },
+  "src/ait/backtesting/engine.py::Backtester.run": {
+   "values": [
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE C: the meta-label decision record writes threshold 0.5 whatever the labeler's min_probability is; the other 0.5s are a binary flag cut (vol_regime_expanding > 0.5) and the sqrt exponent, the 10 a date slice"
   },
   "src/ait/backtesting/engine.py::_session_close": {
    "values": [
@@ -100,6 +257,13 @@
    ],
    "category": "structural",
    "note": "lru_cache size"
+  },
+  "src/ait/backtesting/ex_div.py::ex_div_blocks": {
+   "values": [
+    5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: k_days default 5 repeats backtest.ex_div_entry_k_days; resolve from the setting"
   },
   "src/ait/backtesting/friction.py::<module>": {
    "values": [
@@ -117,9 +281,11 @@
   "src/ait/backtesting/friction.py::_fit_one": {
    "values": [
     1e-09,
-    1e-09
+    1e-09,
+    3
    ],
-   "category": "epsilon"
+   "category": "registered_followup",
+   "note": "CANDIDATE F: an affine fit needs at least 3 points; 1e-9 are floors against dividing by zero"
   },
   "src/ait/backtesting/friction.py::band_dte_range": {
    "values": [
@@ -128,9 +294,19 @@
    "category": "structural",
    "note": "open-ended band sentinel"
   },
+  "src/ait/backtesting/friction.py::fit_leg_spread_models": {
+   "values": [
+    3,
+    3,
+    5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE F: minimum samples to fit a friction model (5), minimum sessions for grouped CV (3) and minimum training rows per fold (3)"
+  },
   "src/ait/backtesting/gate_parity.py::one_sided_gate_warnings": {
    "values": [
-    0.99
+    0.99,
+    5.0
    ],
    "category": "structural",
    "note": "sentinel for 'no vol cap'"
@@ -151,6 +327,13 @@
    "category": "structural",
    "note": "named, documented constants of the research IV proxy (W87a)"
   },
+  "src/ait/backtesting/iv_rank_compare.py::spearman": {
+   "values": [
+    10
+   ],
+   "category": "structural",
+   "note": "a rank correlation needs at least 10 pairs to be reported"
+  },
   "src/ait/backtesting/iv_surface.py::<module>": {
    "values": [
     0.01,
@@ -158,10 +341,13 @@
     0.03,
     0.05,
     0.1,
-    2.5
+    2.5,
+    5,
+    5,
+    10
    ],
-   "category": "structural",
-   "note": "named surface-fit limits (min price, moneyness span, IV bounds)"
+   "category": "registered_followup",
+   "note": "CANDIDATE F: the quote-surface acceptance rules (MIN_VOLUME 10, MIN_POINTS 5, MAX_STALE_DAYS 5 and the price / moneyness / span / IV bounds) decide which quotes build the surface"
   },
   "src/ait/backtesting/iv_surface.py::IVSurface.iv": {
    "values": [
@@ -176,6 +362,27 @@
    "category": "structural",
    "note": "starting confidence of a stateless learner (named constant, display comparison)"
   },
+  "src/ait/backtesting/pool.py::_day": {
+   "values": [
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/backtesting/pricing.py::black_scholes_price": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "Black-Scholes d1: r + 0.5 sigma^2"
+  },
+  "src/ait/backtesting/pricing.py::bs_delta": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "Black-Scholes d1: r + 0.5 sigma^2"
+  },
   "src/ait/backtesting/pricing.py::find_strike_by_delta": {
    "values": [
     0.8,
@@ -187,19 +394,44 @@
   },
   "src/ait/backtesting/pricing.py::realized_vol": {
    "values": [
+    0.25,
     20
    ],
+   "category": "registered_followup",
+   "note": "CANDIDATE B: 0.25 default volatility when there are too few prices (the same fallback IV the engine uses)"
+  },
+  "src/ait/backtesting/range_bank.py::RangeModelBank.get": {
+   "values": [
+    3
+   ],
    "category": "structural",
-   "note": "default realized-vol window (callers pass the window)"
+   "note": "a trained-model result is a 3-tuple"
   },
   "src/ait/backtesting/replay.py::<module>": {
    "values": [
+    5,
     15,
     16,
     55
    ],
    "category": "structural",
    "note": "session-close and settle-bar times (ET)"
+  },
+  "src/ait/backtesting/replay.py::ReplayTrade.condor_roles": {
+   "values": [
+    4,
+    4
+   ],
+   "category": "structural",
+   "note": "a condor has four legs"
+  },
+  "src/ait/backtesting/replay.py::ResearchData.bar_containing": {
+   "values": [
+    3,
+    4
+   ],
+   "category": "structural",
+   "note": "column indices of the OHLC row"
   },
   "src/ait/backtesting/replay.py::ResearchData.load_intraday_range": {
    "values": [
@@ -216,10 +448,26 @@
    ],
    "category": "epsilon"
   },
+  "src/ait/backtesting/replay.py::engine_exit_scan": {
+   "values": [
+    4
+   ],
+   "category": "structural",
+   "note": "n_legs of the condor handed to the engine's exit check"
+  },
+  "src/ait/backtesting/replay.py::entry_replay": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "bar mid = 0.5 * (open + close)"
+  },
   "src/ait/backtesting/replay.py::exit_replay": {
    "values": [
     0.0001,
-    0.0001
+    0.0001,
+    0.5
    ],
    "category": "epsilon",
    "note": "floor on time-to-expiry"
@@ -227,14 +475,25 @@
   "src/ait/backtesting/replay.py::implied_vol_from_price": {
    "values": [
     0.01,
+    0.5,
+    0.5,
+    3.0,
     80
    ],
    "category": "structural",
    "note": "IV solver bounds and iterations"
   },
+  "src/ait/backtesting/replay.py::load_bot_exec_context": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "column index of the fetched execution row"
+  },
   "src/ait/backtesting/replay.py::settlement_replay": {
    "values": [
-    9
+    9,
+    30
    ],
    "category": "structural",
    "note": "09:30 ET open"
@@ -259,6 +518,13 @@
     19
    ],
    "category": "display"
+  },
+  "src/ait/backtesting/run_record.py::<module>": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "repo root is three parents up from this file"
   },
   "src/ait/backtesting/run_record.py::flatten": {
    "values": [
@@ -291,8 +557,56 @@
    "category": "structural",
    "note": "named, documented study floors (W87a)"
   },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_direction_model_oos": {
+   "values": [
+    0.5,
+    0.5,
+    0.5,
+    10,
+    30
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE E: n_label < 10 minimum labelled rows of the OOS direction evaluation; CANDIDATE A: horizon_days default 30 repeats backtest.max_hold_days. The 0.5s are default model weights and the AUROC-style chance level"
+  },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._evaluate_range_model_oos": {
+   "values": [
+    0.5,
+    0.5,
+    0.5,
+    5,
+    30
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE E: the +5 margin of rows beyond the horizon; CANDIDATE A: horizon_days default 30 repeats backtest.max_hold_days. The 0.5s are default model weights"
+  },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._prob_score_metrics": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "0.5 probability cut for balanced accuracy and the 0.5 chance level"
+  },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester._train_window_range_model": {
+   "values": [
+    30
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: max_hold_days default 30 repeats backtest.max_hold_days; resolve from the config"
+  },
+  "src/ait/backtesting/walkforward.py::WalkForwardBacktester.run": {
+   "values": [
+    0.5,
+    0.5,
+    3,
+    5,
+    5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE E: fewer than 3 windows aborts (also run_backtest), and the window score shrinks win rate by sqrt(trades / 5); the 0.5s are the sqrt exponent and a default"
+  },
   "src/ait/backtesting/walkforward.py::WalkForwardConfig.__post_init__": {
    "values": [
+    10,
     45
    ],
    "category": "structural",
@@ -308,6 +622,8 @@
   },
   "src/ait/backtesting/walkforward.py::WalkForwardResult.summary": {
    "values": [
+    5,
+    5,
     6,
     8,
     13
@@ -315,11 +631,72 @@
    "category": "display",
    "note": "string slicing offsets of the funnel summary"
   },
+  "src/ait/backtesting/walkforward.py::_save_window_timeseries": {
+   "values": [
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/ml/drift.py::DriftDetector.__init__": {
+   "values": [
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE G: check_interval default 10 predictions between drift checks"
+  },
   "src/ait/ml/drift.py::DriftDetector.check_drift": {
    "values": [
+    5,
     20
    ],
-   "category": "structural"
+   "category": "registered_followup",
+   "note": "CANDIDATE G: calibration is only measured with at least 5 high-confidence predictions"
+  },
+  "src/ait/ml/ensemble.py::<module>": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "repo root is three parents up from this file"
+  },
+  "src/ait/ml/ensemble.py::DirectionPredictor._prune_old_versions": {
+   "values": [
+    5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE G: keep = 5 saved model versions (live artifact retention)"
+  },
+  "src/ait/ml/ensemble.py::DirectionPredictor._save_models": {
+   "values": [
+    5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE G: prunes to keep=5 saved versions (live artifact retention)"
+  },
+  "src/ait/ml/ensemble.py::DirectionPredictor.predict": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "equal prior weight 0.5 of two models when none are fitted"
+  },
+  "src/ait/ml/ensemble.py::DirectionPredictor.predict_from_features": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "equal prior weight 0.5 of two models when none are fitted"
+  },
+  "src/ait/ml/ensemble.py::DirectionPredictor.train": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "AUROC chance level 0.5 and the equal prior weight 0.5"
   },
   "src/ait/ml/excursion.py::<module>": {
    "values": [
@@ -329,6 +706,7 @@
     0.1,
     0.15,
     0.2,
+    0.25,
     0.3,
     0.8,
     0.975,
@@ -339,6 +717,7 @@
   },
   "src/ait/ml/excursion.py::barrier_no_touch": {
    "values": [
+    4.0,
     8,
     50
    ],
@@ -357,12 +736,14 @@
   },
   "src/ait/ml/excursion.py::garman_klass": {
    "values": [
-    1e-10
+    1e-10,
+    0.5
    ],
    "category": "epsilon"
   },
   "src/ait/ml/excursion.py::har_lags": {
    "values": [
+    5,
     22
    ],
    "category": "structural"
@@ -382,6 +763,12 @@
    "category": "structural",
    "note": "hash prefix length"
   },
+  "src/ait/ml/features.py::<module>": {
+   "values": [
+    0.5
+   ],
+   "category": "fixed_feature_group"
+  },
   "src/ait/ml/features.py::FeatureEngine._add_cross_asset": {
    "values": [
     0.15,
@@ -390,6 +777,23 @@
     0.2,
     0.3,
     0.3,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    3,
+    3,
+    5,
+    5,
+    5,
+    5,
+    10,
+    10,
     14,
     20,
     20,
@@ -416,12 +820,23 @@
    ],
    "category": "fixed_feature_group"
   },
+  "src/ait/ml/features.py::FeatureEngine._add_iv_features": {
+   "values": [
+    3,
+    3,
+    3
+   ],
+   "category": "fixed_feature_group"
+  },
   "src/ait/ml/features.py::FeatureEngine._add_macro": {
    "values": [
     0.1,
     0.1,
     0.2,
     0.2,
+    4.0,
+    4.0,
+    5,
     20,
     20,
     20,
@@ -435,6 +850,19 @@
     0.2,
     0.3,
     0.3,
+    3,
+    3,
+    3,
+    3,
+    5,
+    5,
+    5,
+    5,
+    5,
+    10,
+    10,
+    10,
+    10,
     20,
     20,
     20,
@@ -444,12 +872,32 @@
    ],
    "category": "fixed_feature_group"
   },
+  "src/ait/ml/features.py::FeatureEngine._add_seasonality": {
+   "values": [
+    0.5,
+    0.5,
+    4.0
+   ],
+   "category": "fixed_feature_group"
+  },
   "src/ait/ml/features.py::FeatureEngine._hurst_wavelet": {
    "values": [
     1e-12,
     0.1,
+    0.5,
+    0.5,
+    0.5,
     0.9,
+    3,
+    4,
     50
+   ],
+   "category": "fixed_feature_group"
+  },
+  "src/ait/ml/features.py::FeatureEngine._merge_intraday_features": {
+   "values": [
+    10,
+    10
    ],
    "category": "fixed_feature_group"
   },
@@ -459,7 +907,16 @@
     1e-12,
     1e-08,
     1e-08,
+    0.5,
+    0.5,
     1.5,
+    3.0,
+    3,
+    3.0,
+    3,
+    4,
+    5.0,
+    5.0,
     8,
     16,
     32,
@@ -478,7 +935,10 @@
   "src/ait/ml/features.py::FeatureEngine._psd_features": {
    "values": [
     1e-12,
-    0.8
+    0.5,
+    0.8,
+    4,
+    4.0
    ],
    "category": "fixed_feature_group"
   },
@@ -496,6 +956,20 @@
     1e-12,
     1e-08,
     1e-08,
+    0.5,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    5,
+    7,
     14,
     20,
     40,
@@ -505,25 +979,123 @@
    ],
    "category": "fixed_feature_group"
   },
+  "src/ait/ml/hyperparams.py::lgbm_multiclass_kwargs": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "num_class = 3: bearish / neutral / bullish"
+  },
+  "src/ait/ml/hyperparams.py::xgb_multiclass_kwargs": {
+   "values": [
+    3
+   ],
+   "category": "structural",
+   "note": "num_class = 3: bearish / neutral / bullish"
+  },
+  "src/ait/ml/meta_label.py::<module>": {
+   "values": [
+    3,
+    30
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE G: MIN_TRADES_FOR_TRAINING = 30 (the meta-labeler is disabled; the 3 is the repo-root parent count)"
+  },
+  "src/ait/ml/meta_label.py::MetaLabeler.__init__": {
+   "values": [
+    0.5
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: min_probability default 0.50 repeats meta_label.min_probability; resolve from the setting"
+  },
+  "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest": {
+   "values": [
+    10
+   ],
+   "category": "structural",
+   "note": "[:10] ISO-date slice of a stored date string"
+  },
+  "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest._regime_flags": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "binary flag cut vol_regime_expanding > 0.5"
+  },
+  "src/ait/ml/meta_label.py::MetaLabeler.train": {
+   "values": [
+    5,
+    5,
+    5,
+    5,
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE G: a class needs at least 5 rows, CV folds = min(5, rows // 10); the [:5] top-features list is display"
+  },
   "src/ait/ml/range_predictor.py::<module>": {
    "values": [
     1e-09,
-    0.05
+    0.05,
+    3,
+    30
    ],
    "category": "structural",
    "note": "facts about artifacts already on disk: a range.pkl with no spec key was trained at +/-5% over 30 days (compared as such), and the 1e-9 float tolerance of the load-time spec guard (W90d)"
   },
+  "src/ait/ml/range_predictor.py::RangePredictor.__init__": {
+   "values": [
+    0.5,
+    0.5,
+    30
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: horizon_days default 30 is a bare-constructor copy (live passes the derived horizon); the 0.5s are equal prior model weights"
+  },
+  "src/ait/ml/range_predictor.py::RangePredictor.predict": {
+   "values": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "balanced-accuracy chance level 0.50 and the equal prior weight"
+  },
+  "src/ait/ml/range_predictor.py::RangePredictor.predict_from_features": {
+   "values": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "balanced-accuracy chance level 0.50 and the equal prior weight"
+  },
+  "src/ait/ml/range_predictor.py::RangePredictor.train": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "balanced-accuracy chance level 0.50"
+  },
   "src/ait/ml/range_spec.py::<module>": {
    "values": [
+    3,
+    5,
+    7,
     9,
     14,
-    21
+    21,
+    30
    ],
    "category": "structural",
    "note": "research horizon buckets (a research-cost approximation); the live band is the setting ml.range_threshold_pct (W90d)"
   },
   "src/ait/ml/regime.py::RegimeDetector._classify": {
    "values": [
+    0.5,
+    0.5,
+    0.5,
+    0.5,
     0.6,
     0.7,
     0.7,
@@ -536,25 +1108,36 @@
   },
   "src/ait/ml/regime.py::RegimeDetector._estimate_hurst": {
    "values": [
+    0.5,
+    0.5,
+    0.5,
+    3,
     20
    ],
    "category": "structural"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_iv_rank": {
    "values": [
+    0.5,
+    0.5,
     20
    ],
    "category": "structural"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_trend": {
    "values": [
+    5,
+    5,
+    10,
+    10,
     20,
     20,
     20,
     50,
     50
    ],
-   "category": "structural"
+   "category": "registered_followup",
+   "note": "CANDIDATE G: the trend score's SMA periods (10, 20, 50), slope lookback (5) and scale factors (100, 10, 5) decide the regime class"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_volatility": {
    "values": [
@@ -564,6 +1147,9 @@
   },
   "src/ait/ml/regime.py::RegimeDetector.analyze": {
    "values": [
+    0.5,
+    0.5,
+    5,
     14,
     20,
     50,
@@ -573,9 +1159,19 @@
   },
   "src/ait/ml/regime_gate.py::<module>": {
    "values": [
-    0.2
+    0.2,
+    3.0
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "RANGE_PROB_SCALE_CAP 3.0 bounds the range-probability adjustment so a huge spread cannot drive it without limit; LEGACY_VETO_BASE_FLOOR 0.20 is a historical floor"
+  },
+  "src/ait/ml/trainer.py::ModelTrainer._apply_optimized_hyperparams._objective": {
+   "values": [
+    3,
+    3
+   ],
+   "category": "structural",
+   "note": "num_class = 3: bearish / neutral / bullish"
   },
   "src/ait/ml/trainer.py::ModelTrainer._fetch_market_context": {
    "values": [
@@ -594,17 +1190,73 @@
   "src/ait/ml/vol_magnitude_predictor.py::<module>": {
    "values": [
     1e-09,
-    0.07
+    0.07,
+    3,
+    30
    ],
    "category": "structural",
    "note": "facts about artifacts already on disk: a vol_magnitude.pkl with no spec key was trained at +/-7% over 30 days, and the 1e-9 spec-guard tolerance (W90d)"
   },
+  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor.__init__": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "equal prior model weights 0.5"
+  },
+  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor.predict": {
+   "values": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "balanced-accuracy chance level 0.50 and the equal prior weight"
+  },
+  "src/ait/ml/vol_magnitude_predictor.py::VolMagnitudePredictor.train": {
+   "values": [
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "balanced-accuracy chance level 0.50 and the equal prior weight"
+  },
   "src/ait/optimization/optimizer.py::<module>": {
    "values": [
+    30,
     90
    ],
    "category": "structural",
    "note": "minimum fetch period days"
+  },
+  "src/ait/optimization/optimizer.py::StrategyOptimizer.__init__": {
+   "values": [
+    10
+   ],
+   "category": "registered_followup",
+   "note": "CANDIDATE A: min_trades default 10 repeats backtest.optimize_min_trades (a stale second copy); resolve from the setting"
+  },
+  "src/ait/optimization/optimizer.py::StrategyOptimizer._suggest_one": {
+   "values": [
+    3,
+    3
+   ],
+   "category": "structural",
+   "note": "index of the optional kwargs element of a search-space spec"
+  },
+  "src/ait/optimization/optimizer.py::_top_rejections": {
+   "values": [
+    3
+   ],
+   "category": "display",
+   "note": "how many rejection reasons the log line lists"
+  },
+  "src/ait/optimization/results.py::OptimizationResult.summary": {
+   "values": [
+    5
+   ],
+   "category": "display"
   }
  }
 }

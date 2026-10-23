@@ -10,7 +10,7 @@ allowlist disagree, so a new literal (or a converted one) has to be seen and cla
     python scripts/literal_census.py              # print the census summary and any difference from the allowlist
     python scripts/literal_census.py --update     # rewrite the allowlist (keeps existing categories, classifies new entries)
 
-What is NOT counted: trivial values (0, 1, 2, 10, 100, 252, 365, ... see ``TRIVIAL``), booleans, ``round()`` digits, arguments of
+What is NOT counted: trivial values (0, 1, 2, 100, 252, 365, ... see ``TRIVIAL``; W90e narrowed it to unit-like values), booleans, ``round()`` digits, arguments of
 logging / ``print`` calls, string-repeat counts (``"=" * 70``), and anything in a docstring or comment.
 
 Categories (closed set): ``display`` (formatting), ``epsilon`` (numerical tolerance), ``fixed_feature_group`` (a feature group W88d
@@ -30,7 +30,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "tests" / "data" / "literal_allowlist.json"
 
-TRIVIAL = {0, 1, -1, 2, 100, 0.0, 1.0, -1.0, 2.0, 252, 365, 12, 24, 60, 1000, 10, 3, 4, 5, 7, 30, 0.5, 0.25}
+# W90e: the ignore list is now ONLY unit-like values (0 / 1 / -1 / 2, percent 100, trading days per year 252, calendar days 365,
+# months 12, hours 24, minutes 60, 1000). It used to also hide 3, 4, 5, 7, 10, 30, 0.5 and 0.25, which hid real windows and
+# thresholds (a 5-day lookback, a 3-window minimum, a 25% capital cap, a 0.5 baseline), so those are counted now.
+TRIVIAL = {0, 1, -1, 2, 100, 0.0, 1.0, -1.0, 2.0, 252, 365, 12, 24, 60, 1000}
 CATEGORIES = ("display", "epsilon", "fixed_feature_group", "dormant_path", "structural", "registered_followup")
 
 # The result-affecting research modules. A new module under these directories must be added here or to EXCLUDED.

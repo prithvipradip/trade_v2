@@ -110,9 +110,9 @@ Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared
 **What is it?** `scripts/literal_census.py` walks the research code (`backtesting/`, `optimization/`, `ml/`, `run_backtest.py`,
 `run_optimizer.py`: 37 modules) and lists, per function, the numeric literals written inside it. `tests/data/literal_allowlist.json`
 is the accepted list, and `tests/test_w88_literal_census.py` fails when a number appears, changes or disappears without that list being
-updated, so a research number cannot be added or removed unseen. It ignores unit-like values (0, 1, 2, 10, 100, 252, 365, ... the
-`TRIVIAL` set in the script), booleans, `round()` digits, log / `print` arguments, and docstrings and comments. That ignore list is
-too generous (it also hides 3, 4, 5, 7, 30, 0.5 ...); W90e is revisiting it.
+updated, so a research number cannot be added or removed unseen. It ignores only unit-like values (0, 1, 2, 100, 252, 365, 12, 24, 60, 1000: the
+`TRIVIAL` set in the script), booleans, `round()` digits, log / `print` arguments, and docstrings and comments. Until W90e it also ignored 3, 4, 5, 7,
+10, 30, 0.5 and 0.25, which hid real windows and thresholds; those are counted now.
 
 **Categories.** Every function in the list has one:
 
