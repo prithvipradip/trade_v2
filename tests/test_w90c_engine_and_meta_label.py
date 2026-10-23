@@ -323,9 +323,9 @@ class TestMetaLabeler:
         assert (d._min_feature_coverage, d._max_artifact_age_days) == (11, 100)
 
     def test_the_arm_guard_uses_the_coverage_setting(self):
-        from ait.ml.meta_label import MIN_TRADES_FOR_TRAINING, MetaLabeler
+        from ait.ml.meta_label import MetaLabeler
         rng = np.random.default_rng(1)
-        n = MIN_TRADES_FOR_TRAINING + 20
+        n = MetaLabelConfig().min_trades_for_training + 20       # W92: the floor is a setting now
         df = pd.DataFrame({"primary_confidence": rng.uniform(0.5, 0.9, n), "vix": rng.uniform(10, 30, n),
                            "iv_rank": rng.uniform(0, 1, n), "rsi_14": rng.uniform(20, 80, n),
                            "profitable": rng.integers(0, 2, n)})

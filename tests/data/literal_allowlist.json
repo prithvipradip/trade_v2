@@ -536,41 +536,12 @@
    "category": "structural",
    "note": "[:10] ISO-date slice of a stored date string"
   },
-  "src/ait/ml/drift.py::DriftDetector.__init__": {
-   "values": [
-    10
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: check_interval default 10 predictions between drift checks"
-  },
-  "src/ait/ml/drift.py::DriftDetector.check_drift": {
-   "values": [
-    5,
-    20
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: calibration is only measured with at least 5 high-confidence predictions"
-  },
   "src/ait/ml/ensemble.py::<module>": {
    "values": [
     3
    ],
    "category": "structural",
    "note": "repo root is three parents up from this file"
-  },
-  "src/ait/ml/ensemble.py::DirectionPredictor._prune_old_versions": {
-   "values": [
-    5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: keep = 5 saved model versions (live artifact retention)"
-  },
-  "src/ait/ml/ensemble.py::DirectionPredictor._save_models": {
-   "values": [
-    5
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: prunes to keep=5 saved versions (live artifact retention)"
   },
   "src/ait/ml/ensemble.py::DirectionPredictor.predict": {
    "values": [
@@ -893,11 +864,10 @@
   },
   "src/ait/ml/meta_label.py::<module>": {
    "values": [
-    3,
-    30
+    3
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: MIN_TRADES_FOR_TRAINING = 30 (the meta-labeler is disabled; the 3 is the repo-root parent count)"
+   "category": "structural",
+   "note": "the repo root is three parents up from this file (the minimum-trades floor is meta_label.min_trades_for_training, W92)"
   },
   "src/ait/ml/meta_label.py::MetaLabeler.build_training_data_from_backtest": {
    "values": [
@@ -915,14 +885,10 @@
   },
   "src/ait/ml/meta_label.py::MetaLabeler.train": {
    "values": [
-    5,
-    5,
-    5,
-    5,
-    10
+    5
    ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: a class needs at least 5 rows, CV folds = min(5, rows // 10); the [:5] top-features list is display"
+   "category": "display",
+   "note": "[:5] = how many top feature importances the training stats list (the class floor and the fold rule are meta_label settings, W92)"
   },
   "src/ait/ml/range_predictor.py::<module>": {
    "values": [
@@ -984,18 +950,10 @@
   "src/ait/ml/regime.py::RegimeDetector._classify": {
    "values": [
     0.5,
-    0.5,
-    0.5,
-    0.5,
-    0.6,
-    0.7,
-    0.7,
-    0.8,
-    0.9,
-    0.95,
-    0.95
+    0.5
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "0.5 = the neutral-prior default of iv_rank / hurst when a measurement is unavailable (the confidences and the trend numbers are regime.* settings, W92)"
   },
   "src/ait/ml/regime.py::RegimeDetector._estimate_hurst": {
    "values": [
@@ -1005,7 +963,8 @@
     3,
     20
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "estimator definition: R/S Hurst over lags 2..20 with at least 3 points, 0.5 (random walk) when it cannot be estimated"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_iv_rank": {
    "values": [
@@ -1013,28 +972,15 @@
     0.5,
     20
    ],
-   "category": "structural"
-  },
-  "src/ait/ml/regime.py::RegimeDetector._measure_trend": {
-   "values": [
-    5,
-    5,
-    10,
-    10,
-    20,
-    20,
-    20,
-    50,
-    50
-   ],
-   "category": "registered_followup",
-   "note": "CANDIDATE G: the trend score's SMA periods (10, 20, 50), slope lookback (5) and scale factors (100, 10, 5) decide the regime class"
+   "category": "structural",
+   "note": "estimator definition: 20-day realized-vol percentile (the 252-day window and 60-row minimum are unit-like values the census ignores); 0.5 when unavailable"
   },
   "src/ait/ml/regime.py::RegimeDetector._measure_volatility": {
    "values": [
     20
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "estimator definition: 20-day realized volatility, annualized"
   },
   "src/ait/ml/regime.py::RegimeDetector.analyze": {
    "values": [
@@ -1046,7 +992,8 @@
     50,
     50
    ],
-   "category": "structural"
+   "category": "structural",
+   "note": "diagnostic details whose key names embed their window (rsi_14, sma_20_slope, price_vs_sma_50) and the neutral priors 0.5 for a too-short history"
   },
   "src/ait/ml/regime_gate.py::<module>": {
    "values": [

@@ -232,6 +232,13 @@ A change to a LIVE value takes effect at the next bot restart, and a changed lab
 (`range_model_spec_mismatch`, CRITICAL) and the model retrained. An artifact written before the spec was recorded is compared as +/-5% / 30 days (range) or +/-7% / 30 days (vol-magnitude), whatever the settings say now. Research does not
 read the band keys (it adapts its range band per window: `backtest.walkforward_tuning`); the other keys it shares with live.
 
+## Drift detection, the regime classifier and saved model versions (W92; live)
+
+Their numbers are settings in `config.yaml` (`ml.drift_*`, `ml.model_versions_kept`, the `regime:` block, `meta_label.min_trades_for_training` / `min_class_trades` / `cv_*`), each with a comment and a table in
+`docs/RESEARCH_GUIDE.md` ("Drift detection (live; off by default)", "The regime classifier (live)", "Saved model versions and the meta-labeler"). **Drift detection is OFF by default**
+(`ml.drift_detection_enabled: false`): the live book trades iron condors only, and outcomes are recorded only for directional strategies, so the detector could never report. To use it, set the switch
+to `true` and restart the bot; the full check then runs at most once per `ml.drift_check_interval` newly recorded predictions. All values equal the old literals; they take effect at the next bot restart.
+
 ## Feature windows (W88d; shared by live and research)
 
 The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them

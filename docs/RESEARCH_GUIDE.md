@@ -205,6 +205,68 @@ scope and what stays fixed.
 
 **Could a research run overwrite the live model?** No. Window models are throw-away (`persist_artifacts=False`) or go to `models/research/`.
 
+### Drift detection (live; off by default)
+
+**What is it?** The live bot compares the direction model's calls with what happened. If the model is clearly getting worse it asks for an
+early retrain instead of waiting for the weekly one. Research does not use it. The settings are `ml.drift_*` in `config.yaml`.
+
+**Is it on?** No: `ml.drift_detection_enabled: false`. A prediction is recorded on every scan, but an outcome is recorded only when a
+directional trade closes (iron condors, short strangles and long straddles are skipped). An iron-condor-only book therefore never completes a
+sample and the detector could never speak, so it is off. Turn it on (`true`, then restart) only if directional strategies trade.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `drift_detection_enabled` | `false` | Master switch. Off = records nothing and always reports "no drift". |
+| `drift_window_size` | 50 | N: how many of the most recent resolved predictions (trade closed) it looks at. Larger = steadier but slower to notice. |
+| `drift_accuracy_threshold` | 0.40 | Drift if the share of those that were right falls below this. Guessing a 3-way direction is right about 33% of the time. |
+| `drift_high_confidence` | 0.80 | The "high-confidence group": predictions made with at least this confidence. They should be right about this often. |
+| `drift_calibration_threshold` | 0.25 | Drift if that group is right LESS often than it claims by more than this (25 points: claimed 80%, right under 55%). |
+| `drift_min_samples` | 20 | No report until this many predictions have an outcome. Must not exceed the window. |
+| `drift_min_high_confidence_samples` | 5 | The calibration test needs this many resolved high-confidence predictions; with fewer only accuracy counts. |
+| `drift_check_interval` | 10 | The full check runs at most once per this many newly recorded predictions (1 = every call). Until W92 this was documented but not implemented. |
+
+**What happens on drift?** The report says `should_retrain`, the trainer's `needs_training` returns true and the next opportunity retrains; the post-market
+job also logs `post_market_drift`. A retrain clears the window and the throttle.
+
+### The regime classifier (live)
+
+**What is it?** From SPY's last 60 or more days plus VIX it labels the market as one of seven regimes (high volatility, IV crush, mean-reverting,
+low volatility, trending up, trending down, range-bound) and gives a confidence. Research does not use it (the engine has its own regime thresholds,
+`backtest.regime_*`). The settings are the `regime:` block of `config.yaml`.
+
+**How is trend measured?** The trend strength (-1 to +1) is the average of three kinds of terms, each clamped to [-1, 1]: the slope of moving averages,
+the price's distance from moving averages, and the recent return.
+
+**Where does the live bot use it?**
+- **Entry:** a HIGH_VOLATILITY label with confidence strictly above `ml.regime_override_confidence` (0.80) forces the direction to NEUTRAL (moot for condors, which are neutral).
+- **Exit check:** a position entered in a trending regime that now reads as high volatility with confidence above `exit.thesis_regime_shift_confidence` (0.70) is flagged for exit.
+- **Record:** the label is stored on each trade as `entry_regime`.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `trend_sma_periods` | `[10, 20, 50]` | Moving-average lengths (days) whose slope is scored. |
+| `trend_slope_lookback`, `trend_slope_scale` | 5, 100 | A slope is the average's % change over this many days, times this (a 1% move scores 1.0). |
+| `trend_deviation_periods`, `trend_deviation_scale` | `[20, 50]`, 10 | Moving-average lengths the price's distance is scored against, times this (10% away scores 1.0). |
+| `trend_momentum_days`, `trend_momentum_scale` | 20, 5 | The return over this many days, times this (a 20% return scores 1.0). |
+| `high_vol_confidence_floor`, `high_vol_confidence_cap`, `high_vol_confidence_vol_scale` | 0.80, 0.90, 0.50 | HIGH_VOLATILITY reports `max(floor, min(cap, realized vol / scale))`. The only confidence a live rule compares against. |
+| `iv_crush_confidence`, `low_vol_confidence` | 0.70, 0.70 | Confidence of those labels (reported only). |
+| `mean_revert_confidence_floor` | 0.60 | MEAN_REVERTING reports `max(floor, 1 - Hurst exponent)` (reported only). |
+| `trend_confidence_cap` | 0.95 | TRENDING_UP / DOWN report `min(cap, abs(trend strength))` (reported only). |
+| `range_confidence_floor` | 0.50 | RANGE_BOUND reports `max(floor, 1 - 2 x abs(trend strength))` (reported only). |
+
+**Watch the pair.** `high_vol_confidence_floor` and `ml.regime_override_confidence` must agree. The entry rule is a strict "above", and a day triggered
+by VIX alone with realized vol at or under 40% scores exactly the floor, so at 0.80 / 0.80 the override fires only when realized vol is above 40%.
+This is recorded as a finding (PLAN.md W92), not changed.
+
+### Saved model versions and the meta-labeler
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ml.model_versions_kept` | 5 | Saved direction-model versions kept on disk (older ones deleted on each save); also how far back a rollback can go. |
+| `meta_label.min_trades_for_training` | 30 | The meta-labeler (disabled) is not trained on fewer closed trades than this. `min_closes_to_enable` is the separate question of when to trust it. |
+| `meta_label.min_class_trades` | 5 | ... and needs at least this many profitable and this many unprofitable trades. |
+| `meta_label.cv_max_splits`, `cv_min_rows_per_split` | 5, 10 | Its training cross-validation uses `min(max splits, max(2, rows / rows per split))` folds. |
+
 ---
 
 ## 7. The learner

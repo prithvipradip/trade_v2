@@ -396,10 +396,21 @@ ml:
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
   # W69: were literals in bot/orchestrator.py and ml/drift.py.
   regime_override_confidence: 0.80     # HIGH_VOLATILITY regime above this -> direction NEUTRAL
-  drift_window_size: 50                # resolved predictions the drift detector scores
-  drift_accuracy_threshold: 0.40       # rolling accuracy below this -> drift + retrain
-  drift_calibration_threshold: 0.25    # high-confidence calibration error above this -> drift
-  drift_high_confidence: 0.80          # calibration cohort cutoff / expected accuracy
+  # --- Drift detection: is the direction model's live record getting worse? (explained in docs/RESEARCH_GUIDE.md, "Drift detection") ---
+  # It compares the model's recent calls with what happened and, if it is clearly degrading, asks for an EARLY retrain instead of
+  # waiting for the weekly one. OFF by default: outcomes are only recorded for directional strategies, so an iron-condor-only book
+  # never feeds it. Turn it on only if directional strategies trade.
+  drift_detection_enabled: false       # master switch. false = records nothing, always reports "no drift"
+  drift_window_size: 50                # N: how many of the most recent resolved predictions (trade closed) it looks at. Larger = steadier, slower
+  drift_accuracy_threshold: 0.40       # drift if the share of those right drops below 40% (random guessing on 3 classes is ~33%)
+  drift_high_confidence: 0.80          # "high-confidence group" = predictions made with at least this confidence; they should be right ~this often
+  drift_calibration_threshold: 0.25    # drift if that group is right LESS often than it claims by more than 25 percentage points (80% claimed -> under 55%)
+  drift_min_samples: 20                # no report until this many predictions have an outcome (must not exceed drift_window_size)
+  drift_min_high_confidence_samples: 5 # the calibration test needs this many resolved high-confidence predictions, else only accuracy counts
+  drift_check_interval: 10             # the full check runs at most once per this many newly recorded predictions (1 = every call)
+  # Saved direction-model versions kept on disk (older ones deleted on each save); also how far back a rollback can go.
+  # (explained in docs/RESEARCH_GUIDE.md, "Saved model versions and the meta-labeler")
+  model_versions_kept: 5               # how many saved versions to keep (older ones deleted on each save; also the rollback depth)
   # W88c: tree hyperparameters (were literals in ml/ensemble.py, range_predictor.py, vol_magnitude_predictor.py and
   # meta_label.py). SHARED by live and research: the values below are what the code used before, so listing them
   # changes nothing; research may differ through config_research.yaml or a study (the parity manifest shows it).
@@ -448,6 +459,26 @@ regime:
   low_vol_realized: 0.12
   low_vol_trend_breakout: 0.30
   strong_trend: 0.35
+  # --- How the trend strength is measured and how sure each class sounds (explained in docs/RESEARCH_GUIDE.md, "The regime classifier").
+  # Live-only: research does not use the RegimeDetector. The trend strength (-1 .. +1) is the average of three kinds of terms, each
+  # clamped to [-1, 1]: moving-average slopes, distance of the price from moving averages, and recent return.
+  trend_sma_periods: [10, 20, 50]      # moving-average lengths (days) whose slope is scored
+  trend_slope_lookback: 5              # slope = the average's % change over this many days ...
+  trend_slope_scale: 100.0             # ... x this (100: a 1% move in 5 days scores 1.0)
+  trend_deviation_periods: [20, 50]    # moving-average lengths the price's distance is scored against
+  trend_deviation_scale: 10.0          # distance as a fraction of the average x this (10: 10% away scores 1.0)
+  trend_momentum_days: 20              # recent return over this many days ...
+  trend_momentum_scale: 5.0            # ... x this (5: a 20% return scores 1.0)
+  # The "confidence" each class reports. Only HIGH_VOLATILITY is compared with a live rule: the entry gate ml.regime_override_confidence
+  # (strict ">", so floor 0.80 vs gate 0.80 means only realized vol above 40% reaches the override). The rest are reported/logged only.
+  high_vol_confidence_floor: 0.80      # HIGH_VOLATILITY reports max(floor, min(cap, realized_vol / vol_scale)); must not exceed the cap
+  high_vol_confidence_cap: 0.90        # ... never more than this
+  high_vol_confidence_vol_scale: 0.50  # realized vol 0.40 -> 0.80, 0.45 -> 0.90
+  iv_crush_confidence: 0.70            # IV_CRUSH reports this (reported only)
+  mean_revert_confidence_floor: 0.60   # MEAN_REVERTING reports max(floor, 1 - Hurst exponent)
+  low_vol_confidence: 0.70             # LOW_VOLATILITY reports this (reported only)
+  trend_confidence_cap: 0.95           # TRENDING_UP / DOWN report min(cap, |trend strength|)
+  range_confidence_floor: 0.50         # RANGE_BOUND reports max(floor, 1 - 2 x |trend strength|)
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
@@ -455,6 +486,11 @@ meta_label:
   retrain_with_primary: true           # Retrain when primary model retrains
   min_feature_coverage: 15             # of the 20 inputs, this many must carry real data before a new model is armed (W90c)
   max_artifact_age_days: 45            # a saved model older than this is stale and refused at load (W90c)
+  # W92 (explained in docs/RESEARCH_GUIDE.md, "Saved model versions and the meta-labeler"): the meta-labeler is disabled, these only make its numbers visible
+  min_trades_for_training: 30          # it is not trained on fewer closed trades than this (min_closes_to_enable below is when its output is TRUSTED)
+  min_class_trades: 5                  # ... and needs at least this many profitable AND this many unprofitable trades
+  cv_max_splits: 5                     # training cross-validation uses at most this many folds ...
+  cv_min_rows_per_split: 10            # ... one per this many rows, never fewer than 2
   # W49 (policy-vs-impl-7): the ONE close-count policy number -- config.yaml
   # used to say 50 here, PLAN.md's tracking table said 100+, and neither was
   # ever enforced in code. Real live entries stay ungated by this model until

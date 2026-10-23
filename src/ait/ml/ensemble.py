@@ -545,12 +545,14 @@ class DirectionPredictor:
                 log.warning("versioned_save_failed", error=str(e))
 
             # Prune old versions (keep last 5)
-            self._prune_old_versions(keep=5)
+            self._prune_old_versions(keep=int(self._ml("model_versions_kept")))      # W92: was 5
 
         return True
 
-    def _prune_old_versions(self, keep: int = 5) -> None:
-        """Remove old model versions, keeping only the N most recent."""
+    def _prune_old_versions(self, keep: int | None = None) -> None:
+        """Remove old model versions, keeping only the N most recent (default ``ml.model_versions_kept``; W92: was 5)."""
+        if keep is None:
+            keep = int(self._ml("model_versions_kept"))
         versions = sorted(self.model_dir.glob("ensemble_v-*.pkl"))
         if len(versions) > keep:
             for old in versions[:-keep]:

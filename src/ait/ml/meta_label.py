@@ -110,7 +110,7 @@ def _loaded_regime_thresholds() -> tuple[float, float]:
         return float(d["regime_down_threshold"].default), float(d["regime_up_threshold"].default)
 
 # Minimum trades needed before the meta-labeler has enough signal
-MIN_TRADES_FOR_TRAINING = 30
+# W92: the minimum number of closed trades to train on is ``meta_label.min_trades_for_training`` (was the constant 30 here).
 
 # Features the meta-labeler uses (all available at trade entry time)
 # W88d: the DEFAULT-window list (kept for importers and as documentation). The 20 inputs are derived from
@@ -178,6 +178,10 @@ class MetaLabeler:
         _ml_cfg = meta_label_config if meta_label_config is not None else _loaded_meta_label_config()
         self._min_feature_coverage = int(_ml_cfg.min_feature_coverage)
         self._max_artifact_age_days = int(_ml_cfg.max_artifact_age_days)
+        self._min_trades_for_training = int(_ml_cfg.min_trades_for_training)         # W92
+        self._min_class_trades = int(_ml_cfg.min_class_trades)
+        self._cv_max_splits = int(_ml_cfg.cv_max_splits)
+        self._cv_min_rows_per_split = int(_ml_cfg.cv_min_rows_per_split)
         self._regime_down, self._regime_up = (regime_thresholds if regime_thresholds is not None
                                               else _loaded_regime_thresholds())
         # W88d: the 20 inputs (and the window-bearing names among them) follow ml.features
@@ -256,11 +260,11 @@ class MetaLabeler:
         Returns:
             Dict with training metrics.
         """
-        if len(trades_df) < MIN_TRADES_FOR_TRAINING:
+        if len(trades_df) < self._min_trades_for_training:
             log.warning(
                 "insufficient_trades_for_meta_label",
                 trades=len(trades_df),
-                required=MIN_TRADES_FOR_TRAINING,
+                required=self._min_trades_for_training,
             )
             return {}
 
@@ -306,7 +310,7 @@ class MetaLabeler:
         # Class balance check
         n_positive = int(y.sum())
         n_negative = len(y) - n_positive
-        if n_positive < 5 or n_negative < 5:
+        if n_positive < self._min_class_trades or n_negative < self._min_class_trades:
             log.warning(
                 "meta_label_class_imbalance",
                 profitable=n_positive,
@@ -321,7 +325,7 @@ class MetaLabeler:
         # CV below scales per fold; the production scaler fits on the full
         # data only AFTER CV (matching ensemble/range/vol_mag).
         # Time-series cross-validation
-        n_splits = min(5, max(2, len(y) // 10))
+        n_splits = min(self._cv_max_splits, max(2, len(y) // self._cv_min_rows_per_split))     # W92: was min(5, max(2, n // 10))
         tscv = TimeSeriesSplit(n_splits=n_splits)
 
         try:

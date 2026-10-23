@@ -45,7 +45,11 @@ class ModelTrainer:
             accuracy_threshold=config.drift_accuracy_threshold,
             calibration_threshold=config.drift_calibration_threshold,
             high_confidence=config.drift_high_confidence,
-        )  # W69: ml.drift_* config (were DriftDetector's literal defaults)
+            check_interval=config.drift_check_interval,
+            enabled=config.drift_detection_enabled,                  # W92: default OFF
+            min_samples=config.drift_min_samples,
+            min_high_confidence_samples=config.drift_min_high_confidence_samples,
+        )  # W69/W92: ml.drift_* config (were DriftDetector's literal defaults)
         self._range_predictor = range_predictor
         self._vol_mag_predictor = vol_mag_predictor
 

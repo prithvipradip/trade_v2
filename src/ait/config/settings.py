@@ -1693,20 +1693,48 @@ class MLConfig(_StrictModel):
                     "at entry. Was a literal 0.8 in orchestrator (the R5 "
                     "classifier floors high-vol confidence at 0.80 so any "
                     "VIX/vol trigger clears it — keep this at or below 0.80).")
+    # --- Drift detection (ml/drift.py). W92: switchable, default OFF; every number explained. Guide: RESEARCH_GUIDE "Drift detection". ---
+    drift_detection_enabled: bool = Field(default=False,
+        description="W92: master switch of the live drift detector. OFF (default): it records nothing and always reports 'no "
+                    "drift', so it can never ask for an early retrain. ON: it scores the direction model's live calls against "
+                    "what happened and asks for an early retrain when its accuracy or calibration degrades (the numbers below). "
+                    "Caveat: outcomes are only recorded for directional strategies (not iron_condor / short_strangle / "
+                    "long_straddle), so in an iron-condor-only book switching it on changes nothing until directional trades "
+                    "close.")
     drift_window_size: int = Field(default=50, ge=20, le=500,
-        description="W69: rolling window of resolved predictions the drift "
-                    "detector scores. Was DriftDetector's window_size=50.")
+        description="W69: N = how many of the most recent RESOLVED predictions (a prediction whose trade has closed) the detector "
+                    "looks at. Larger = steadier but slower to notice a change; smaller = quicker but noisier.")
     drift_accuracy_threshold: float = Field(default=0.40, ge=0.20, le=0.80,
-        description="W69: rolling accuracy below this flags drift and asks "
-                    "for a retrain. Was DriftDetector's accuracy_threshold.")
-    drift_calibration_threshold: float = Field(default=0.25, ge=0.05, le=0.60,
-        description="W69: high-confidence calibration error above this flags "
-                    "drift. Was DriftDetector's calibration_threshold.")
+        description="W69: if the share of those predictions that were right falls below this, the model is flagged as drifting "
+                    "and an early retrain is requested. 0.40 = right less than 40% of the time; a 3-way direction call guessing "
+                    "at random is right about 33%, so this is only just above chance.")
     drift_high_confidence: float = Field(default=0.80, ge=0.60, le=0.99,
-        description="W69: predictions at/above this confidence form the "
-                    "calibration cohort, and are EXPECTED to be right this "
-                    "often (the shortfall is the calibration error). Was a "
-                    "literal 0.80 used for both in ml/drift.py.")
+        description="W69: predictions made with at least this confidence form the 'high-confidence group', which should be right "
+                    "about this often (80% confident should mean about 80% right).")
+    drift_calibration_threshold: float = Field(default=0.25, ge=0.05, le=0.60,
+        description="W69: if the high-confidence group is right LESS often than drift_high_confidence by more than this (0.25 = 25 "
+                    "percentage points, i.e. it is right under 55% of the time at the defaults), the model is overconfident and "
+                    "is flagged as drifting.")
+    drift_min_samples: int = Field(default=20, ge=5, le=500,
+        description="W92: nothing is reported until at least this many predictions in the window have an outcome (it was a literal "
+                    "20 in check_drift). Must not exceed drift_window_size.")
+    drift_min_high_confidence_samples: int = Field(default=5, ge=1, le=500,
+        description="W92: the calibration test needs at least this many resolved high-confidence predictions (it was a literal 5); "
+                    "with fewer it is skipped and only accuracy counts.")
+    drift_check_interval: int = Field(default=10, ge=1, le=500,
+        description="W92: the full check runs at most once per this many newly recorded predictions; in between, the last report is "
+                    "returned. The detector always documented this behaviour but never implemented it (the value was stored and "
+                    "unused). 1 = check on every call.")
+    model_versions_kept: int = Field(default=5, ge=1, le=100,
+        description="W92: how many saved direction-model versions are kept on disk; older ones are deleted each time a model is "
+                    "saved (it was a literal keep=5). This is also how far back a rollback can go.")
+
+    @model_validator(mode="after")
+    def _drift_numbers_are_consistent(self) -> "MLConfig":
+        if self.drift_min_samples > self.drift_window_size:
+            raise ValueError(f"ml: drift_min_samples ({self.drift_min_samples}) cannot exceed drift_window_size "
+                             f"({self.drift_window_size}): the detector would never report")
+        return self
 
     @field_validator("ensemble_weights")
     @classmethod
@@ -1758,6 +1786,42 @@ class RegimeConfig(_StrictModel):
     strong_trend: float = Field(default=0.35, ge=0.05, le=1.0,
         description="|trend strength| above this (outside the branches above) "
                     "classifies TRENDING_UP/DOWN.")
+    # --- W92: how the trend strength (-1 to +1) is measured, and the confidence each class reports. Guide: RESEARCH_GUIDE "The regime
+    # classifier". Live-only: research does not use the RegimeDetector. ---
+    trend_sma_periods: list[int] = Field(default=[10, 20, 50], min_length=1, max_length=6,
+        description="W92: the trend score averages the slope of the simple moving average of each of these lengths (days).")
+    trend_slope_lookback: int = Field(default=5, ge=1, le=60,
+        description="W92: a moving average's slope is its percentage change over this many days ...")
+    trend_slope_scale: float = Field(default=100.0, gt=0.0, le=10000.0,
+        description="W92: ... multiplied by this and clamped to [-1, 1] (100 = a 1% move in 5 days scores 1.0).")
+    trend_deviation_periods: list[int] = Field(default=[20, 50], min_length=1, max_length=6,
+        description="W92: the trend score also averages how far the price sits above or below the moving average of each of these "
+                    "lengths ...")
+    trend_deviation_scale: float = Field(default=10.0, gt=0.0, le=10000.0,
+        description="W92: ... as a fraction of that average, multiplied by this and clamped to [-1, 1] (10 = 10% away scores 1.0).")
+    trend_momentum_days: int = Field(default=20, ge=1, le=252,
+        description="W92: ... and the price return over this many days ...")
+    trend_momentum_scale: float = Field(default=5.0, gt=0.0, le=10000.0,
+        description="W92: ... multiplied by this and clamped to [-1, 1] (5 = a 20% return scores 1.0).")
+    high_vol_confidence_floor: float = Field(default=0.80, ge=0.5, le=1.0,
+        description="W92: a HIGH_VOLATILITY classification reports a confidence of at least this. The live entry rule 'high-vol "
+                    "regime above ml.regime_override_confidence forces direction NEUTRAL' compares against it with a strict '>', "
+                    "so floor and ml.regime_override_confidence are a must-agree pair: at the shipped 0.80 / 0.80 only a day "
+                    "whose realized vol is above 40% reaches the override.")
+    high_vol_confidence_cap: float = Field(default=0.90, ge=0.5, le=1.0,
+        description="W92: ... and at most this.")
+    high_vol_confidence_vol_scale: float = Field(default=0.50, gt=0.0, le=5.0,
+        description="W92: between the floor and the cap the confidence is realized volatility divided by this (0.40 vol -> 0.80).")
+    iv_crush_confidence: float = Field(default=0.70, ge=0.0, le=1.0,
+        description="W92: the confidence an IV_CRUSH classification reports (reported only: no live rule compares against it).")
+    mean_revert_confidence_floor: float = Field(default=0.60, ge=0.0, le=1.0,
+        description="W92: a MEAN_REVERTING classification reports max(this, 1 - Hurst exponent) (reported only).")
+    low_vol_confidence: float = Field(default=0.70, ge=0.0, le=1.0,
+        description="W92: the confidence a LOW_VOLATILITY classification reports (reported only).")
+    trend_confidence_cap: float = Field(default=0.95, ge=0.5, le=1.0,
+        description="W92: a TRENDING_UP / TRENDING_DOWN classification reports min(this, |trend strength|) (reported only).")
+    range_confidence_floor: float = Field(default=0.50, ge=0.0, le=1.0,
+        description="W92: a RANGE_BOUND classification reports max(this, 1 - 2 x |trend strength|) (reported only).")
 
     @model_validator(mode="after")
     def _vol_bands_are_ordered(self) -> "RegimeConfig":
@@ -1769,6 +1833,10 @@ class RegimeConfig(_StrictModel):
             raise ValueError(
                 f"regime.low_vol_vix ({self.low_vol_vix}) must be below "
                 f"high_vol_vix ({self.high_vol_vix})")
+        if self.high_vol_confidence_floor > self.high_vol_confidence_cap:       # W92
+            raise ValueError(
+                f"regime.high_vol_confidence_floor ({self.high_vol_confidence_floor}) cannot exceed "
+                f"high_vol_confidence_cap ({self.high_vol_confidence_cap})")
         return self
 
 
@@ -1780,6 +1848,16 @@ class MetaLabelConfig(_StrictModel):
     enabled: bool = False
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
     retrain_with_primary: bool = True  # Retrain when primary model retrains
+    min_trades_for_training: int = Field(default=30, ge=10, le=1000,
+        description="W92: the meta-labeler is not trained on fewer closed trades than this (it was the module constant "
+                    "MIN_TRADES_FOR_TRAINING = 30). min_closes_to_enable below is the separate question of when its output is "
+                    "TRUSTED for live entries.")
+    min_class_trades: int = Field(default=5, ge=2, le=500,
+        description="W92: ... and it needs at least this many profitable AND this many unprofitable trades (a literal 5).")
+    cv_max_splits: int = Field(default=5, ge=2, le=20,
+        description="W92: its training cross-validation uses at most this many folds ...")
+    cv_min_rows_per_split: int = Field(default=10, ge=2, le=500,
+        description="W92: ... with one fold per this many rows, never fewer than 2 (it was min(5, max(2, rows // 10))).")
     min_feature_coverage: int = Field(default=15, ge=1, le=20,
         description="W90c: of the 20 meta-label inputs, at least this many must carry real (non-constant) data "
                     "before a freshly trained model is armed (R16 arm guard: the 07-18 artifact was trained on 9 "
@@ -1796,7 +1874,7 @@ class MetaLabelConfig(_StrictModel):
                     "50, PLAN.md's tracking table said 100+, and the code enforced "
                     "neither at arm time -- this is now the one number, adjustable "
                     "here without a code deploy. Floor of 30 matches "
-                    "meta_label.MIN_TRADES_FOR_TRAINING, the separate (unchanged) "
+                    "meta_label.min_trades_for_training, the separate (unchanged) "
                     "statistical minimum for fitting the model at all; this field is "
                     "the different question of when its output should be TRUSTED for "
                     "live risk.")

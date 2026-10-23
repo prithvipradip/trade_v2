@@ -133,24 +133,25 @@ class RegimeDetector:
 
         Uses multiple timeframe MA slopes and price position.
         """
+        c = self._cfg
         scores = []
 
-        # SMA slopes (normalized)
-        for period in [10, 20, 50]:
+        # SMA slopes (normalized). W92: the periods, look-back and scale are regime.trend_* (were 10/20/50, 5, 100)
+        for period in c.trend_sma_periods:
             sma = close.rolling(period).mean()
-            slope = sma.pct_change(5).iloc[-1]
+            slope = sma.pct_change(c.trend_slope_lookback).iloc[-1]
             # Clamp to [-1, 1]
-            scores.append(max(-1, min(1, slope * 100)))
+            scores.append(max(-1, min(1, slope * c.trend_slope_scale)))
 
-        # Price vs SMAs
-        for period in [20, 50]:
+        # Price vs SMAs (was 20/50, scale 10)
+        for period in c.trend_deviation_periods:
             sma_val = close.rolling(period).mean().iloc[-1]
             deviation = (close.iloc[-1] - sma_val) / sma_val
-            scores.append(max(-1, min(1, deviation * 10)))
+            scores.append(max(-1, min(1, deviation * c.trend_deviation_scale)))
 
-        # Recent momentum (20-day return)
-        ret_20 = close.pct_change(20).iloc[-1]
-        scores.append(max(-1, min(1, ret_20 * 5)))
+        # Recent momentum (was the 20-day return, scale 5)
+        ret_n = close.pct_change(c.trend_momentum_days).iloc[-1]
+        scores.append(max(-1, min(1, ret_n * c.trend_momentum_scale)))
 
         return float(np.mean(scores))
 
@@ -236,18 +237,19 @@ class RegimeDetector:
             # override only woke at ~2008-level realized vol. Scale so any
             # classification at the trigger threshold clears the gates:
             # vol 0.40 -> 0.80; VIX-triggered entries floor at 0.80.
-            conf = max(0.80, min(0.9, vol / 0.50))
+            conf = max(c.high_vol_confidence_floor,
+                       min(c.high_vol_confidence_cap, vol / c.high_vol_confidence_vol_scale))      # W92: was 0.80 / 0.9 / 0.50
             return MarketRegime.HIGH_VOLATILITY, conf
 
         # IV Crush: vol was recently high but is rapidly compressing
         # (iv_rank dropping from high, vol trend negative)
         if (iv_rank < c.iv_crush_iv_rank_max and vol < c.iv_crush_vol_max
                 and abs(trend) < c.iv_crush_trend_max):
-            return MarketRegime.IV_CRUSH, 0.7
+            return MarketRegime.IV_CRUSH, c.iv_crush_confidence
 
         # Mean-reverting: Hurst < 0.4 with no strong trend
         if hurst < c.mean_revert_hurst_max and abs(trend) < c.mean_revert_trend_max:
-            return MarketRegime.MEAN_REVERTING, max(0.6, 1.0 - hurst)
+            return MarketRegime.MEAN_REVERTING, max(c.mean_revert_confidence_floor, 1.0 - hurst)
 
         # Low volatility (VIX < 15 or realized vol < 12%)
         if (vix and vix < c.low_vol_vix) or vol < c.low_vol_realized:
@@ -256,16 +258,16 @@ class RegimeDetector:
                     return MarketRegime.TRENDING_UP, abs(trend)
                 else:
                     return MarketRegime.TRENDING_DOWN, abs(trend)
-            return MarketRegime.LOW_VOLATILITY, 0.7
+            return MarketRegime.LOW_VOLATILITY, c.low_vol_confidence
 
         # Strong trend
         if trend > c.strong_trend:
-            return MarketRegime.TRENDING_UP, min(0.95, abs(trend))
+            return MarketRegime.TRENDING_UP, min(c.trend_confidence_cap, abs(trend))
         elif trend < -c.strong_trend:
-            return MarketRegime.TRENDING_DOWN, min(0.95, abs(trend))
+            return MarketRegime.TRENDING_DOWN, min(c.trend_confidence_cap, abs(trend))
 
         # Range-bound
-        return MarketRegime.RANGE_BOUND, max(0.5, 1.0 - abs(trend) * 2)
+        return MarketRegime.RANGE_BOUND, max(c.range_confidence_floor, 1.0 - abs(trend) * 2)
 
     @staticmethod
     def _rsi(series: pd.Series, period: int) -> pd.Series:
