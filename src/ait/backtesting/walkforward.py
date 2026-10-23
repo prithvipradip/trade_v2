@@ -63,6 +63,36 @@ def _loaded_tuning() -> WalkForwardTuningConfig:
         return WalkForwardTuningConfig()
 
 
+def oos_context_bars(configured: int, train_rows: int) -> int:
+    """W95: how many bars of the training window's tail go in front of an out-of-sample test window: the configured
+    ``oos_feature_context_bars``, capped at the training length so an early window still runs."""
+    return min(configured, train_rows)
+
+
+def meta_label_window_long_enough(train_rows: int, minimum: int) -> bool:
+    """W95: the meta-labeler is trained only for a training window with MORE than ``meta_label_min_window_rows`` bars."""
+    return train_rows > minimum
+
+
+def fetched_rows_sufficient(rows: int, minimum: int) -> bool:
+    """W95: a symbol is used only when MORE than ``min_fetched_rows`` daily bars were fetched for it."""
+    return rows > minimum
+
+
+def check_oos_context_covers_features(context_bars: int, iv_rank_lookback: int) -> None:
+    """W95: refuse an out-of-sample context shorter than the feature spec's longest look-back. A shorter context does not
+    fail, it silently changes the feature VALUES in the test window (measured: ``iv_rank`` differs below 252 bars,
+    ``distance_sma200`` below 200) so the model is scored on inputs it was not trained on.
+
+    W97: the look-back passed in is ``FeatureSpec.longest_lookback()`` (the longest ``ml.features`` window: by default the
+    IV-rank range, ``vol_regime.iv_rank_lookback``, 252)."""
+    if context_bars < iv_rank_lookback:
+        raise ValueError(
+            f"backtest.walkforward_tuning.oos_feature_context_bars ({context_bars}) is below the feature spec's longest "
+            f"look-back ({iv_rank_lookback}; by default ml.features.vol_regime.iv_rank_lookback): the test-window features "
+            f"would not match the ones the model was trained on. Raise it to at least {iv_rank_lookback}.")
+
+
 @dataclass
 class WalkForwardConfig:
     """Configuration for walk-forward backtest."""
@@ -172,6 +202,7 @@ class WalkForwardConfig:
     optimize_min_trades: int | None = None   # None -> backtest.optimize_min_trades (W67: was a 10 literal)
     optimize_hard_min_trades: int | None = None          # W67: None -> backtest.*
     optimize_below_floor_gradient: float | None = None   # W67: None -> backtest.*
+    optimize_below_floor_score: float | None = None      # W95: None -> backtest.* (was a -100 literal in the optimizer)
     optimize_seed: int | None = None   # TPESampler seed; None -> backtest.walkforward_tuning.optimize_seed (W90a: was 42)
     # W90b: ``range_threshold_pct`` (0.05) was removed: nothing read it (the per-window range band is computed by
     # _adaptive_range_threshold, whose fallback is backtest.walkforward_tuning.range_threshold_fallback).
@@ -436,6 +467,9 @@ class WalkForwardConfig:
             BacktestConfig, _settings))
         self.optimize_below_floor_gradient = float(resolve_config_value(
             self.optimize_below_floor_gradient, "backtest", "optimize_below_floor_gradient",
+            BacktestConfig, _settings))
+        self.optimize_below_floor_score = float(resolve_config_value(
+            self.optimize_below_floor_score, "backtest", "optimize_below_floor_score",
             BacktestConfig, _settings))
         self.range_min_confidence = float(resolve_config_value(
             self.range_min_confidence, "ml", "range_min_confidence", MLConfig, _settings))
@@ -1243,6 +1277,8 @@ class WalkForwardBacktester:
                         or WalkForwardTuningConfig())
         # W88d: the feature windows (ml.features) every FeatureEngine of this run computes with
         self._fspec = spec_from_config(getattr(getattr(self._settings, "ml", None), "features", None))
+        # W95: the test-window context must reach back as far as the IV-rank feature does (refused otherwise)
+        check_oos_context_covers_features(self._tuning.oos_feature_context_bars, self._fspec.longest_lookback())   # W97
         # R12-C: enable_msgarch/enable_oujump flags removed — the GARCH family
         # is retired to deprecated/research/; range models are ML-only.
 
@@ -1718,7 +1754,9 @@ class WalkForwardBacktester:
             # Prepend training data context so ML features can be computed.
             # iv_rank uses vol_20.rolling(252) — needs 252 bars to be meaningful.
             # Capped at actual train_df length so early windows still work.
-            context_bars = min(252, len(train_df))
+            # W95: the 252 is backtest.walkforward_tuning.oos_feature_context_bars (refused below the feature
+            # spec's IV-rank look-back at construction), via the one helper the tests exercise.
+            context_bars = oos_context_bars(self._tuning.oos_feature_context_bars, len(train_df))
             test_with_context = pd.concat([train_df.tail(context_bars), test_df])
 
             if learner is not None:
@@ -2196,6 +2234,7 @@ class WalkForwardBacktester:
                     penalty_on_range_prob=self._config.penalty_on_range_prob,
                     hard_min_trades=self._config.optimize_hard_min_trades,
                     below_floor_gradient=self._config.optimize_below_floor_gradient,
+                    below_floor_score=self._config.optimize_below_floor_score,
                     economic_calendar=self._research_calendar,
                     wing_floor_dollars=self._config.wing_floor_dollars,
                     wing_k=self._config.wing_k,
@@ -3130,12 +3169,12 @@ class WalkForwardBacktester:
             )
 
             # Shadow Backtester: run on training data to get labelled trade outcomes.
-            # Use a reduced context prefix (same 60-bar convention as the OOS run).
-            context_bars = 60
-            if len(train_df) <= context_bars:
+            # W95: the old `context_bars = 60` here was only this minimum-length guard (the shadow run uses the whole
+            # training window with context_bars=0; the `train_head` slice it fed was never read), so it is now the
+            # setting it always was: backtest.walkforward_tuning.meta_label_min_window_rows.
+            if not meta_label_window_long_enough(len(train_df), self._tuning.meta_label_min_window_rows):
                 return None
 
-            train_head = train_df.head(len(train_df) - context_bars)  # actual training slice
             train_with_ctx = train_df  # full training window already has its own context
 
             shadow_bt = Backtester(
@@ -3466,7 +3505,7 @@ class WalkForwardBacktester:
                 if df is not None and start is not None and not df.empty:
                     _idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
                     df = df[_idx >= pd.Timestamp(start)]
-                if df is not None and len(df) > 100:
+                if df is not None and fetched_rows_sufficient(len(df), self._tuning.min_fetched_rows):
                     # R16 #5: load_daily_ohlcv can return a tz-aware
                     # (America/New_York) index while run() normalizes VIX/SPY
                     # context to tz-naive — the mix crashed

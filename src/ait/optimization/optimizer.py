@@ -38,7 +38,6 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 _FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS = 30
 _FETCH_MIN_PERIOD_DAYS = 90
-_MIN_BACKTEST_ROWS = 60
 
 
 class _EarlyStopCallback:
@@ -120,6 +119,7 @@ class StrategyOptimizer:
         penalty_on_range_prob: float | None = None,
         hard_min_trades: int | None = None,          # W67 graded objective (None -> config)
         below_floor_gradient: float | None = None,
+        below_floor_score: float | None = None,     # W95: None -> backtest.optimize_below_floor_score (was a -100 literal)
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
@@ -345,6 +345,9 @@ class StrategyOptimizer:
         self._below_floor_gradient = float(_rcv(
             below_floor_gradient, "backtest", "optimize_below_floor_gradient", _BTC2,
             self._settings))
+        self._below_floor_score = float(_rcv(
+            below_floor_score, "backtest", "optimize_below_floor_score", _BTC2,
+            self._settings))                                                                  # W95
         # R20b review follow-up: same None -> config-resolution pattern as
         # iv_rank_rise_threshold/min_edge_over_baseline below — a direct
         # caller that omits wing_k now gets the config/live value (1.6)
@@ -534,7 +537,7 @@ class StrategyOptimizer:
         trial.set_user_attr("n_trades", int(result.total_trades))
         trial.set_user_attr("entry_funnel_top", _top_rejections(result.entry_funnel))
         if result.total_trades < self._hard_min_trades:
-            return -100.0 + self._below_floor_gradient * (
+            return self._below_floor_score + self._below_floor_gradient * (       # W95: was -100.0
                 result.total_trades / max(self._hard_min_trades, 1))
         if self._min_trades > 0 and result.total_trades < self._min_trades:
             _f = (result.total_trades / self._min_trades) ** 2
@@ -721,17 +724,19 @@ class StrategyOptimizer:
         # Use first available symbol for speed (full multi-symbol adds overhead)
         symbol = self._symbols[0]
         df = self._data.get(symbol)
-        if df is None or len(df) < _MIN_BACKTEST_ROWS:
+        # W95: the minimum row count is backtest.walkforward_tuning.min_backtest_rows (was the module constant
+        # _MIN_BACKTEST_ROWS = 60); the same setting drives the split rules below and the fetch filter.
+        if df is None or len(df) < self._tuning.min_backtest_rows:
             raise ValueError(f"Insufficient data for {symbol}")
 
         eval_start_date = None
-        if self._val_split and len(df) >= _MIN_BACKTEST_ROWS * 2:
+        if self._val_split and len(df) >= self._tuning.min_backtest_rows * 2:
             # H2: split 80/20. Full df is passed to Backtester for feature warmup;
             # eval_start_date restricts new entries to the val slice only.
-            split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - self._tuning.optimize_val_split_ratio)))
+            split_idx = max(self._tuning.min_backtest_rows, int(len(df) * (1.0 - self._tuning.optimize_val_split_ratio)))
             val_start = df.index[split_idx]
             eval_start_date = val_start.date() if hasattr(val_start, "date") else val_start
-            if len(df) - split_idx < _MIN_BACKTEST_ROWS // 2:
+            if len(df) - split_idx < self._tuning.min_backtest_rows // 2:
                 eval_start_date = None  # val slice too short — fall back to full window
 
         # Extract Backtester-compatible params (drop strategy__ prefix).
@@ -867,7 +872,7 @@ class StrategyOptimizer:
                 ) if self._db_path is not None else load_daily_ohlcv(symbol, days=fetch_days)   # W91: research = a db_path was given
                 if len(df) > 0:
                     df = df.tail(requested_days)
-                    if len(df) >= _MIN_BACKTEST_ROWS:
+                    if len(df) >= self._tuning.min_backtest_rows:
                         data[symbol] = df
                         log.info(
                             "data_fetched_for_optimizer",

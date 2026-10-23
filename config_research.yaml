@@ -128,7 +128,8 @@ backtest:
   fractal_veto_spread: 0.0             # absolute hurst spread veto for neutral structures (0 = off = live today)
   penalty_on_range_prob: 0.0           # fractal penalty also lowers P(in range) (0 = off = live today)
   optimize_hard_min_trades: 3          # below this a trial scores on the graded floor (not a flat -100)
-  optimize_below_floor_gradient: 20.0  # -100 (0 trades) rising toward -80; 0 restores the flat -100
+  optimize_below_floor_gradient: 20.0  # the score rises from the base below by up to this much as trades approach the floor; 0 = flat
+  optimize_below_floor_score: -100.0   # W95: the score of a trial with ZERO trades (the base of the ramp); must stay far below any real score (see docs/RESEARCH_GUIDE.md, "The optimizer")
 
   # --- W68: IV-rank parity (research up to date with live) ---
   iv_rank_gate: true                   # live's two IV-RANK gates on credit entries: condor refuses rank < ic_iv_rank_floor
@@ -206,6 +207,9 @@ backtest:
     vol_gate_lookback_rows: 11         # closes the realized-vol entry gate measures (11 = 10 returns)
     min_history_bars: 20               # no decision before this many bars of history
     fallback_iv: 0.25                  # volatility assumed for a position with no entry_iv, and by realized_vol with too few prices
+    # W95 (explained in docs/RESEARCH_GUIDE.md, "Where the history and row-count minimums are set")
+    drawdown_high_lookback_rows: 60    # rows of closes in the rolling high the drawdown entry gate measures the fall from (the result keeps the name pct_from_60d_high)
+    replay_lookback_days: 60           # calendar days of history the single-trade replay gives the engine before the entry date (about 42 trading rows)
 
   # --- W90f: the research IV surface's acceptance rules (used when pricing_source is "surface"); part of the surface cache key ---
   surface_tuning:
@@ -268,6 +272,11 @@ backtest:
     oos_range_min_extra_rows: 5        # bars beyond the label horizon the OOS range evaluation needs
     min_windows: 3                     # a run with fewer walk-forward windows aborts / is flagged as too few to judge
     window_score_full_credit_trades: 5 # a window's score = win rate x sqrt(min(1, trades / this))
+    # W95 (explained in docs/RESEARCH_GUIDE.md, "Where the history and row-count minimums are set")
+    oos_feature_context_bars: 252      # bars of the training tail put in front of each test window so the features have their look-back; refused below the feature spec's longest ml.features look-back (252 by default)
+    meta_label_min_window_rows: 60     # the meta-labeler is trained only for a training window with MORE than this many bars
+    min_fetched_rows: 100              # a symbol is used only when MORE than this many daily bars were fetched
+    min_backtest_rows: 60              # the optimizer's minimum daily bars (symbol dropped / trial refused below it; validation split needs twice this)
 
 # --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
 # Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.

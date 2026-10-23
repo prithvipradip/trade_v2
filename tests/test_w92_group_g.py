@@ -106,7 +106,9 @@ class TestRegime:
                  "trend_slope_scale": ("slope_scale", 20.0), "trend_deviation_periods": ("dev_periods", [10]),
                  "trend_deviation_scale": ("dev_scale", 2.0), "trend_momentum_days": ("mom_days", 60), "trend_momentum_scale": ("mom_scale", 1.0)}
         for field, (arg, value) in moves.items():
-            got = self._detector(**{field: value})._measure_trend(close)
+            # W95: min_history_rows must cover the trend look-back (a 60-day momentum needs 61); this test calls
+            # _measure_trend directly, so the minimum is raised only to satisfy the schema validator
+            got = self._detector(**{field: value, "min_history_rows": 100})._measure_trend(close)
             want = self._expected_trend(close, **{**base, arg: value})
             assert got == pytest.approx(want, abs=1e-12), field
             assert got != pytest.approx(self._detector()._measure_trend(close), abs=1e-9), f"{field} did not move the score"

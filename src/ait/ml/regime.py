@@ -76,10 +76,10 @@ class RegimeDetector:
         """Analyze market regime from recent price data.
 
         Args:
-            df: OHLCV DataFrame with at least 60 rows.
+            df: OHLCV DataFrame with at least ``regime.min_history_rows`` rows (60 by default).
             vix: Current VIX level (optional, improves accuracy).
         """
-        if df is None or len(df) < 60:
+        if df is None or len(df) < self._cfg.min_history_rows:     # W95: was a literal 60
             return RegimeAnalysis(
                 regime=MarketRegime.RANGE_BOUND,
                 confidence=0.0,
@@ -99,7 +99,7 @@ class RegimeDetector:
         # --- Volatility Analysis ---
         vol = self._measure_volatility(close)
 
-        # --- IV Rank (vol percentile over 252 days) ---
+        # --- IV Rank (vol percentile over regime.iv_rank_window_rows, 252 by default) ---
         iv_rank = self._measure_iv_rank(close)
 
         # --- Hurst Exponent (mean-reversion vs trending) ---
@@ -173,16 +173,21 @@ class RegimeDetector:
         return float(log_returns.tail(20).std() * np.sqrt(252))
 
     def _measure_iv_rank(self, close: pd.Series) -> float:
-        """IV rank proxy: current 20-day vol percentile over 252 days."""
+        """IV rank proxy: current 20-day vol percentile over ``regime.iv_rank_window_rows`` values.
+
+        W95: the minimum number of 20-day-vol values (60) and the window (252) are ``regime.iv_rank_min_rows`` /
+        ``iv_rank_window_rows``. The minimum counts vol values, each of which needs 20 bars of its own.
+        """
+        c = self._cfg
         log_returns = np.log(close / close.shift(1)).dropna()
         vol_20 = log_returns.rolling(20).std() * np.sqrt(252)
         vol_20 = vol_20.dropna()
 
-        if len(vol_20) < 60:
+        if len(vol_20) < c.iv_rank_min_rows:
             return 0.5
 
         current = float(vol_20.iloc[-1])
-        lookback = vol_20.tail(min(252, len(vol_20)))
+        lookback = vol_20.tail(min(c.iv_rank_window_rows, len(vol_20)))
         vol_min = float(lookback.min())
         vol_max = float(lookback.max())
         vol_range = vol_max - vol_min

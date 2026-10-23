@@ -193,8 +193,8 @@ fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit 
 | `legacy_engine` | Constants of the dormant paths: fallback direction model, naked-margin fraction, bearish margin, thesis-invalidation confidence, vol-regime ratio. None is on the iron-condor path under `engine_model: realistic`. | `backtesting/engine.py` |
 | `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
 | `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
-| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink. | `backtesting/walkforward.py`, `run_backtest.py`, `run_optimizer.py` |
-| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e). | `backtesting/engine.py`, `pricing.py` |
+| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink; W95: the test-window feature context (`oos_feature_context_bars`, refused below the feature spec's IV-rank look-back), the meta-labeler's minimum window (`meta_label_min_window_rows`), the minimum fetched rows (`min_fetched_rows`) and the optimizer's minimum rows (`min_backtest_rows`). | `backtesting/walkforward.py`, `optimization/optimizer.py`, `run_backtest.py`, `run_optimizer.py` |
+| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e); the drawdown gate's rolling-high window and the replay's history pad (W95). | `backtesting/engine.py`, `pricing.py`, `replay.py` |
 | `surface_tuning` | The acceptance rules of the research IV surface (volume, price, moneyness, points, span, IV bounds, clamp margin, stale days). The fit rules are in the surface cache key. | `backtesting/iv_surface.py`, `engine.py` (W90f) |
 | `friction_fit` | Minimum samples, sessions, training rows and affine points to fit a leg-spread model. Offline calibration only. | `backtesting/friction.py` (W90f) |
 | `spread_tuning` | Max cost as a share of capital (0.25) and the wing as a fraction of the expected move (0.5) in the non-condor builders; the iron-condor builder does not read them. | `backtesting/engine.py` (W90f) |
@@ -240,12 +240,17 @@ Their numbers are settings in `config.yaml` (`ml.drift_*`, `ml.model_versions_ke
 (`ml.drift_detection_enabled: false`): the live book trades iron condors only, and outcomes are recorded only for directional strategies, so the detector could never report. To use it, set the switch
 to `true` and restart the bot; the full check then runs at most once per `ml.drift_check_interval` newly recorded predictions. All values equal the old literals; they take effect at the next bot restart.
 
+W95 added three more `regime:` keys, `min_history_rows` (60), `iv_rank_min_rows` (60) and `iv_rank_window_rows` (252): the history the classifier needs and the window of its price-only IV-rank proxy. Same defaults as the old literals, same rule: they take effect at the next bot restart. `min_history_rows` below the trend measure's look-back (55 at the defaults) is a startup error.
+
 ## Feature windows (W88d; shared by live and research)
 
 The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them
 changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different window there (or in a study); the parity manifest then warns (`ml_features`).
-In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. Fixed (not settings): the fractal / wavelet / Hurst group, the 26 VLMC
-intraday features, cross-asset, macro, seasonality and the market-structure group (including `above_sma200` / `distance_sma200`).
+In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. **W97 added the remaining windows:** `market_structure`
+(including the 200-day SMA behind `above_sma200` / `distance_sma200`), `cross_asset`, `macro`, `fractal` (Hurst short / long, PSD and MFDFA minimums) and `intraday` (hour = 12 bars, the minimum-bar guards), 50 settings listed in
+`config.yaml` with the old values (RESEARCH_GUIDE "The remaining feature windows"). Fourteen more model columns follow their window in the name (`vix_change_5d`, `rel_strength_60d`, `above_sma200`, ...); the 26 VLMC intraday names are a fixed list and do not.
+**The hash rule:** these five groups enter the saved-model hash only when a value differs from its default, so at the defaults nothing is refused or retrained. Fixed (not settings): clip bounds, neutral values, the wavelet family and MFDFA scales, the
+seasonality encoding and the 252 annualisation constant.
 
 **What changes when you change a window.** (1) The feature VALUES. (2) For the thirteen model columns whose name embeds a window the NAME follows it: `rsi_long: 21` turns `rsi_14` into `rsi_21`; `sma_mid: 30` turns `price_vs_sma_20`,
 `sma_20_slope` and `sma_10_20_cross` into `price_vs_sma_30`, `sma_30_slope`, `sma_10_30_cross`. The meta-labeler's inputs, the engine's and the live orchestrator's meta-context keys, and the entry-signals snapshot follow; the dashboard series keep

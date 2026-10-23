@@ -60,7 +60,12 @@ from ait.backtesting.pricing import (
     skewed_leg_iv,
 )
 from ait.backtesting.study_harness import STUDY_INITIAL_CAPITAL
-from ait.config.settings import DEFAULT_RISK_FREE_RATE, BacktestConfig, EngineTuningConfig
+from ait.config.settings import (
+    DEFAULT_RISK_FREE_RATE,
+    BacktestConfig,
+    EngineTuningConfig,
+    loaded_engine_tuning,
+)
 from ait.utils.time import ET
 
 # engine.py used a bare r = 0.05 at entry and in the daily re-mark (W72 finding); since W81 it reads
@@ -579,7 +584,9 @@ def engine_exit_scan(trade: ReplayTrade, data: ResearchData, entry: dict[str, An
     frame = data.daily_frame()
     start = pd.Timestamp(trade.entry_date)
     end = pd.Timestamp(trade.front_expiry)
-    window = frame.loc[(frame.index >= start - pd.Timedelta(days=60)) & (frame.index <= end)]
+    # W95: the 60 calendar days are backtest.engine_tuning.replay_lookback_days
+    window = frame.loc[(frame.index >= start - pd.Timedelta(days=loaded_engine_tuning().replay_lookback_days))
+                       & (frame.index <= end)]
     if window.empty or pd.Timestamp(trade.entry_date) not in window.index:
         return None
 

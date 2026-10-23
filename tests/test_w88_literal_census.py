@@ -79,15 +79,21 @@ class TestTheScannerSeesWhatItShould:
         return lc.scan(f)
 
     def test_counts_a_new_literal_in_a_function_and_at_module_level(self, tmp_path):
-        got = self._scan(tmp_path, "X = 0.37\n\ndef f(a):\n    return a * 1.23 + 100\n")
+        got = self._scan(tmp_path, "X = 0.37\n\ndef f(a):\n    return a * 1.23 + 1\n")
         assert got == {"<module>": [0.37], "f": [1.23]}
 
     def test_the_small_numbers_that_used_to_be_ignored_are_counted(self, tmp_path):
         """W90e: 3, 4, 5, 7, 10, 30, 0.5 and 0.25 hid real windows and thresholds (a 5-day lookback, a 3-window minimum, a
-        25% capital cap, a 0.5 baseline); only unit-like values are ignored now."""
+        25% capital cap, a 0.5 baseline); W95 then removed 12, 24, 60, 100, 252, 365 and 1000 too (they hid nine real
+        windows and minimums); only 0, 1, 2 and -1 are ignored now."""
         got = self._scan(tmp_path, "def f(x):\n    return x[:10] + x.rolling(5).mean() + 3 + 4 + 7 + 30 + 0.5 + 0.25\n")
         assert got == {"f": [0.25, 0.5, 3, 4, 5, 7, 10, 30]}
-        assert lc.TRIVIAL == {0, 1, -1, 2, 100, 0.0, 1.0, -1.0, 2.0, 252, 365, 12, 24, 60, 1000}
+        assert lc.TRIVIAL == {0, 1, -1, 2, 0.0, 1.0, -1.0, 2.0}
+
+    def test_the_unit_like_numbers_that_hid_real_windows_are_counted_too(self, tmp_path):
+        """W95: x 100, / 365, sqrt(252), rolling(60) and a > 100 row minimum are listed (and classified) like any other number."""
+        got = self._scan(tmp_path, "def f(x, df):\n    return x * 100 / 365 + np.sqrt(252) + df.rolling(60).max() + len(df) > 100 + 12 + 24 + 1000\n")
+        assert got == {"f": [12, 24, 60, 100, 100, 252, 365, 1000]}
 
     def test_counts_methods_by_qualified_name(self, tmp_path):
         got = self._scan(tmp_path, "class C:\n    def m(self):\n        return 0.71\n")
@@ -95,7 +101,7 @@ class TestTheScannerSeesWhatItShould:
 
     def test_ignores_trivial_values_logging_round_and_string_repeat(self, tmp_path):
         got = self._scan(tmp_path, 'def f(x):\n    log.info("e", v=0.81)\n    print(0.82)\n    y = round(x, 4)\n'
-                                   '    s = "=" * 70\n    return x + 1 + 2 + 100 + 252 + 365 + 1000\n')
+                                   '    s = "=" * 70\n    return x + 1 + 2 - 1 + 0\n')
         assert got == {}
 
     def test_a_changed_literal_is_a_difference(self, tmp_path):
