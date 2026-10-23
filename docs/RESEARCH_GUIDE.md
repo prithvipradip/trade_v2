@@ -97,8 +97,8 @@ or the command-line flag.
 | `surface_tuning` | The acceptance rules of the research IV surface (min volume 10, min price 0.05, |moneyness| 0.10, 5 points, 1% span, IV bounds, clamp margin, 5 stale days); part of the surface cache key, so a changed rule rebuilds it (W90f) |
 | `friction_fit` | The minimum data a leg-spread (friction) model needs to be fitted: samples, sessions for cross-validation, training rows, affine points. Offline calibration only (W90f) |
 | `spread_tuning` | Sizing numbers of the non-condor builders (put / call credit spreads, iron butterfly, jade lizard, debit structures): max cost as a share of capital (25%) and the wing as a fraction of the expected move (0.5). The iron-condor builder does not read them (W90f) |
-| `engine_tuning` | The engine's IV-skew coefficients (`put_skew_coefficient` 0.10, `call_skew_coefficient` 0.02), the look-backs of the realized-vol and IV-rank-rise entry gates, the minimum history before the first decision (W90c), and the fallback volatility used when a position has no entry IV (`fallback_iv`, W90e) |
-| `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins and minimums, the minimum number of windows (`min_windows`) and the window-score shrink (W90e); also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
+| `engine_tuning` | The engine's IV-skew coefficients (`put_skew_coefficient` 0.10, `call_skew_coefficient` 0.02), the look-backs of the realized-vol and IV-rank-rise entry gates, the minimum history before the first decision (W90c), and the fallback volatility used when a position has no entry IV (`fallback_iv`, W90e); the window of the drawdown gate's rolling high (`drawdown_high_lookback_rows`, 60) and the replay's history pad (`replay_lookback_days`, 60) (W95) |
+| `walkforward_tuning` | Window lengths (`train_days` / `test_days` / `step_days` / `gap_days`), Optuna trial counts and seed, row floors, context and fetch paddings, out-of-sample diagnostic bins and minimums, the minimum number of windows (`min_windows`) and the window-score shrink (W90e); the test-window feature context (`oos_feature_context_bars`) and three row minimums (`meta_label_min_window_rows`, `min_fetched_rows`, `min_backtest_rows`) (W95); also warm start, adaptive range threshold, validation split, inert-parameter probe. `--train-days`, `--test-days`, `--step-days`, `--gap-days`, `--optimize-n-trials` and `--n-trials` override them for one run (W90b) |
 
 The neutral value a missing meta-label input takes (`ml.meta_label_neutrals`: RSI 50, volatility 0.20, ...) and the meta-labeler's
 arm-guard limits (`meta_label.min_feature_coverage`, `meta_label.max_artifact_age_days`) are also shared with live (W90c), so they are in
@@ -107,6 +107,22 @@ folds, the class-balance guards and the retrain's trials, seed and rollback marg
 
 Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared with live, so they are listed in
 `config.yaml`; research differs only if you override them. Details: RUNBOOK "Research tunables" and "Model hyperparameters".
+
+### Where the history and row-count minimums are set
+
+Until W95 six research minimums sat in the code as bare numbers (60, 252, 100). They are settings now, in `config_research.yaml`,
+and the defaults are the old numbers, so no result moved.
+
+| Setting (under `backtest:`) | Default | What it controls |
+|---|---|---|
+| `engine_tuning.drawdown_high_lookback_rows` | 60 | Rows of closes in the rolling high the drawdown entry gate measures the fall from. The result keeps the name `pct_from_60d_high`. |
+| `engine_tuning.replay_lookback_days` | 60 | Calendar days of history the single-trade replay gives the engine before the entry date. 60 calendar days is about 42 trading rows, so a replayed engine's 60-row gates run on a shorter history than in a full run. |
+| `walkforward_tuning.oos_feature_context_bars` | 252 | Bars of the training tail put in front of each test window so the features have their look-back. A shorter context does not fail: it changes the feature values (`iv_rank` below 252 bars, `distance_sma200` below 200), so the model would be scored on inputs it was not trained on. A value below `ml.features.vol_regime.iv_rank_lookback` is refused when the walk-forward starts. Not `backtest.context_bars`, which is the engine's intraday look-back. |
+| `walkforward_tuning.meta_label_min_window_rows` | 60 | The meta-labeler is trained for a window only when the training window has more than this many bars. A guard on length, not a context. |
+| `walkforward_tuning.min_fetched_rows` | 100 | A symbol is used only when more than this many daily bars were fetched. |
+| `walkforward_tuning.min_backtest_rows` | 60 | The optimizer's minimum daily bars: a symbol with fewer is dropped and a trial on fewer raises "insufficient data". With a validation split on, the split needs at least twice this many bars and a validation slice shorter than half of it is dropped. |
+
+The live regime classifier has its own three (`regime.min_history_rows`, `iv_rank_min_rows`, `iv_rank_window_rows`); see "The regime classifier".
 
 ### Numbers that are not settings: the literal census
 
@@ -230,7 +246,7 @@ job also logs `post_market_drift`. A retrain clears the window and the throttle.
 
 ### The regime classifier (live)
 
-**What is it?** From SPY's last 60 or more days plus VIX it labels the market as one of seven regimes (high volatility, IV crush, mean-reverting,
+**What is it?** From SPY's last `min_history_rows` (60) or more days plus VIX it labels the market as one of seven regimes (high volatility, IV crush, mean-reverting,
 low volatility, trending up, trending down, range-bound) and gives a confidence. Research does not use it (the engine has its own regime thresholds,
 `backtest.regime_*`). The settings are the `regime:` block of `config.yaml`.
 
@@ -253,6 +269,13 @@ the price's distance from moving averages, and the recent return.
 | `mean_revert_confidence_floor` | 0.60 | MEAN_REVERTING reports `max(floor, 1 - Hurst exponent)` (reported only). |
 | `trend_confidence_cap` | 0.95 | TRENDING_UP / DOWN report `min(cap, abs(trend strength))` (reported only). |
 | `range_confidence_floor` | 0.50 | RANGE_BOUND reports `max(floor, 1 - 2 x abs(trend strength))` (reported only). |
+| `min_history_rows` | 60 | Fewer daily bars than this and the classifier makes no call (RANGE_BOUND, confidence 0). It must cover the trend measure's longest look-back (55 at the defaults); a lower value is refused when the settings load. |
+| `iv_rank_min_rows`, `iv_rank_window_rows` | 60, 252 | The IV-rank proxy needs at least 60 values of the 20-day realized vol (else it reports a neutral 0.5) and compares today's with the highest and lowest of the last 252. |
+
+**What is the IV rank here?** A price-only proxy: today's 20-day realized volatility as a percentile of its own range over the last
+`iv_rank_window_rows` values. It is not the stored-IV rank of `ait.data.iv_rank` and not the `ml.features.vol_regime.iv_rank_lookback`
+feature; the three are separate on purpose. Each volatility value needs 20 bars of its own, so at the defaults the proxy stays 0.5 until the history
+reaches about 80 bars, although the classifier itself runs from 60 (W95 documented this; the defaults are unchanged).
 
 **Watch the pair.** `high_vol_confidence_floor` and `ml.regime_override_confidence` must agree: keep the override threshold at or below the floor. A day
 triggered by VIX alone with realized vol at or under 40% scores exactly the floor, so at 0.80 / 0.80 it reaches the override. (Until W93 the rule was a strict
@@ -378,6 +401,10 @@ benchmark, and per-window rows.
 3. **The funnel.** If one gate removes most days, the result describes the days that were left.
 4. **The run record.** Is the tree dirty? Is the data span what you expected?
 5. **Comparability.** Numbers made before a research default changed are not comparable (for example, `max_concurrent_positions` went 1 → 3 in W86).
+
+**How is Sharpe annualized?** By the square root of the trades per year the sample actually made, capped at 252 (one trade per trading day).
+The cap is a fixed convention (`SHARPE_ANNUALIZATION_CAP` in `backtesting/result.py`), not a setting: it decides how every reported Sharpe and Sortino
+is annualized, so a study that could change it would make reported numbers incomparable across runs.
 
 **Why is the default run's return negative or small?** The default run is a smoke test, with a $5,000 pool, enforced ML gates and few windows.
 It is not evidence about the strategy.

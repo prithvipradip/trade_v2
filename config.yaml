@@ -480,6 +480,10 @@ regime:
   low_vol_confidence: 0.70             # LOW_VOLATILITY reports this (reported only)
   trend_confidence_cap: 0.95           # TRENDING_UP / DOWN report min(cap, |trend strength|)
   range_confidence_floor: 0.50         # RANGE_BOUND reports max(floor, 1 - 2 x |trend strength|)
+  # W95 (explained in docs/RESEARCH_GUIDE.md, "The regime classifier"): how much history the classifier needs
+  min_history_rows: 60                 # fewer daily bars than this: no call (RANGE_BOUND, confidence 0). Must cover the trend measure's look-back (55 at the defaults)
+  iv_rank_min_rows: 60                 # the IV-rank proxy needs this many 20-day-vol values (each needs 20 bars), else it reports 0.5: about 80 bars at the default
+  iv_rank_window_rows: 252             # ... compared with the highest and lowest 20-day vol over the last this many values (a price-only proxy, not ait.data.iv_rank)
 
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.

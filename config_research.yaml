@@ -205,6 +205,9 @@ backtest:
     vol_gate_lookback_rows: 11         # closes the realized-vol entry gate measures (11 = 10 returns)
     min_history_bars: 20               # no decision before this many bars of history
     fallback_iv: 0.25                  # volatility assumed for a position with no entry_iv, and by realized_vol with too few prices
+    # W95 (explained in docs/RESEARCH_GUIDE.md, "Where the history and row-count minimums are set")
+    drawdown_high_lookback_rows: 60    # rows of closes in the rolling high the drawdown entry gate measures the fall from (the result keeps the name pct_from_60d_high)
+    replay_lookback_days: 60           # calendar days of history the single-trade replay gives the engine before the entry date (about 42 trading rows)
 
   # --- W90f: the research IV surface's acceptance rules (used when pricing_source is "surface"); part of the surface cache key ---
   surface_tuning:
@@ -267,6 +270,11 @@ backtest:
     oos_range_min_extra_rows: 5        # bars beyond the label horizon the OOS range evaluation needs
     min_windows: 3                     # a run with fewer walk-forward windows aborts / is flagged as too few to judge
     window_score_full_credit_trades: 5 # a window's score = win rate x sqrt(min(1, trades / this))
+    # W95 (explained in docs/RESEARCH_GUIDE.md, "Where the history and row-count minimums are set")
+    oos_feature_context_bars: 252      # bars of the training tail put in front of each test window so the features have their look-back; refused below ml.features.vol_regime.iv_rank_lookback
+    meta_label_min_window_rows: 60     # the meta-labeler is trained only for a training window with MORE than this many bars
+    min_fetched_rows: 100              # a symbol is used only when MORE than this many daily bars were fetched
+    min_backtest_rows: 60              # the optimizer's minimum daily bars (symbol dropped / trial refused below it; validation split needs twice this)
 
 # --- W72: parity replay tolerances (scripts/parity_replay.py; schema: ParityConfig) ---
 # Research-only: decides whether a DTE band's research can be trusted before an Optuna study is run on it.

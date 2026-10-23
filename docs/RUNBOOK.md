@@ -193,8 +193,8 @@ fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit 
 | `legacy_engine` | Constants of the dormant paths: fallback direction model, naked-margin fraction, bearish margin, thesis-invalidation confidence, vol-regime ratio. None is on the iron-condor path under `engine_model: realistic`. | `backtesting/engine.py` |
 | `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
 | `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
-| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink. | `backtesting/walkforward.py`, `run_backtest.py`, `run_optimizer.py` |
-| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e). | `backtesting/engine.py`, `pricing.py` |
+| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink; W95: the test-window feature context (`oos_feature_context_bars`, refused below the feature spec's IV-rank look-back), the meta-labeler's minimum window (`meta_label_min_window_rows`), the minimum fetched rows (`min_fetched_rows`) and the optimizer's minimum rows (`min_backtest_rows`). | `backtesting/walkforward.py`, `optimization/optimizer.py`, `run_backtest.py`, `run_optimizer.py` |
+| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e); the drawdown gate's rolling-high window and the replay's history pad (W95). | `backtesting/engine.py`, `pricing.py`, `replay.py` |
 | `surface_tuning` | The acceptance rules of the research IV surface (volume, price, moneyness, points, span, IV bounds, clamp margin, stale days). The fit rules are in the surface cache key. | `backtesting/iv_surface.py`, `engine.py` (W90f) |
 | `friction_fit` | Minimum samples, sessions, training rows and affine points to fit a leg-spread model. Offline calibration only. | `backtesting/friction.py` (W90f) |
 | `spread_tuning` | Max cost as a share of capital (0.25) and the wing as a fraction of the expected move (0.5) in the non-condor builders; the iron-condor builder does not read them. | `backtesting/engine.py` (W90f) |
@@ -239,6 +239,8 @@ Their numbers are settings in `config.yaml` (`ml.drift_*`, `ml.model_versions_ke
 `docs/RESEARCH_GUIDE.md` ("Drift detection (live; off by default)", "The regime classifier (live)", "Saved model versions and the meta-labeler"). **Drift detection is OFF by default**
 (`ml.drift_detection_enabled: false`): the live book trades iron condors only, and outcomes are recorded only for directional strategies, so the detector could never report. To use it, set the switch
 to `true` and restart the bot; the full check then runs at most once per `ml.drift_check_interval` newly recorded predictions. All values equal the old literals; they take effect at the next bot restart.
+
+W95 added three more `regime:` keys, `min_history_rows` (60), `iv_rank_min_rows` (60) and `iv_rank_window_rows` (252): the history the classifier needs and the window of its price-only IV-rank proxy. Same defaults as the old literals, same rule: they take effect at the next bot restart. `min_history_rows` below the trend measure's look-back (55 at the defaults) is a startup error.
 
 ## Feature windows (W88d; shared by live and research)
 

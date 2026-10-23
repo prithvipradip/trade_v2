@@ -38,7 +38,6 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 _FETCH_WEEKEND_HOLIDAY_BUFFER_DAYS = 30
 _FETCH_MIN_PERIOD_DAYS = 90
-_MIN_BACKTEST_ROWS = 60
 
 
 class _EarlyStopCallback:
@@ -721,17 +720,19 @@ class StrategyOptimizer:
         # Use first available symbol for speed (full multi-symbol adds overhead)
         symbol = self._symbols[0]
         df = self._data.get(symbol)
-        if df is None or len(df) < _MIN_BACKTEST_ROWS:
+        # W95: the minimum row count is backtest.walkforward_tuning.min_backtest_rows (was the module constant
+        # _MIN_BACKTEST_ROWS = 60); the same setting drives the split rules below and the fetch filter.
+        if df is None or len(df) < self._tuning.min_backtest_rows:
             raise ValueError(f"Insufficient data for {symbol}")
 
         eval_start_date = None
-        if self._val_split and len(df) >= _MIN_BACKTEST_ROWS * 2:
+        if self._val_split and len(df) >= self._tuning.min_backtest_rows * 2:
             # H2: split 80/20. Full df is passed to Backtester for feature warmup;
             # eval_start_date restricts new entries to the val slice only.
-            split_idx = max(_MIN_BACKTEST_ROWS, int(len(df) * (1.0 - self._tuning.optimize_val_split_ratio)))
+            split_idx = max(self._tuning.min_backtest_rows, int(len(df) * (1.0 - self._tuning.optimize_val_split_ratio)))
             val_start = df.index[split_idx]
             eval_start_date = val_start.date() if hasattr(val_start, "date") else val_start
-            if len(df) - split_idx < _MIN_BACKTEST_ROWS // 2:
+            if len(df) - split_idx < self._tuning.min_backtest_rows // 2:
                 eval_start_date = None  # val slice too short — fall back to full window
 
         # Extract Backtester-compatible params (drop strategy__ prefix).
@@ -866,7 +867,7 @@ class StrategyOptimizer:
                 ) if self._table_prefix else load_daily_ohlcv(symbol, days=fetch_days)
                 if len(df) > 0:
                     df = df.tail(requested_days)
-                    if len(df) >= _MIN_BACKTEST_ROWS:
+                    if len(df) >= self._tuning.min_backtest_rows:
                         data[symbol] = df
                         log.info(
                             "data_fetched_for_optimizer",

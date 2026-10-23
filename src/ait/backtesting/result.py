@@ -15,6 +15,12 @@ import pandas as pd
 
 from ait.config.settings import loaded_account_capital, loaded_cash_yield
 
+# W95: the cap on the Sharpe / Sortino annualization frequency: no strategy is treated as trading more often than once
+# per trading day (252 a year). A fixed methodology convention, not a tunable: it decides how EVERY reported Sharpe is
+# annualized, so letting a study change it would make reported Sharpes incomparable across runs. See RESEARCH_GUIDE.md,
+# "Sharpe annualization".
+SHARPE_ANNUALIZATION_CAP = 252.0
+
 
 @dataclass
 class BacktestResult:
@@ -327,6 +333,6 @@ def annualization_factor(trades) -> float:
             return 1.0
         span_days = max((ds[-1] - ds[0]).days, 1)
         tpy = len(ds) * 365.0 / span_days
-        return math.sqrt(min(252.0, max(tpy, 1.0)))
+        return math.sqrt(min(SHARPE_ANNUALIZATION_CAP, max(tpy, 1.0)))
     except Exception:
         return 1.0

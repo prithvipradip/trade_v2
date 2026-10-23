@@ -803,6 +803,26 @@ class WalkForwardTuningConfig(_StrictModel):
     window_score_full_credit_trades: int = Field(default=5, ge=1, le=500,
         description="W90e: a window's score for the global best parameters is win rate x sqrt(min(1, trades / this)), so a "
                     "window with fewer trades than this counts for proportionally less.")
+    oos_feature_context_bars: int = Field(default=252, ge=20, le=2000,
+        description="W95: bars of the training window's tail that are put in front of each out-of-sample test window so the "
+                    "features have their look-back (capped at the training window's length, so early windows still run). The "
+                    "default is one trading year: the IV-rank feature looks back ml.features.vol_regime.iv_rank_lookback (252) "
+                    "bars. A shorter context does not fail, it changes the feature VALUES the model sees in the test window "
+                    "(iv_rank below 252, distance_sma200 below 200) so they differ from the ones it was trained on; for that "
+                    "reason a value below the feature spec's IV-rank look-back is refused when the walk-forward starts. Not "
+                    "backtest.context_bars, which is the engine's own intraday look-back.")
+    meta_label_min_window_rows: int = Field(default=60, ge=1, le=5000,
+        description="W95: the meta-labeler is trained for a window only when the training window has MORE than this many bars "
+                    "(otherwise the window runs without one). A minimum-length guard, not a context length: the labelling run "
+                    "uses the whole training window.")
+    min_fetched_rows: int = Field(default=100, ge=0, le=10000,
+        description="W95: a symbol is used by a walk-forward run only when MORE than this many daily bars were fetched for it "
+                    "(fewer is treated as no data).")
+    min_backtest_rows: int = Field(default=60, ge=4, le=5000,
+        description="W95: the optimizer's minimum number of daily bars. A symbol fetched with fewer is left out, and a trial on "
+                    "fewer raises 'insufficient data'. With a validation split on, the split is made only with at least twice "
+                    "this many bars, the training part is never shorter than this, and a validation slice shorter than half of "
+                    "it is dropped (the whole window is scored instead).")
 
     @model_validator(mode="after")
     def _clips(self) -> "WalkForwardTuningConfig":
@@ -834,6 +854,14 @@ class EngineTuningConfig(_StrictModel):
     fallback_iv: float = Field(default=0.25, ge=0.01, le=3.0,
         description="W90e: the annualized volatility the engine assumes when it has nothing better: a position that carries "
                     "no entry_iv (exit repricing, half-spread model) and a realized-vol estimate with too few prices.")
+    drawdown_high_lookback_rows: int = Field(default=60, ge=2, le=1000,
+        description="W95: window (rows of daily closes) of the rolling high the drawdown entry gate measures the fall from "
+                    "(backtest.pct_from_60d_high_threshold); fewer rows are used while the history is shorter. The result "
+                    "keeps the name pct_from_60d_high whatever this is set to.")
+    replay_lookback_days: int = Field(default=60, ge=0, le=3650,
+        description="W95: calendar days of history the single-trade replay (backtesting/replay.py) gives the engine in front "
+                    "of the trade's entry date. 60 calendar days is about 42 trading rows, so a replayed engine's gates that "
+                    "look back further than that (the drawdown gate's 60 rows) run on a shorter history than in a full run.")
 
 
 class SurfaceTuningConfig(_StrictModel):
@@ -1752,6 +1780,15 @@ class MLConfig(_StrictModel):
         return self
 
 
+def regime_trend_history_need(cfg: "RegimeConfig") -> int:
+    """W95: the fewest daily bars the regime classifier's own measures can be computed from. An SMA slope over
+    ``trend_slope_lookback`` days needs the SMA's period plus that many bars, a deviation needs its SMA's period, the
+    momentum return needs ``trend_momentum_days`` + 1, and the 20-day realized volatility needs 21 (20 returns). The
+    single definition: ``RegimeConfig`` refuses a ``min_history_rows`` below it."""
+    return max(max(cfg.trend_sma_periods) + cfg.trend_slope_lookback, max(cfg.trend_deviation_periods),
+               cfg.trend_momentum_days + 1, 21)
+
+
 class RegimeConfig(_StrictModel):
     """W69: market-regime classification thresholds (ml/regime.py `_classify`).
 
@@ -1824,6 +1861,22 @@ class RegimeConfig(_StrictModel):
         description="W92: a TRENDING_UP / TRENDING_DOWN classification reports min(this, |trend strength|) (reported only).")
     range_confidence_floor: float = Field(default=0.50, ge=0.0, le=1.0,
         description="W92: a RANGE_BOUND classification reports max(this, 1 - 2 x |trend strength|) (reported only).")
+    # --- W95: how much history the classifier needs. Guide: RESEARCH_GUIDE "The regime classifier" ---
+    min_history_rows: int = Field(default=60, ge=21, le=1000,
+        description="W95: the classifier needs at least this many daily bars; with fewer it returns RANGE_BOUND at confidence 0 "
+                    "(it makes no call). Must cover the longest look-back of the trend measure (the longest trend_sma_periods "
+                    "entry plus trend_slope_lookback, the longest trend_deviation_periods entry, trend_momentum_days + 1): "
+                    "55 at the defaults.")
+    iv_rank_min_rows: int = Field(default=60, ge=2, le=1000,
+        description="W95: the IV-rank proxy (today's 20-day realized vol as a percentile of its own recent range) is computed "
+                    "only from at least this many 20-day-vol values, else it reports a neutral 0.5. Each value needs 20 bars "
+                    "of its own, so at the default the proxy stays 0.5 until the history reaches about 80 bars, although "
+                    "min_history_rows alone would let the classifier run at 60.")
+    iv_rank_window_rows: int = Field(default=252, ge=2, le=2000,
+        description="W95: the IV-rank proxy compares today's 20-day vol with the highest and lowest 20-day vol over the last "
+                    "this many values (252 = one trading year; fewer are used while the history is shorter). Not the stored-IV "
+                    "rank of ait.data.iv_rank and not the ml.features.vol_regime.iv_rank_lookback feature: a separate proxy "
+                    "built from prices alone.")
 
     @model_validator(mode="after")
     def _vol_bands_are_ordered(self) -> "RegimeConfig":
@@ -1839,6 +1892,12 @@ class RegimeConfig(_StrictModel):
             raise ValueError(
                 f"regime.high_vol_confidence_floor ({self.high_vol_confidence_floor}) cannot exceed "
                 f"high_vol_confidence_cap ({self.high_vol_confidence_cap})")
+        need = regime_trend_history_need(self)                                 # W95
+        if self.min_history_rows < need:
+            raise ValueError(
+                f"regime.min_history_rows ({self.min_history_rows}) is below the {need} bars the trend measure needs "
+                f"(longest trend_sma_periods + trend_slope_lookback, longest trend_deviation_periods, "
+                f"trend_momentum_days + 1, and the 21 bars of the volatility measure): raise it or shorten those")
         return self
 
 

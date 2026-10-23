@@ -1320,7 +1320,9 @@ class Backtester:
             # jade/ccs arms silently skipped, biasing any promotion study.
             if strategy in NEUTRAL_CREDIT_GATED and self._pct_from_60d_high_threshold > _DRAWDOWN_GATE_OFF_FLOOR:
                 _close_series = hist_dec["Close"]
-                _rolling_high = _close_series.rolling(min(60, len(_close_series))).max().iloc[-1]
+                # W95: the 60 is backtest.engine_tuning.drawdown_high_lookback_rows (the result key keeps its name)
+                _rolling_high = _close_series.rolling(
+                    min(self._eng.drawdown_high_lookback_rows, len(_close_series))).max().iloc[-1]
                 if _rolling_high and _rolling_high > 0:
                     _pct_from_high = (float(_close_series.iloc[-1]) - float(_rolling_high)) / float(_rolling_high)
                     _entry_decision["pct_from_60d_high"] = round(_pct_from_high, 4)
