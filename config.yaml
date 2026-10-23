@@ -438,24 +438,236 @@ ml:
   # Changing one changes the feature VALUES, and for the thirteen columns whose name embeds a window it changes the NAME
   # too (rsi_14 -> rsi_10). Every saved model records a hash of these windows and a model trained under other windows
   # is REFUSED (it is retrained): after a change, expect a retrain, and old entry_signals snapshots keep the old names.
+  # W98: this section is the COMPLETE list of the features the models can use. Each group holds its windows and, under `use:`, one
+  # true/false switch per feature it produces (the comment shows the column at the current windows). true = the column is an input of
+  # the direction, range and vol-magnitude models and of the tuner; false = it is left out (it is still computed, because the
+  # meta-labeler and the gates read some columns, so switching off a long-look-back feature does not shorten the warm-up). The
+  # shipped switches reproduce today's model list exactly, so listing them changes nothing; like a window, a switch that differs
+  # from its default changes the hash and every saved model is refused (retrained). Research switches features in a study
+  # (studies/_template.yaml) or the overlay, never here: `fractal: {use: {hurst_psd_divergence: false}}` writes one line. A switch
+  # is keyed by its role (rsi_long, not rsi_14) so a window change never renames it; an unknown key is a startup error. To add a
+  # NEW feature: compute it in ml/features.py and add its name to CATALOGUE in config/feature_names.py (off by default).
+  # How-to: docs/RESEARCH_GUIDE.md "Choosing the model's features".
   features:
-    momentum: {rsi_long: 14, rsi_short: 7, macd_fast: 12, macd_slow: 26, macd_signal: 9, roc_short: 5, roc_mid: 10, roc_long: 20}
-    volatility: {atr_window: 14, bb_window: 20, bb_std: 2.0, rv_long: 20, rv_short: 10}
-    volume: {volume_avg_window: 20, volume_fast_window: 5, obv_period: 5}
-    trend: {sma_fast: 10, sma_mid: 20, sma_slow: 50, slope_period: 5}
-    multi_timeframe: {weekly_close_window: 5, weekly_trend_window: 4, weekly_trend_shift: 5, weekly_rsi_period: 14, weekly_momentum_period: 25}
-    vol_regime: {fast: 5, slow: 60, iv_rank_lookback: 252, iv_rank_min_periods: 20, vol_trend_period: 5, vol_of_vol_window: 20}
+    momentum:
+      rsi_long: 14
+      rsi_short: 7
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+      roc_short: 5
+      roc_mid: 10
+      roc_long: 20
+      use:
+        rsi_long: true  # rsi_14
+        rsi_short: true  # rsi_7
+        macd: true
+        macd_signal: true
+        macd_hist: true
+        roc_short: true  # roc_5
+        roc_mid: true  # roc_10
+        roc_long: true  # roc_20
+    volatility:
+      atr_window: 14
+      bb_window: 20
+      bb_std: 2.0
+      rv_long: 20
+      rv_short: 10
+      use:
+        atr_pct: true
+        bb_width: true
+        bb_position: true
+        bb_pct_above_upper: true
+        bb_pct_below_lower: true
+        rv_long: true  # realized_vol_20
+        rv_short: true  # realized_vol_10
+        high_low_range: true
+    volume:
+      volume_avg_window: 20
+      volume_fast_window: 5
+      obv_period: 5
+      use:
+        volume_ratio: true  # volume_sma_20_ratio
+        obv_change: true
+        volume_trend: true
+    trend:
+      sma_fast: 10
+      sma_mid: 20
+      sma_slow: 50
+      slope_period: 5
+      use:
+        slope_fast: true  # sma_10_slope
+        slope_mid: true  # sma_20_slope
+        px_vs_mid: true  # price_vs_sma_20
+        px_vs_slow: true  # price_vs_sma_50
+        cross: true  # sma_10_20_cross
     # W97 (explained in docs/RESEARCH_GUIDE.md, "The remaining feature windows"): the windows of the market-structure, cross-asset, macro,
     # fractal and intraday groups (were literals in ml/features.py). Same rules as above, with one difference that matters: these five
     # groups enter the saved-model hash ONLY when a value differs from the default listed here, so listing them changes nothing and no
     # saved model is refused or retrained; change one and every saved model is refused (retrained) like any other window.
     # Columns that follow a window: above_sma<long_sma_window>, distance_sma<...>, vix_change_<n>d, rel_strength_<n>d, spy_momentum_<n>d,
     # spy_rsi_<n>, correlation_spy_<n>d, yield_curve_change_<n>d, us_10y_change_<n>d, dxy_change_<n>d. The intraday column names are a fixed list.
-    market_structure: {put_call_window: 10, put_call_min_periods: 5, term_fast: 5, term_slow: 60, skew_window: 20, skew_min_periods: 10, divergence_short: 5, divergence_long: 60, long_sma_window: 200, long_sma_min_periods: 100, range_fast: 5, range_slow: 20}
-    cross_asset: {vix_change_short: 5, vix_change_long: 20, vix_z_window: 60, vix_z_min_periods: 20, vix_term_fast: 5, vix_term_slow: 20, rel_short: 5, rel_mid: 20, rel_long: 60, spy_momentum_days: 10, spy_rsi_period: 14, corr_window: 20, corr_min_periods: 10, min_context_rows: 20}
-    macro: {change_days: 20, dxy_change_short: 5, dxy_change_long: 20, dxy_center: 100.0, dxy_scale: 20.0}
-    fractal: {hurst_short_window: 60, hurst_long_window: 180, hurst_min_len: 50, psd_min_rows: 60, min_rows: 50, mfdfa_min_returns: 500}
-    intraday: {hour_bars: 12, rsi_period: 7, atr_period: 14, closing_bars: 3, min_bars: 20, session_min_rows: 10, load_buffer_days: 10, session_min_bars: 3, hurst_min_bars: 78, scale_spread_min_bars: 200, wavelet_min_bars: 40, psd_min_bars: 100, mfdfa_min_returns: 500}
+    market_structure:
+      put_call_window: 10
+      put_call_min_periods: 5
+      term_fast: 5
+      term_slow: 60
+      skew_window: 20
+      skew_min_periods: 10
+      divergence_short: 5
+      divergence_long: 60
+      long_sma_window: 200
+      long_sma_min_periods: 100
+      range_fast: 5
+      range_slow: 20
+      use:
+        above_sma_long: true  # above_sma200
+        distance_sma_long: true  # distance_sma200
+        put_call_proxy: false  # computed in the frame, not a model input unless you switch it on
+        vix_term_structure: false  # computed in the frame, not a model input unless you switch it on
+        skew_proxy: false  # computed in the frame, not a model input unless you switch it on
+        momentum_divergence: false  # computed in the frame, not a model input unless you switch it on
+        range_compression: false  # computed in the frame, not a model input unless you switch it on
+    price_action:
+      use:
+        daily_return: true
+        gap: true
+        body_size: true
+        upper_wick: true
+        lower_wick: true
+        consecutive_up: true
+        consecutive_down: true
+    multi_timeframe:
+      weekly_close_window: 5
+      weekly_trend_window: 4
+      weekly_trend_shift: 5
+      weekly_rsi_period: 14
+      weekly_momentum_period: 25
+      use:
+        weekly_trend_aligned: true
+        weekly_rsi: true
+        weekly_momentum: true
+        volume_confirmation: true
+    vol_regime:
+      fast: 5
+      slow: 60
+      iv_rank_lookback: 252
+      iv_rank_min_periods: 20
+      vol_trend_period: 5
+      vol_of_vol_window: 20
+      use:
+        iv_rank: true
+        vol_ratio: true
+        vol_trend: true
+        vol_of_vol: true
+        vol_regime_expanding: true
+        vol_mean_reversion_signal: true
+    cross_asset:
+      vix_change_short: 5
+      vix_change_long: 20
+      vix_z_window: 60
+      vix_z_min_periods: 20
+      vix_term_fast: 5
+      vix_term_slow: 20
+      rel_short: 5
+      rel_mid: 20
+      rel_long: 60
+      spy_momentum_days: 10
+      spy_rsi_period: 14
+      corr_window: 20
+      corr_min_periods: 10
+      min_context_rows: 20
+      use:
+        vix_level: true
+        vix_change_short: true  # vix_change_5d
+        vix_change_long: true  # vix_change_20d
+        vix_zscore: true
+        vix_term_spread: true
+        rel_short: true  # rel_strength_5d
+        rel_mid: true  # rel_strength_20d
+        rel_long: true  # rel_strength_60d
+        spy_momentum: true  # spy_momentum_10d
+        spy_rsi: true  # spy_rsi_14
+        corr_spy: true  # correlation_spy_20d
+    macro:
+      change_days: 20
+      dxy_change_short: 5
+      dxy_change_long: 20
+      dxy_center: 100.0
+      dxy_scale: 20.0
+      use:
+        us_2y_yield_level: true
+        us_10y_yield_level: true
+        yield_curve_spread: true
+        yield_curve_inverted: true
+        yield_curve_change: true  # yield_curve_change_20d
+        dxy_level_norm: true
+        dxy_change_short: true  # dxy_change_5d
+        dxy_change_long: true  # dxy_change_20d
+        us10y_change: true  # us_10y_change_20d
+    seasonality:
+      use:
+        day_of_week: true
+        month_of_year: true
+    fractal:
+      hurst_short_window: 60
+      hurst_long_window: 180
+      hurst_min_len: 50
+      psd_min_rows: 60
+      min_rows: 50
+      mfdfa_min_returns: 500
+      use:
+        hurst_wavelet: true
+        hurst_fit_r2: true
+        psd_beta: true
+        psd_fit_r2: true
+        hurst_psd_divergence: true
+        hurst_short: true
+        hurst_long: true
+        hurst_scale_spread: true
+        multifractal_width: true
+        multifractal_asymmetry: true
+    intraday:
+      hour_bars: 12
+      rsi_period: 7
+      atr_period: 14
+      closing_bars: 3
+      min_bars: 20
+      session_min_rows: 10
+      load_buffer_days: 10
+      session_min_bars: 3
+      hurst_min_bars: 78
+      scale_spread_min_bars: 200
+      wavelet_min_bars: 40
+      psd_min_bars: 100
+      mfdfa_min_returns: 500
+      use:
+        intraday_vwap_position: true
+        intraday_rsi: true
+        intraday_momentum_1h: true
+        intraday_atr_pct: true
+        intraday_vol_ratio: true
+        intraday_range_compression: true
+        hurst_wavelet_intraday: true
+        hurst_scale_spread_intraday: true
+        wavelet_L3_energy: true
+        wavelet_L4_energy: true
+        wavelet_L5_energy: true
+        psd_beta_intraday: true
+        mfdfa_width_intraday: true
+        session_vwap_position: true
+        session_vwap_q1: true
+        session_vwap_q2: true
+        session_vwap_q3: true
+        session_high_timing: true
+        session_low_timing: true
+        session_volume_front_load: true
+        session_volume_shape: true
+        power_hour_momentum: true
+        power_hour_vol_accel: true
+        power_hour_vwap_cross: true
+        closing_imbalance: true
+        closing_range_position: true
 
 # W69: regime classification thresholds (were literals in ml/regime.py).
 regime:

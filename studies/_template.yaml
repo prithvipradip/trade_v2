@@ -24,6 +24,15 @@ settings: {}
 #  backtest:
 #    max_concurrent_positions: 1
 
+# W98: choose the model's features. `ml.features.<group>.use` holds one true/false switch per feature (config.yaml lists them all);
+# a study writes only the difference, and a window sits in the same group:
+#  ml:
+#    features:
+#      fractal: {use: {hurst_psd_divergence: false}}        # drop a feature from the model inputs
+#      market_structure: {use: {skew_proxy: true}}          # try a computed-but-unused one
+#      momentum: {rsi_long: 21}                             # change a window (rsi_14 becomes rsi_21)
+# Any switch or window that differs from config.yaml changes the feature-spec hash (the run record shows it and the feature_list).
+
 # Per-dimension overrides of the Optuna search ranges ({strategy: {dimension: [low, high]}}). Defaults live in
 # src/ait/optimization/param_spaces.py; an override is validated (known dimension, low < high, hard limits).
 search_space: {}

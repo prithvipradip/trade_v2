@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 import yaml
 from datetime import date
@@ -17,6 +17,7 @@ from datetime import date
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
+from ait.config.feature_names import DEFAULT_USE, use_switches
 from ait.utils.cadence import QUOTE_STALENESS_BUDGET_SECONDS
 
 
@@ -1497,9 +1498,38 @@ def _ordered(label: str, **named: int) -> None:
                          + ", ".join(f"{k}={v}" for k, v in named.items()))
 
 
-class MomentumWindows(_StrictModel):
+def _use_field(group: str):
+    """W98: the ``use`` switch map of a feature group; the default is the catalogue's (every feature on, except the
+    columns the code computes but no model used before W98)."""
+    return Field(default_factory=lambda: dict(DEFAULT_USE[group]),
+                 description=f"W98: one true/false switch per {group} feature; true = the column is a model input "
+                             f"(direction, range and vol-magnitude models and the tuner). The column is still computed "
+                             f"either way. Keys are the catalogue names in ait/config/feature_names.py (a window-bearing "
+                             f"column is keyed by its role, e.g. rsi_long for rsi_14, so a window change never renames a "
+                             f"switch); an unknown key is a startup error and a missing one takes its default.")
+
+
+class _UseGroup(_StrictModel):
+    """W98: a feature group of ``ml.features``: its windows (declared by the subclass) plus the ``use`` switches."""
+
+    GROUP: ClassVar[str]
+
+    @field_validator("use", check_fields=False)
+    @classmethod
+    def _check_use(cls, v: dict[str, bool]) -> dict[str, bool]:
+        known = DEFAULT_USE[cls.GROUP]
+        unknown = sorted(set(v) - set(known))
+        if unknown:
+            raise ValueError(f"features.{cls.GROUP}.use: unknown feature(s) {unknown}; valid names: {list(known)}")
+        return {**known, **v}                      # a missing key takes its default (a study may list only a difference)
+
+
+class MomentumWindows(_UseGroup):
     """W88d: windows of the momentum features (RSI, MACD, rate of change). A window that appears in a column NAME
     (``rsi_14``, ``roc_5``) renames that column when changed (``rsi_10``)."""
+
+    GROUP: ClassVar[str] = "momentum"
+    use: dict[str, bool] = _use_field("momentum")
 
     rsi_long: int = Field(default=14, ge=2, le=200, description="Long RSI period (column rsi_<n>).")
     rsi_short: int = Field(default=7, ge=2, le=200, description="Short RSI period (column rsi_<n>).")
@@ -1518,8 +1548,11 @@ class MomentumWindows(_StrictModel):
         return self
 
 
-class VolatilityWindows(_StrictModel):
+class VolatilityWindows(_UseGroup):
     """W88d: windows of the volatility features (ATR, Bollinger bands, realized volatility)."""
+
+    GROUP: ClassVar[str] = "volatility"
+    use: dict[str, bool] = _use_field("volatility")
 
     atr_window: int = Field(default=14, ge=2, le=200, description="ATR window (raw column atr_<n>; atr_pct divides it by price).")
     bb_window: int = Field(default=20, ge=2, le=400, description="Bollinger band window.")
@@ -1533,8 +1566,11 @@ class VolatilityWindows(_StrictModel):
         return self
 
 
-class VolumeWindows(_StrictModel):
+class VolumeWindows(_UseGroup):
     """W88d: windows of the volume features."""
+
+    GROUP: ClassVar[str] = "volume"
+    use: dict[str, bool] = _use_field("volume")
 
     volume_avg_window: int = Field(default=20, ge=2, le=400,
         description="Average-volume window (column volume_sma_<n>_ratio; the slow side of volume_trend; the weekly "
@@ -1548,8 +1584,11 @@ class VolumeWindows(_StrictModel):
         return self
 
 
-class TrendWindows(_StrictModel):
+class TrendWindows(_UseGroup):
     """W88d: windows of the trend features (simple moving averages and their slopes)."""
+
+    GROUP: ClassVar[str] = "trend"
+    use: dict[str, bool] = _use_field("trend")
 
     sma_fast: int = Field(default=10, ge=2, le=400, description="Fast SMA (columns sma_<n>, sma_<n>_slope, sma_<n>_<m>_cross).")
     sma_mid: int = Field(default=20, ge=3, le=400, description="Middle SMA (columns sma_<n>, price_vs_sma_<n>; the weekly daily-trend test).")
@@ -1562,8 +1601,11 @@ class TrendWindows(_StrictModel):
         return self
 
 
-class MultiTimeframeWindows(_StrictModel):
+class MultiTimeframeWindows(_UseGroup):
     """W88d: windows of the simulated-weekly features."""
+
+    GROUP: ClassVar[str] = "multi_timeframe"
+    use: dict[str, bool] = _use_field("multi_timeframe")
 
     weekly_close_window: int = Field(default=5, ge=2, le=60, description="Daily bars averaged into a simulated weekly close.")
     weekly_trend_window: int = Field(default=4, ge=2, le=60, description="Simulated weeks averaged for the weekly trend.")
@@ -1572,8 +1614,11 @@ class MultiTimeframeWindows(_StrictModel):
     weekly_momentum_period: int = Field(default=25, ge=2, le=200, description="Rate-of-change period of weekly_momentum.")
 
 
-class VolRegimeWindows(_StrictModel):
+class VolRegimeWindows(_UseGroup):
     """W88d: windows of the realized-volatility regime ('IV proxy') features."""
+
+    GROUP: ClassVar[str] = "vol_regime"
+    use: dict[str, bool] = _use_field("vol_regime")
 
     fast: int = Field(default=5, ge=2, le=100, description="Fast realized-vol window of vol_regime_expanding.")
     slow: int = Field(default=60, ge=5, le=400, description="Slow realized-vol window (vol_ratio, the mean-reversion signal).")
@@ -1596,10 +1641,13 @@ def _min_within(label: str, **pairs: tuple[int, int]) -> None:
             raise ValueError(f"features.{label}: {name} min_periods ({mn}) cannot exceed its window ({win})")
 
 
-class MarketStructureWindows(_StrictModel):
+class MarketStructureWindows(_UseGroup):
     """W97: windows of the market-structure features (put/call proxy, vol term structure, skew proxy, momentum divergence,
     the long moving average, range compression). Of these only ``above_sma<n>`` / ``distance_sma<n>`` are model inputs and
     carry the long window in their name; the other columns stay in the frame under fixed names. Defaults = the pre-W97 literals."""
+
+    GROUP: ClassVar[str] = "market_structure"
+    use: dict[str, bool] = _use_field("market_structure")
 
     put_call_window: int = Field(default=10, ge=2, le=200,
         description="W97: days the up-volume and down-volume are summed over for the put/call proxy.")
@@ -1633,10 +1681,13 @@ class MarketStructureWindows(_StrictModel):
         return self
 
 
-class CrossAssetWindows(_StrictModel):
+class CrossAssetWindows(_UseGroup):
     """W97: windows of the cross-asset features (VIX level changes and z-score, relative strength against SPY, SPY momentum
     and RSI, correlation with SPY). A window that appears in a column name renames the column when changed
     (``vix_change_5d`` -> ``vix_change_3d``). Defaults = the pre-W97 literals."""
+
+    GROUP: ClassVar[str] = "cross_asset"
+    use: dict[str, bool] = _use_field("cross_asset")
 
     vix_change_short: int = Field(default=5, ge=1, le=100, description="W97: short VIX change horizon (column vix_change_<n>d).")
     vix_change_long: int = Field(default=20, ge=2, le=400, description="W97: long VIX change horizon (column vix_change_<n>d).")
@@ -1664,8 +1715,11 @@ class CrossAssetWindows(_StrictModel):
         return self
 
 
-class MacroWindows(_StrictModel):
+class MacroWindows(_UseGroup):
     """W97: windows of the macro features (FRED yield curve and the dollar index). Defaults = the pre-W97 literals."""
+
+    GROUP: ClassVar[str] = "macro"
+    use: dict[str, bool] = _use_field("macro")
 
     change_days: int = Field(default=20, ge=1, le=400,
         description="W97: horizon of the yield-curve and 10-year-yield changes (columns yield_curve_change_<n>d, us_10y_change_<n>d).")
@@ -1682,10 +1736,13 @@ class MacroWindows(_StrictModel):
         return self
 
 
-class FractalWindows(_StrictModel):
+class FractalWindows(_UseGroup):
     """W97: windows and minimum lengths of the daily fractal group (wavelet Hurst, power-spectrum slope, multi-scale Hurst,
     multifractal width). The column names do not embed a window. The wavelet family, the MFDFA scales and the clip bounds
     stay fixed algorithm constants. Defaults = the pre-W97 literals."""
+
+    GROUP: ClassVar[str] = "fractal"
+    use: dict[str, bool] = _use_field("fractal")
 
     hurst_short_window: int = Field(default=60, ge=16, le=1000,
         description="W97: bars of the short Hurst estimate (hurst_short); with fewer bars than the long window only this one is reported.")
@@ -1705,10 +1762,13 @@ class FractalWindows(_StrictModel):
         return self
 
 
-class IntradayWindows(_StrictModel):
+class IntradayWindows(_UseGroup):
     """W97: bar counts of the intraday (VLMC) features computed from 5-minute bars. The 26 column names are a FIXED list and
     do not follow these numbers (``intraday_momentum_1h`` keeps its name and then means ``hour_bars`` bars). Defaults = the
     pre-W97 literals."""
+
+    GROUP: ClassVar[str] = "intraday"
+    use: dict[str, bool] = _use_field("intraday")
 
     hour_bars: int = Field(default=12, ge=2, le=78,
         description="W97: bars that make 'an hour' (12 five-minute bars): the hourly momentum, the recent-range window and the power-hour window.")
@@ -1732,6 +1792,21 @@ class IntradayWindows(_StrictModel):
         description="W97: returns (about seven sessions) the intraday multifractal width needs.")
 
 
+class PriceActionGroup(_UseGroup):
+    """W98: the price-action features (daily return, gap, candle body and wicks, consecutive up / down days). They have no
+    window, so the group holds only the ``use`` switches."""
+
+    GROUP: ClassVar[str] = "price_action"
+    use: dict[str, bool] = _use_field("price_action")
+
+
+class SeasonalityGroup(_UseGroup):
+    """W98: the seasonality features (day of week, month of year). No window: the group holds only the ``use`` switches."""
+
+    GROUP: ClassVar[str] = "seasonality"
+    use: dict[str, bool] = _use_field("seasonality")
+
+
 class FeaturesConfig(_StrictModel):
     """W88d: the indicator windows of the core feature groups (``ml/features.py``).
 
@@ -1743,7 +1818,12 @@ class FeaturesConfig(_StrictModel):
     their windows are here too, and the spec hash covers them ONLY when one differs from its default, so at the default
     values the hash (and every saved model) is unchanged. Not here on purpose: clip bounds, scales, neutral values, the
     wavelet family and the MFDFA scales (algorithm constants), the seasonality encoding, and the 252-day annualisation
-    constant."""
+    constant.
+
+    W98: every group also holds ``use``, one true/false switch per feature the group produces (``price_action`` and
+    ``seasonality`` hold only that), so this section lists EVERY feature the models can use. A study switches one off or
+    on; the switches enter the spec hash ONLY when one differs from its default (like the W97 windows), so at the defaults
+    the hash and every saved model are unchanged."""
 
     momentum: MomentumWindows = Field(default_factory=MomentumWindows)
     volatility: VolatilityWindows = Field(default_factory=VolatilityWindows)
@@ -1757,6 +1837,10 @@ class FeaturesConfig(_StrictModel):
     macro: MacroWindows = Field(default_factory=MacroWindows)
     fractal: FractalWindows = Field(default_factory=FractalWindows)
     intraday: IntradayWindows = Field(default_factory=IntradayWindows)
+    # W98: the groups that have no window (switches only). With the switches inside every group above, ``ml.features`` lists
+    # every feature the models can use; ``use`` is explained at ``_use_field``.
+    price_action: PriceActionGroup = Field(default_factory=PriceActionGroup)
+    seasonality: SeasonalityGroup = Field(default_factory=SeasonalityGroup)
 
     @model_validator(mode="after")
     def _check(self) -> "FeaturesConfig":
@@ -1764,7 +1848,10 @@ class FeaturesConfig(_StrictModel):
                  rv_long=self.volatility.rv_long, slow=self.vol_regime.slow)
         from ait.config.feature_names import derive_names, validate_names     # leaf: no ait.ml import at load time
         validate_names(derive_names(self))
+        if not any(on for g, use in use_switches(self).items() if g != "intraday" for on in use.values()):
+            raise ValueError("features: every daily feature is switched off (ml.features.<group>.use); the models need inputs")
         return self
+
 
 
 class MetaLabelNeutralsConfig(_StrictModel):

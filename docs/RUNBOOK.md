@@ -265,6 +265,18 @@ old `entry_signals` snapshots keep the old names, so the meta-labeler's live tra
 and `vol_regime.fast < rv_short < rv_long < vol_regime.slow`; derived names must be distinct and must not collide with a fixed column. Very short RSI periods make RSI undefined whenever a window has no down days, and those rows are dropped; `iv_rank_min_periods`
 only matters once it exceeds the warm-up that other windows already drop.
 
+### Feature switches (W98; shared by live and research)
+
+Next to its windows, every `ml.features` group in `config.yaml` has a `use:` block: one `true`/`false` switch per feature (the complete list of what the models can use; the comment shows the column). `false` leaves the column out of the
+inputs of the direction, range and vol-magnitude models and of the tuner; the column is still computed (the meta-labeler and the gates read some), so the warm-up does not shorten. Five columns the code computes but no model used
+(`put_call_proxy`, `vix_term_structure`, `skew_proxy`, `momentum_divergence`, `range_compression`) ship `false`. **At the shipped switches nothing changes**: the model list and its order are today's and the spec hash is still `6e0e3f8f922f6b88`.
+
+* **Live:** flipping a switch in `config.yaml` is a live change and the operator's call. The hash changes, so after the restart the direction, range and vol-magnitude models (and the tuner) are refused and retrained (`model_feature_spec_mismatch`
+  at CRITICAL on the first load, one retrain). Do it outside market hours; run `smoke_deploy.py` first; the rollback is reverting the line (then one more retrain). The meta-labeler's inputs do not change.
+* **Research:** never edit `config.yaml` for an experiment. A study (or `config_research.yaml`) writes only the difference, e.g. `fractal: {use: {hurst_psd_divergence: false}}`. The parity manifest warns (`ml_features`) and the run record
+  stores the resolved `feature_list` and the hash. How to drop, add and try features, and how to add a brand-new one: RESEARCH_GUIDE "Choosing the model's features".
+* A typo or a feature under the wrong group is a startup error that lists the valid names; switching every daily feature off is refused.
+
 ## Risk-knob ceilings and the links between them (W86)
 
 Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails

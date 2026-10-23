@@ -131,6 +131,9 @@ folds, the class-balance guards and the retrain's trials, seed and rollback marg
 Model hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`) are shared with live, so they are listed in
 `config.yaml`; research differs only if you override them. Details: RUNBOOK "Research tunables" and "Model hyperparameters".
 
+Which features the models use is also set in `config.yaml`: `ml.features.<group>.use` holds one true/false switch per feature, next to the group's windows
+(W98; [Choosing the model's features](#choosing-the-models-features-w98)). It is shared with live; research differs only through a study or the overlay.
+
 ### Where the history and row-count minimums are set
 
 Until W95 six research minimums sat in the code as bare numbers (60, 252, 100). They are settings now, in `config_research.yaml`,
@@ -244,6 +247,9 @@ records the values it was trained with, and loading a model trained under other 
 (`rsi_14` → `rsi_21`), every saved model records a hash of the windows, and a model trained under other windows is refused and retrained. RUNBOOK "Feature windows" lists what is in
 scope and what stays fixed. Since W97 that includes the cross-asset, macro, market-structure, fractal and intraday windows: see "The remaining feature windows".
 
+**Can I choose which features the models use, or add one?** Yes: each `ml.features` group has a `use:` switch per feature, and a study can turn any of them off or on. See
+"Choosing the model's features" below. Adding a brand-new feature also needs code (a few lines).
+
 **Could a research run overwrite the live model?** No. Window models are throw-away (`persist_artifacts=False`) or go to `models/research/`.
 
 ### The remaining feature windows (W97)
@@ -268,6 +274,53 @@ old `entry_signals` snapshots keep the old names. A test pins the default hash a
 **Minimums versus windows.** A `*_min_periods` only changes the first rows (they are dropped by the warm-up), so you see it at the start of a frame, not at its end. `long_sma_min_periods` can change how many rows a frame keeps.
 
 **The walk-forward context.** The out-of-sample context (`backtest.walkforward_tuning.oos_feature_context_bars`) must cover the longest window; the check reads `FeatureSpec.longest_lookback()` (the longest of the IV-rank range, the long SMA, the long Hurst window, the slow SMA, the slow vol window, the long relative-strength, VIX z-score, vol term and momentum-divergence windows): 252 by default.
+
+### Choosing the model's features (W98)
+
+**Where is the list of features?** In `config.yaml`, under `ml.features`. Every group (`momentum`, `volatility`, `volume`, `trend`, `market_structure`, `price_action`, `multi_timeframe`,
+`vol_regime`, `cross_asset`, `macro`, `seasonality`, `fractal`, `intraday`) holds its windows (if it has any) and a `use:` block with one `true`/`false` line per feature it produces. The comment after a
+line shows the column at the current windows (`rsi_long: true  # rsi_14`). Together the blocks are the complete list of what the models can use: 80 daily columns (75 on by default) plus the 26 intraday
+(VLMC) columns, which are used when 5-minute data exists. `python -c "from ait.ml.features import FeatureEngine; print(FeatureEngine().get_feature_names(include_vlmc=True))"` prints the
+list in effect. Every run record stores it as `feature_list`, next to `feature_spec_hash`.
+
+**What do true and false mean?** `true` = the column is an input of the direction, range and vol-magnitude models and of the hyperparameter tuner. `false` = it is left out of those inputs.
+The column is **still computed** either way: the meta-labeler, the entry gates and the dashboards read some columns from the same frame. Two consequences: switching a feature off does not
+shorten the warm-up (the 252 rows `iv_rank` needs are still needed), and the meta-labeler's own 20 inputs are not affected.
+
+**How do I drop a feature for one study?** Write the one line that differs in a study file ([section 9](#9-studies-and-run-records)):
+
+```yaml
+# studies/no_psd_divergence.yaml
+name: no_psd_divergence
+question: Does the model do better without hurst_psd_divergence?
+rule: exploratory
+settings:
+  ml:
+    features:
+      fractal: {use: {hurst_psd_divergence: false}}
+```
+
+**How do I try a feature the models do not use yet?** Five columns are computed today but were never model inputs (`put_call_proxy`, `vix_term_structure`, `skew_proxy`, `momentum_divergence`,
+`range_compression`, all in `market_structure`). They ship as `false`; `market_structure: {use: {skew_proxy: true}}` in a study adds `skew_proxy` to the inputs.
+
+**How do I change a feature's window?** The window is a setting of the same group (`momentum: {rsi_long: 21}`), so a study can change a window and a switch together. A window is shared by every
+feature that reads it (`sma_mid` feeds `price_vs_sma_20`, `sma_20_slope` and `sma_10_20_cross`), which is why it is a group setting and not a field of one feature. A column that carries its window in its name is
+renamed (`rsi_14` → `rsi_21`) and its switch keeps its key (`rsi_long`), so the switch survives a window change. To have the same indicator at two windows (RSI 7 and 21 as two separate inputs), add a new feature (below).
+
+**How do I add a brand-new feature?** A feature needs code, because YAML cannot compute anything:
+1. Compute the column in the matching `_add_*` method of `src/ait/ml/features.py`.
+2. Add its name to `CATALOGUE` in `src/ait/config/feature_names.py`, in the group it belongs to, **at the position you want it in the model's column order**, and, so that it ships off, to that group's entry in `OFF_BY_DEFAULT`. (A name is a role: if the column follows a window, give it a role key in `derive_names` and `_WINDOW_ROLES` like `rsi_long`.)
+3. Add its line to the group's `use:` block in `config.yaml` as `false`. `tests/test_w98_feature_switches.py` fails until you do (the file must list everything the code produces).
+4. A study switches it on: `use: {my_feature: true}`. Run the fast lane. The default-list and default-hash tests must still pass, which proves live is unchanged. If the new column adds NaN
+   rows to the frame (a longer warm-up), the engine drops them from every frame, so that is a live change: treat it like any other and ask the operator.
+
+**Why switches and not a list I comment lines out of?** A study or the overlay is laid over `config.yaml`, and a list laid over a list replaces it. Dropping one feature would mean copying all ~100 names into the study, and the
+copy would silently miss any feature added later. Mappings merge key by key, so a study writes only the difference. Every feature is always listed in `config.yaml`, so a missing one is a visible mistake and not an
+ambiguous "excluded". An unknown key (a typo, or a feature under the wrong group) is a startup error that lists the valid names; switching every daily feature off is refused.
+
+**What happens when a switch differs from its default?** The feature-spec hash changes (switches enter it **only when they differ from the default**, like the W97 windows). Every saved model records the hash, and a model trained under other
+inputs is refused and retrained (`model_feature_spec_mismatch`). At the shipped defaults the hash is `6e0e3f8f922f6b88`, unchanged, so nothing is refused or retrained. The research engine drops a predictor whose hash differs
+from its own. The parity manifest warns (`ml_features`) when research differs from live.
 
 ### Drift detection (live; off by default)
 
@@ -432,6 +485,8 @@ search_space: {iron_condor: {wing_k: [1.0, 2.0]}}
 
 Run it with `python run_backtest.py --study-file studies/<name>.yaml` (also `run_optimizer.py`). Commit the file first and never edit it afterwards.
 
+A study can also choose the model's features and windows (`ml.features`): see [Choosing the model's features](#choosing-the-models-features-w98).
+
 **Does every study need a PLAN.md entry?** No. `rule: exploratory` needs only the file and its run record, and its results may not be quoted as evidence.
 A pre-registered study (one whose result could change a gate, a live parameter or a go-live criterion) gets an "AS PLANNED" entry with its pass rule
 **before** the run, and its `rule:` names that PLAN heading. The run refuses to start if the heading does not exist.
@@ -492,6 +547,10 @@ RUNBOOK sections "One-sided entry gates" and "Research-vs-reality parity replay"
 | Optimize per window | `python run_backtest.py --optimize-per-window --optimize-n-trials 50` |
 | Run a recorded study | `python run_backtest.py --study-file studies/<name>.yaml` |
 | Run a standalone search | `python run_optimizer.py --n-trials 100 --objective composite` |
+| Drop a feature for a study | a study with `settings: {ml: {features: {<group>: {use: {<feature>: false}}}}}` (list: `config.yaml` `ml.features`) |
+| Try a computed-but-unused feature (e.g. `skew_proxy`) | the same, with `true` |
+| Change a feature window | a study with `settings: {ml: {features: {momentum: {rsi_long: 21}}}}` |
+| Add a brand-new feature | code in `ml/features.py` + `CATALOGUE` in `config/feature_names.py` + a `false` line in `config.yaml`; see [Choosing the model's features](#choosing-the-models-features-w98) |
 | See every value and where it comes from | `python scripts/show_research_config.py --section backtest` |
 | Test a gate | `python scripts/gate_parity_ab.py --symbols QQQ` |
 | Refresh the data | `scripts/backfill_historical_data.py`, `backfill_intraday.py`, `backfill_dividends.py`, `backfill_option_history.py` |

@@ -144,6 +144,14 @@ def _feature_spec_hash(settings) -> str:
     return spec_from_config(getattr(getattr(settings, "ml", None), "features", None)).spec_hash()
 
 
+def _feature_list(settings) -> list[str]:
+    """W98: the model feature columns this run trained on (the ``ml.features.<group>.use`` switches applied; the 26
+    intraday columns are included when their switch is on). Recorded beside the hash so a run says WHICH features it used."""
+    from ait.ml.feature_spec import spec_from_config
+    from ait.config.feature_names import VLMC_NAMES
+    return spec_from_config(getattr(getattr(settings, "ml", None), "features", None)).feature_names(list(VLMC_NAMES))
+
+
 def seed_inventory(extra: dict | None = None, settings=None) -> dict:
     """The seeds that decide a research result. The ML estimators' seed is ``ml.hyperparams.random_state`` of the
     settings the run used (W88c; the schema default without settings); the Optuna seed is whatever the caller
@@ -179,6 +187,7 @@ def build_run_record(*, kind: str, name: str, settings, config_path: str | Path,
         "research_invariants": research_invariant_values(),     # W88a: fixed in code, not configurable
         # W88d: hash of the indicator windows this run computed features with (recorded in every model it trained)
         "feature_spec_hash": _feature_spec_hash(settings),
+        "feature_list": _feature_list(settings),       # W98: the resolved model columns (the use switches applied)
         # W88a: {dotted.key: [value, layer]} -- which layer decides each value (study > overlay > config.yaml > default)
         "settings_origin": ({k: list(v) for k, v in settings_origin.items()} if settings_origin else None),
         "data": data_fingerprint(db_path, prefix, list(symbols or []), as_of) if db_path else None,

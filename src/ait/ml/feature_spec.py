@@ -31,8 +31,11 @@ if TYPE_CHECKING:  # pragma: no cover
 from ait.config.feature_names import (  # noqa: F401 - re-exported: the names are part of this module's API
     _BASE_TEMPLATE,
     _META_TEMPLATE,
+    CATALOGUE,
+    DEFAULT_USE,
     FEATURE_SET_VERSION,
     derive_names,
+    use_switches,
     validate_names,
 )
 
@@ -42,13 +45,37 @@ from ait.config.feature_names import (  # noqa: F401 - re-exported: the names ar
 _W97_GROUPS = ("market_structure", "cross_asset", "macro", "fractal", "intraday")
 
 
+# W98: the groups that hold only ``use`` switches (no window); never part of the window dump.
+_W98_GROUPS = ("price_action", "seasonality")
+_W88D_GROUPS = ("momentum", "volatility", "volume", "trend", "multi_timeframe", "vol_regime")
+
+
+def _switch_changes(cfg: "FeaturesConfig") -> dict:
+    """W98: {group: {feature: switch}} for the ``use`` switches that differ from their default (empty at the defaults)."""
+    out: dict = {}
+    switches = use_switches(cfg)
+    for g, roles in CATALOGUE.items():
+        use, default = switches[g], DEFAULT_USE[g]
+        diff = {r: use[r] for r in roles if use.get(r, default[r]) != default[r]}
+        if diff:
+            out[g] = diff
+    return out
+
+
 def _hash(cfg: "FeaturesConfig") -> str:
-    features = cfg.model_dump(mode="json", exclude=set(_W97_GROUPS))
+    # W98: ``use`` is not part of the window dump (it would change the hash at the defaults); switches are added below,
+    # and only when one differs from its default, exactly like the W97 windows.
+    exclude: dict = {g: {"use"} for g in _W88D_GROUPS}
+    exclude.update({g: True for g in _W97_GROUPS + _W98_GROUPS})
+    features = cfg.model_dump(mode="json", exclude=exclude)
     payload: dict = {"version": FEATURE_SET_VERSION, "features": features}
-    changed = {g: getattr(cfg, g).model_dump(mode="json", exclude_defaults=True) for g in _W97_GROUPS}
+    changed = {g: getattr(cfg, g).model_dump(mode="json", exclude_defaults=True, exclude={"use"}) for g in _W97_GROUPS}
     changed = {g: v for g, v in changed.items() if v}
     if changed:
         payload["w97"] = changed
+    switches = _switch_changes(cfg)
+    if switches:
+        payload["w98"] = switches
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -64,9 +91,20 @@ class FeatureSpec:
         return cls(cfg=cfg, names=derive_names(cfg))
 
     def feature_names(self, vlmc_names: list[str] | None = None) -> list[str]:
-        """The ordered model feature list (``vlmc_names`` appended when given)."""
-        base = [n.format_map(self.names) for n in _BASE_TEMPLATE]
-        return base + list(vlmc_names) if vlmc_names else base
+        """The ordered model feature list (``vlmc_names`` appended when given). W98: a feature whose ``ml.features.<group>.use``
+        switch is false is left out; this is the ONE place the switches are applied (every model's training columns come
+        from here). At the default switches the list is exactly ``_BASE_TEMPLATE`` filled with the window-bearing names."""
+        base = []
+        switches = use_switches(self.cfg)
+        for g, roles in CATALOGUE.items():
+            if g == "intraday":
+                continue
+            use, default = switches[g], DEFAULT_USE[g]
+            base.extend(self.names.get(r, r) for r in roles if use.get(r, default[r]))
+        if not vlmc_names:
+            return base
+        iuse = switches["intraday"]
+        return base + [n for n in vlmc_names if iuse.get(n, True)]
 
     def meta_feature_names(self) -> list[str]:
         return [n.format_map(self.names) for n in _META_TEMPLATE]

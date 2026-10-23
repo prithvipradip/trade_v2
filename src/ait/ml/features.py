@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pywt
 
+from ait.config.feature_names import VLMC_NAMES
 from ait.ml.feature_spec import FeatureSpec, default_feature_spec
 from ait.utils.logging import get_logger
 
@@ -443,21 +444,7 @@ class FeatureEngine:
 
     # The 26 VLMC / intraday feature names produced by compute_intraday_features().
     # Returned by get_feature_names() when an intraday_store was used during compute().
-    VLMC_FEATURE_NAMES: list[str] = [
-        # Original 6 intraday features
-        "intraday_vwap_position", "intraday_rsi", "intraday_momentum_1h",
-        "intraday_atr_pct", "intraday_vol_ratio", "intraday_range_compression",
-        # Phase 6a: intraday fractal (7 features)
-        "hurst_wavelet_intraday", "hurst_scale_spread_intraday",
-        "wavelet_L3_energy", "wavelet_L4_energy", "wavelet_L5_energy",
-        "psd_beta_intraday", "mfdfa_width_intraday",
-        # Phase 6b: VLMC session structure (13 features)
-        "session_vwap_position", "session_vwap_q1", "session_vwap_q2", "session_vwap_q3",
-        "session_high_timing", "session_low_timing",
-        "session_volume_front_load", "session_volume_shape",
-        "power_hour_momentum", "power_hour_vol_accel", "power_hour_vwap_cross",
-        "closing_imbalance", "closing_range_position",
-    ]
+    VLMC_FEATURE_NAMES: list[str] = list(VLMC_NAMES)     # W98: the list lives in config/feature_names.py
 
     def get_feature_names(self, include_vlmc: bool = False) -> list[str]:
         """Get list of all feature column names (excluding OHLCV).

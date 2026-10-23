@@ -145,10 +145,12 @@ class TestDefaultsAreTheOldBehaviour:
     def test_the_loaded_config_lists_every_setting_at_its_default(self):
         live = yaml.safe_load((ROOT / "config.yaml").read_text())["ml"]["features"]
         loaded = load_settings().ml.features
+        def windows(d):          # W98: every group also holds its ``use`` switches (tests/test_w98_feature_switches.py)
+            return {k: v for k, v in d.items() if k != "use"}
         for grp, fields in DEFAULTS.items():
-            assert live[grp] == fields, grp
-            assert loaded.model_dump()[grp] == fields, grp
-            assert FeaturesConfig().model_dump()[grp] == fields, grp
+            assert windows(live[grp]) == fields, grp
+            assert windows(loaded.model_dump()[grp]) == fields, grp
+            assert windows(FeaturesConfig().model_dump()[grp]) == fields, grp
 
     def test_the_overlay_does_not_copy_shared_feature_keys(self):
         research = yaml.safe_load((ROOT / "config_research.yaml").read_text())
@@ -210,7 +212,7 @@ class TestSchema:
         assert len(ALL_FIELDS) == 50
         for grp, fields in DEFAULTS.items():
             model = type(getattr(FeaturesConfig(), grp))
-            assert set(model.model_fields) == set(fields), grp
+            assert set(model.model_fields) - {"use"} == set(fields), grp          # W98: ``use`` is the switch map, not a window
             for f in fields:
                 assert "W97" in (model.model_fields[f].description or ""), (grp, f)
 
