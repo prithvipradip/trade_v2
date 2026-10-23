@@ -45,7 +45,7 @@ from ait.learning.adaptor import AdaptationLimits
 from ait.learning.engine import LearningEngine
 from ait.ml.ensemble import DirectionPredictor
 from ait.ml.meta_label import MetaLabeler, live_technical_features
-from ait.ml.regime import RegimeDetector
+from ait.ml.regime import RegimeDetector, regime_forces_neutral
 from ait.ml.trainer import ModelTrainer
 from ait.monitoring.analytics import TradeAnalytics
 from ait.monitoring.watchdog import Watchdog
@@ -2233,11 +2233,11 @@ class TradingOrchestrator:
         # Map ML direction to signal direction
         direction = prediction.direction
 
-        # Override direction if regime strongly disagrees
-        if regime.confidence > self._settings.ml.regime_override_confidence:  # W69: was 0.8
-            from ait.ml.regime import MarketRegime
-            if regime.regime == MarketRegime.HIGH_VOLATILITY:
-                direction = SignalDirection.NEUTRAL
+        # Override direction if regime strongly disagrees. W69: threshold is ml.regime_override_confidence (was 0.8).
+        # W93: at-or-above (was a strict ">"), as a pure function: the classifier's high-vol floor is exactly 0.80, so ">"
+        # never fired for a VIX-only trigger (see ml.regime.regime_forces_neutral).
+        if regime_forces_neutral(regime, self._settings.ml.regime_override_confidence):
+            direction = SignalDirection.NEUTRAL
 
         # Check earnings proximity — skip if too close to earnings
         if self._earnings.is_near_earnings(symbol):

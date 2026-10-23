@@ -276,11 +276,21 @@ class TestResearchKnobs:
         assert (w.spread_base, w.spread_cap, w.max_entry_vol_annual, w.delta_iv_scale,
                 w.trailing_stop_pct, w.breakeven_trigger_pct) == (0.06, 0.2, 0.7, 0.5, 0.3, 0.35)
 
-    def test_explicit_stop_and_target_stay_harness_defaults(self, clean_contract):
-        """Decision D (registered, NOT changed): the bare engine keeps 0.50 / 1.00 even
-        though config's research baselines are 0.35 / 0.50."""
+    def test_stop_and_target_follow_the_config(self, clean_contract):
+        """Decision D, CLOSED in W93 (it was 'registered, NOT changed': the bare engine kept 0.50 / 1.00 although the config
+        baselines are 0.35 / 0.50). The bare engine now resolves backtest.stop_loss_pct / profit_target_pct like every sibling
+        knob; an explicit argument still wins."""
         bt = self._bt(backtest=BacktestConfig(stop_loss_pct=0.35, profit_target_pct=0.5))
-        assert (bt._stop_loss_pct, bt._profit_target_pct) == (0.50, 1.00)
+        assert (bt._stop_loss_pct, bt._profit_target_pct) == (0.35, 0.50)
+        moved = self._bt(backtest=BacktestConfig(stop_loss_pct=0.21, profit_target_pct=0.66))
+        assert (moved._stop_loss_pct, moved._profit_target_pct) == (0.21, 0.66)
+        from ait.backtesting.engine import Backtester
+        idx = pd.bdate_range("2024-01-02", periods=60)
+        df = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                           "volume": 1_000_000, "implied_vol": 0.2}, index=idx)
+        explicit = Backtester(data=df, strategies=[IronCondor()], stop_loss_pct=0.50, profit_target_pct=1.00,
+                              settings=Settings(backtest=BacktestConfig(stop_loss_pct=0.21, profit_target_pct=0.66)))
+        assert (explicit._stop_loss_pct, explicit._profit_target_pct) == (0.50, 1.00)
 
 
 # --------------------------------------------------------------------------- #

@@ -1688,11 +1688,12 @@ class MLConfig(_StrictModel):
                     "0.60 default sits above the shipped 0.50 with headroom. "
                     "Ignored entirely when gates are ON.")
     regime_override_confidence: float = Field(default=0.80, ge=0.50, le=0.99,
-        description="W69: a regime classification above this confidence that "
-                    "is HIGH_VOLATILITY overrides the ML direction to NEUTRAL "
-                    "at entry. Was a literal 0.8 in orchestrator (the R5 "
+        description="W69: a HIGH_VOLATILITY regime classification at or above "
+                    "this confidence overrides the ML direction to NEUTRAL "
+                    "at entry (W93: 'at or above'; it was a strict 'above'). Was a literal 0.8 in orchestrator (the R5 "
                     "classifier floors high-vol confidence at 0.80 so any "
-                    "VIX/vol trigger clears it — keep this at or below 0.80).")
+                    "VIX/vol trigger clears it — keep this at or below regime.high_vol_confidence_floor, 0.80). "
+                    "Iron condors ignore the direction, so this only matters for direction-sensitive strategies.")
     # --- Drift detection (ml/drift.py). W92: switchable, default OFF; every number explained. Guide: RESEARCH_GUIDE "Drift detection". ---
     drift_detection_enabled: bool = Field(default=False,
         description="W92: master switch of the live drift detector. OFF (default): it records nothing and always reports 'no "
@@ -1804,10 +1805,11 @@ class RegimeConfig(_StrictModel):
     trend_momentum_scale: float = Field(default=5.0, gt=0.0, le=10000.0,
         description="W92: ... multiplied by this and clamped to [-1, 1] (5 = a 20% return scores 1.0).")
     high_vol_confidence_floor: float = Field(default=0.80, ge=0.5, le=1.0,
-        description="W92: a HIGH_VOLATILITY classification reports a confidence of at least this. The live entry rule 'high-vol "
-                    "regime above ml.regime_override_confidence forces direction NEUTRAL' compares against it with a strict '>', "
-                    "so floor and ml.regime_override_confidence are a must-agree pair: at the shipped 0.80 / 0.80 only a day "
-                    "whose realized vol is above 40% reaches the override.")
+        description="W92: a HIGH_VOLATILITY classification reports a confidence of at least this. The live entry rule 'a high-vol "
+                    "regime at or above ml.regime_override_confidence forces direction NEUTRAL' compares against it, so floor and "
+                    "ml.regime_override_confidence are a must-agree pair: keep ml.regime_override_confidence at or below this floor, "
+                    "or a day triggered by VIX alone (which scores exactly the floor) never reaches the override. At the shipped "
+                    "0.80 / 0.80 it does (W93: the rule was a strict 'above' and did not).")
     high_vol_confidence_cap: float = Field(default=0.90, ge=0.5, le=1.0,
         description="W92: ... and at most this.")
     high_vol_confidence_vol_scale: float = Field(default=0.50, gt=0.0, le=5.0,

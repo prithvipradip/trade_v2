@@ -132,12 +132,17 @@ class TestRegime:
             0.0, 0.2, None, 0.5, 0.45)
         assert regime.value == "mean_reverting" and conf == pytest.approx(0.8)
 
-    def test_the_high_vol_floor_and_the_entry_gate_are_a_must_agree_pair(self):
-        """A VIX-triggered high-vol day with realized vol <= 40% scores exactly the floor (0.80); the live gate is a strict '>' 0.80."""
-        _, conf = self._detector()._classify(0.0, 0.25, 35.0, 0.5, 0.5)
-        assert conf == pytest.approx(0.80) and not conf > load_settings().ml.regime_override_confidence
+    def test_the_high_vol_floor_and_the_entry_gate_agree(self):
+        """A VIX-triggered high-vol day with realized vol <= 40% scores exactly the floor (0.80); since W93 the live gate is
+        'at or above', so that day reaches the override (it did not under the strict '>')."""
+        from ait.ml.regime import RegimeAnalysis, regime_forces_neutral
+        gate = load_settings().ml.regime_override_confidence
+        regime, conf = self._detector()._classify(0.0, 0.25, 35.0, 0.5, 0.5)
+        assert conf == pytest.approx(0.80) and gate == pytest.approx(0.80)
+        a = RegimeAnalysis(regime, conf, 0.0, 0.25, 35.0, 0.5, 0.5, {})
+        assert regime_forces_neutral(a, gate) is True
         _, conf = self._detector()._classify(0.0, 0.45, None, 0.5, 0.5)
-        assert conf > load_settings().ml.regime_override_confidence
+        assert conf > gate
 
 
 class TestDrift:

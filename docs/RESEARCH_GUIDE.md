@@ -238,7 +238,7 @@ low volatility, trending up, trending down, range-bound) and gives a confidence.
 the price's distance from moving averages, and the recent return.
 
 **Where does the live bot use it?**
-- **Entry:** a HIGH_VOLATILITY label with confidence strictly above `ml.regime_override_confidence` (0.80) forces the direction to NEUTRAL (moot for condors, which are neutral).
+- **Entry:** a HIGH_VOLATILITY label with confidence at or above `ml.regime_override_confidence` (0.80) forces the direction to NEUTRAL (moot for condors, which ignore the direction).
 - **Exit check:** a position entered in a trending regime that now reads as high volatility with confidence above `exit.thesis_regime_shift_confidence` (0.70) is flagged for exit.
 - **Record:** the label is stored on each trade as `entry_regime`.
 
@@ -254,9 +254,9 @@ the price's distance from moving averages, and the recent return.
 | `trend_confidence_cap` | 0.95 | TRENDING_UP / DOWN report `min(cap, abs(trend strength))` (reported only). |
 | `range_confidence_floor` | 0.50 | RANGE_BOUND reports `max(floor, 1 - 2 x abs(trend strength))` (reported only). |
 
-**Watch the pair.** `high_vol_confidence_floor` and `ml.regime_override_confidence` must agree. The entry rule is a strict "above", and a day triggered
-by VIX alone with realized vol at or under 40% scores exactly the floor, so at 0.80 / 0.80 the override fires only when realized vol is above 40%.
-This is recorded as a finding (PLAN.md W92), not changed.
+**Watch the pair.** `high_vol_confidence_floor` and `ml.regime_override_confidence` must agree: keep the override threshold at or below the floor. A day
+triggered by VIX alone with realized vol at or under 40% scores exactly the floor, so at 0.80 / 0.80 it reaches the override. (Until W93 the rule was a strict
+"above", so that case never fired; PLAN.md W92 recorded it, W93 changed it to "at or above".)
 
 ### Saved model versions and the meta-labeler
 

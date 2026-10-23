@@ -48,6 +48,18 @@ class RegimeAnalysis:
     details: dict[str, float]
 
 
+def regime_forces_neutral(analysis: RegimeAnalysis, threshold: float) -> bool:
+    """W93: True when the live entry rule must force the direction to NEUTRAL: the market is classed HIGH_VOLATILITY with a
+    confidence AT OR ABOVE ``threshold`` (``ml.regime_override_confidence``).
+
+    It was a strict ``>`` inlined in the orchestrator. The classifier's high-vol confidence floor is exactly the shipped
+    threshold (0.80), so a day triggered by VIX alone with realized vol at or under 40% scored 0.80 and ``0.80 > 0.80`` never
+    fired the override, although the R5 audit made the floor precisely so that any VIX / vol trigger would clear the gate. ``>=``
+    is the behaviour the floor was built for (operator decision, 2026-10-23). Iron condors ignore the direction, so this only
+    matters for direction-sensitive strategies."""
+    return analysis.regime == MarketRegime.HIGH_VOLATILITY and analysis.confidence >= threshold
+
+
 class RegimeDetector:
     """Detects the current market regime from price data and VIX."""
 

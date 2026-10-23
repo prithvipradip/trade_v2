@@ -208,11 +208,11 @@ class Backtester:
         # Share of the fractal penalty that ALSO lowers the range model's P(in range)
         # before the range floor (0 = live parity: the range probability is untouched).
         penalty_on_range_prob: float | None = None,   # W70: None -> backtest.penalty_on_range_prob
-        # W70 D (registered, NOT resolved): stop/target stay explicit harness defaults
-        # (0.50 / 1.00) although config.yaml's research baselines are 0.35 / 0.50 — a
-        # deliberate divergence the operator will revisit; see PLAN.md W70.
-        stop_loss_pct: float = 0.50,
-        profit_target_pct: float = 1.00,
+        # W70 D, closed in W93 (operator decision): None -> backtest.stop_loss_pct / profit_target_pct (config
+        # 0.35 / 0.50), like every sibling knob. They were explicit harness defaults 0.50 / 1.00; only a bare Backtester()
+        # ever used those (every research entry point passes the config values) and only DEBIT trades read them.
+        stop_loss_pct: float | None = None,
+        profit_target_pct: float | None = None,
         max_hold_days: int | None = None,      # W70: None -> backtest.max_hold_days
         # R20b (pre-registered PLAN 2026-08-21): was 0.55, silently shadowing
         # the config with a DIFFERENT value. None -> resolve from
@@ -422,9 +422,8 @@ class Backtester:
         # default and resolve here with the project-wide precedence explicit arg > loaded
         # settings.<section>.<field> > the config model's own default (resolve_config_value).
         # The model defaults equal the literals these parameters used to carry, so a bare
-        # Backtester() is unchanged at today's config.yaml. Knobs deliberately kept explicit
-        # (initial_capital, position_size_pct, max_concurrent_positions, stop_loss_pct,
-        # profit_target_pct) are NOT here: see PLAN.md W70 "registered, not changed".
+        # Backtester() is unchanged at today's config.yaml. (W90a resolved initial_capital / position_size_pct, W86
+        # max_concurrent_positions, W93 stop_loss_pct / profit_target_pct: no knob is kept explicit any more.)
         if settings is not None:
             _settings = settings
         else:
@@ -448,6 +447,8 @@ class Backtester:
         friction_stress_multiplier = float(_bt(friction_stress_multiplier, "friction_stress_multiplier"))
         penalty_on_range_prob = float(_bt(penalty_on_range_prob, "penalty_on_range_prob"))
         max_hold_days = int(_bt(max_hold_days, "max_hold_days"))
+        stop_loss_pct = float(_bt(stop_loss_pct, "stop_loss_pct"))                # W93 (W70 D): was 0.50
+        profit_target_pct = float(_bt(profit_target_pct, "profit_target_pct"))     # W93 (W70 D): was 1.00
         trailing_stop_pct = float(_resolve_setting(
             trailing_stop_pct, "exit", "trailing_stop_pct", ExitConfig, _settings))
         breakeven_trigger_pct = float(_resolve_setting(

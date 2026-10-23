@@ -53,11 +53,10 @@
   },
   "src/ait/backtesting/engine.py::Backtester.__init__": {
    "values": [
-    0.5,
     10
    ],
    "category": "structural",
-   "note": "W70 D (registered, NOT resolved): stop_loss_pct 0.50 / profit_target_pct 1.00 are explicit harness defaults that deliberately differ from the config baselines 0.35 / 0.50, a divergence the operator is to revisit (PLAN.md W70); every research entry point passes its own. The 10 is a date slice"
+   "note": "[:10] ISO-date slice of a stored date string (the stop / target defaults are the config baselines since W93, W70 D closed)"
   },
   "src/ait/backtesting/engine.py::Backtester._build_credit_position": {
    "values": [

@@ -395,7 +395,7 @@ ml:
   entry_gates_enabled: false
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
   # W69: were literals in bot/orchestrator.py and ml/drift.py.
-  regime_override_confidence: 0.80     # HIGH_VOLATILITY regime above this -> direction NEUTRAL
+  regime_override_confidence: 0.80     # HIGH_VOLATILITY regime at or above this -> direction NEUTRAL (keep <= regime.high_vol_confidence_floor)
   # --- Drift detection: is the direction model's live record getting worse? (explained in docs/RESEARCH_GUIDE.md, "Drift detection") ---
   # It compares the model's recent calls with what happened and, if it is clearly degrading, asks for an EARLY retrain instead of
   # waiting for the weekly one. OFF by default: outcomes are only recorded for directional strategies, so an iron-condor-only book
@@ -470,7 +470,8 @@ regime:
   trend_momentum_days: 20              # recent return over this many days ...
   trend_momentum_scale: 5.0            # ... x this (5: a 20% return scores 1.0)
   # The "confidence" each class reports. Only HIGH_VOLATILITY is compared with a live rule: the entry gate ml.regime_override_confidence
-  # (strict ">", so floor 0.80 vs gate 0.80 means only realized vol above 40% reaches the override). The rest are reported/logged only.
+  # ("at or above" since W93: floor 0.80 vs gate 0.80, so a VIX-only trigger, which scores exactly the floor, reaches the override).
+  # Keep ml.regime_override_confidence <= the floor. The other classes' confidences are reported/logged only.
   high_vol_confidence_floor: 0.80      # HIGH_VOLATILITY reports max(floor, min(cap, realized_vol / vol_scale)); must not exceed the cap
   high_vol_confidence_cap: 0.90        # ... never more than this
   high_vol_confidence_vol_scale: 0.50  # realized vol 0.40 -> 0.80, 0.45 -> 0.90
