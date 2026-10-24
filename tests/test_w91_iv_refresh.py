@@ -160,6 +160,24 @@ class TestAppendOnlySave:
             tags = dict(c.execute("SELECT date, source FROM daily_prices WHERE symbol='QQQ'").fetchall())
         assert tags["2026-10-20"] == "IB_TRADES_RTH" and tags["2026-10-21"] == "YAHOO_UNADJ"
 
+    def test_a_price_less_iv_only_row_is_filled_but_a_priced_row_is_not(self):
+        """The IV writers create a skeleton row (NULL prices) for today before its bar exists; the append-only
+        save must still fill it, or that date would have no prices forever (found 2026-10-24)."""
+        store = _store()
+        store.save_daily_iv("QQQ", pd.Series([0.25], index=pd.to_datetime(["2026-10-23"])), source="IB_OPTION_IV")
+        import sqlite3
+        with sqlite3.connect(store._db_path) as c:
+            assert c.execute("SELECT close FROM daily_prices WHERE date='2026-10-23'").fetchone() == (None,)
+        bar = pd.DataFrame({"Open": [1.0], "High": [2.0], "Low": [0.5], "Close": [1.5], "Volume": [100]},
+                           index=pd.to_datetime(["2026-10-23"]))
+        store.save("QQQ", bar, source="IB_TRADES_RTH", overwrite=False)
+        with sqlite3.connect(store._db_path) as c:
+            row = c.execute("SELECT close, volume, implied_vol, source FROM daily_prices WHERE date='2026-10-23'").fetchone()
+        assert row == (1.5, 100, 0.25, "IB_TRADES_RTH")            # prices filled, the stored IV kept
+        store.save("QQQ", bar.assign(Close=9.0, Volume=9), source="YAHOO_UNADJ", overwrite=False)
+        with sqlite3.connect(store._db_path) as c:
+            assert c.execute("SELECT close, volume FROM daily_prices WHERE date='2026-10-23'").fetchone() == (1.5, 100)
+
     def test_default_still_overwrites(self):
         store = _store()
         a = pd.DataFrame({"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [1]},

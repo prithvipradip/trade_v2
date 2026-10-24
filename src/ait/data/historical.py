@@ -447,8 +447,8 @@ class HistoricalDataStore:
              overwrite: bool = True) -> int:
         """Save historical data for a symbol. Returns number of rows passed.
 
-        W91: `overwrite=False` makes the save APPEND-ONLY: a (symbol, date) that is already stored is
-        left exactly as it is (`ON CONFLICT DO NOTHING`), only new dates are inserted. The daily
+        W91: `overwrite=False` makes the save APPEND-ONLY: a (symbol, date) that already has prices is
+        left exactly as it is; only new dates (and price-less IV-only rows) are filled. The daily
         retrain uses it so a stored completed session is never rewritten (a later vendor correction or
         a different provider can no longer change history under a registered study). Backfill scripts
         keep the default (explicit overwrite).
@@ -484,13 +484,23 @@ class HistoricalDataStore:
             # doesn't carry — so the daily retrain's save() nulled every IV
             # the backfill had written, silently killing the IV/IV-rank
             # features. Upsert only the OHLCV columns instead.
+            # W91 fix (found 2026-10-24): the IV writers (save_daily_iv) insert a price-less "skeleton" row for a
+            # date before its bar exists (the bot writes today's IV during the session), so a plain DO NOTHING
+            # would leave that date without prices FOREVER. Append-only therefore still fills a row whose close
+            # is NULL, and never touches a row that has prices.
             on_conflict = (
                 """DO UPDATE SET
                      open=excluded.open, high=excluded.high,
                      low=excluded.low, close=excluded.close,
                      volume=excluded.volume,
                      source=COALESCE(excluded.source, source)"""
-                if overwrite else "DO NOTHING")
+                if overwrite else
+                f"""DO UPDATE SET
+                     open=excluded.open, high=excluded.high,
+                     low=excluded.low, close=excluded.close,
+                     volume=excluded.volume,
+                     source=COALESCE(excluded.source, {self._daily_table}.source)
+                   WHERE {self._daily_table}.close IS NULL""")
             conn.executemany(
                 f"""INSERT INTO {self._daily_table}
                    (symbol, date, open, high, low, close, volume, source)
