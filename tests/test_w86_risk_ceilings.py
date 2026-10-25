@@ -68,10 +68,10 @@ class TestCeilings:
     def test_the_shipped_values_are_unchanged(self, real_settings):
         s = real_settings
         assert (s.risk.max_position_risk_pct, s.risk.max_daily_loss_pct,
-                s.positions.max_position_pct) == (0.05, 0.045, 0.05)
+                s.positions.max_position_pct) == (0.20, 0.20, 0.20)
         assert (s.positions.max_portfolio_risk_pct, s.risk.max_symbol_concentration_pct) == (0.20, 0.20)
         again = load_settings("config.yaml", ignore_frozen=True)       # the file itself loads
-        assert again.risk.max_position_risk_pct == 0.05
+        assert again.risk.max_position_risk_pct == 0.20
 
     def test_an_explicit_research_size_is_not_bounded_by_the_yaml_ceiling(self):
         """The ceiling bounds the config VALUE; a deliberate constructor argument (a sizing study) is

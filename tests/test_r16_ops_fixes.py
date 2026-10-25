@@ -339,6 +339,10 @@ class TestForeignBotRefusal:
         alerts = []
         monkeypatch.setattr(_master, "_alert", lambda m: alerts.append(m) or True)
         gateway_calls = []
+        # W94: start() resolves the port with a listening probe (it prefers the same-account-type
+        # twin when only that one is up). Nothing listens here, so the configured port is used
+        # whatever happens to run on the machine running the tests.
+        monkeypatch.setattr(_master, "_gateway_listening", lambda port, host="127.0.0.1": False)
         # gateway unavailable -> start() aborts AFTER the scan guard, without
         # ever spawning — proves the guard let a clean start proceed
         # W34b: start() now also hands the boot launcher a log dir.

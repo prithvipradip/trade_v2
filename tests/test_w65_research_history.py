@@ -697,7 +697,7 @@ class TestOptimizerResearchSupport:
         return o
 
     def test_wing_k_is_dropped_when_the_budget_cap_always_binds(self):
-        o = self._opt(5_000)                                  # budget $250 -> ~$3 wing
+        o = self._opt(5_000, position_size_pct=0.05)          # budget $250 -> ~$3 wing (W100: pinned, shipped is 0.20)
         o._maybe_drop_inert_params()
         assert o._dropped_params == {"iron_condor__wing_k"}
 
@@ -716,7 +716,7 @@ class TestOptimizerResearchSupport:
 
     def test_dropped_param_is_not_suggested_but_the_rest_are(self):
         import optuna
-        o = self._opt(5_000)
+        o = self._opt(5_000, position_size_pct=0.05)
         o._maybe_drop_inert_params()
         trial = optuna.create_study().ask()
         params = o._suggest_params(trial)

@@ -164,7 +164,7 @@ class AccountConfig(_StrictModel):
 class PositionConfig(_StrictModel):
     max_open_positions: int = Field(default=5, ge=1, le=20,
         description="Maximum number of positions open at once (the risk manager's position-count gate; the research pool applies the same cap).")
-    max_position_pct: float = Field(default=0.05, ge=0.01, le=0.30,
+    max_position_pct: float = Field(default=0.20, ge=0.01, le=0.30,
         description="The position sizer's hard per-position cap, fraction of NLV (a defined-risk "
                     "structure's max loss per contract must fit). Must stay >= risk.max_position_risk_pct "
                     "(Settings validates, W64). W86 (2026-10-21, operator): ceiling 0.25 -> 0.30 so the "
@@ -339,7 +339,7 @@ class PositionSizingConfig(_StrictModel):
 
 
 class RiskConfig(_StrictModel):
-    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.20,
+    max_daily_loss_pct: float = Field(default=0.20, ge=0.005, le=0.20,
         description="Daily loss breaker, fraction of NLV (realised AND mark-to-market "
                     "trips; entries only, exits keep running). W64: 0.02 -> 0.045 at the "
                     "$5k account (breaker $225 vs the $3-wide condor's $201-212 max "
@@ -370,7 +370,7 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.25,
+    max_position_risk_pct: float = Field(default=0.20, ge=0.005, le=0.25,
         description="Per-trade max_loss cap as a fraction of NLV (was "
                     "hardcoded 0.03 in manager.py — audit item 3.3), AND the budget the "
                     "condor builder is handed (wing width = budget/90 snapped to the "

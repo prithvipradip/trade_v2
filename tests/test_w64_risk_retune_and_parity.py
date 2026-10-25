@@ -41,8 +41,8 @@ def real_settings():
 class TestRetunedConfig:
     def test_live_values(self, real_settings):
         s = real_settings
-        assert s.risk.max_position_risk_pct == pytest.approx(0.05)
-        assert s.risk.max_daily_loss_pct == pytest.approx(0.045)
+        assert s.risk.max_position_risk_pct == pytest.approx(0.20)
+        assert s.risk.max_daily_loss_pct == pytest.approx(0.20)
         assert s.risk.breaker_to_max_loss_ratio == pytest.approx(1.0)
 
     def test_research_values(self):
@@ -78,7 +78,7 @@ class TestPerTradeKnobsAreLinked:
 
     def test_gate_cap_above_sizer_cap_is_a_startup_error(self, real_settings):
         with pytest.raises(ValueError, match="max_position_pct"):
-            self._with(real_settings, risk_pct=0.08)
+            self._with(real_settings, risk_pct=0.25)
 
     def test_equal_is_allowed(self, real_settings):
         self._with(real_settings, risk_pct=0.05, pos_pct=0.05)
@@ -144,7 +144,7 @@ class _Stub:
 class TestResolvers:
     def test_position_size_precedence(self, real_settings):
         assert resolve_position_size_pct(0.07, real_settings) == pytest.approx(0.07)
-        assert resolve_position_size_pct(None, real_settings) == pytest.approx(0.05)
+        assert resolve_position_size_pct(None, real_settings) == pytest.approx(0.20)
         study = _Stub(backtest=_Stub(position_size_pct=0.10),
                       risk=_Stub(max_position_risk_pct=0.03))
         assert resolve_position_size_pct(None, study) == pytest.approx(0.10)
@@ -165,7 +165,7 @@ class TestEntryPointsInheritLive:
     def test_walkforward_config(self):
         from ait.backtesting.walkforward import WalkForwardConfig
         c = WalkForwardConfig()
-        assert c.position_size_pct == pytest.approx(0.05)
+        assert c.position_size_pct == pytest.approx(0.20)
         assert c.budget_aware_wings is True
         assert c.max_contracts_per_trade == 1
         e = WalkForwardConfig(position_size_pct=0.03, budget_aware_wings=False,
@@ -176,7 +176,7 @@ class TestEntryPointsInheritLive:
     def test_optimizer(self):
         from ait.optimization.optimizer import StrategyOptimizer
         o = StrategyOptimizer(symbols=["SPY"], strategies=["iron_condor"], n_trials=1)
-        assert o._position_size_pct == pytest.approx(0.05)
+        assert o._position_size_pct == pytest.approx(0.20)
         assert o._budget_aware_wings is True and o._max_contracts_per_trade == 1
         o2 = StrategyOptimizer(symbols=["SPY"], strategies=["iron_condor"], n_trials=1,
                                position_size_pct=0.03, budget_aware_wings=False,
@@ -270,7 +270,7 @@ class TestEngineBudgetAwareWings:
         from ait.backtesting.engine import Backtester
         bt = Backtester(data=_df(), strategies=["iron_condor"])
         assert bt._budget_aware_wings is False and bt._max_contracts_per_trade is None
-        assert bt._position_size_pct == pytest.approx(0.05)
+        assert bt._position_size_pct == pytest.approx(0.20)
 
 
 class TestEngineContractCap:
