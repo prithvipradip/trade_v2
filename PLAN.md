@@ -19015,3 +19015,12 @@ The W99 AS BUILT entry above records "`--paper` stays hardcoded in `master.py`" 
 ## 2026-10-25 - W99 FOLLOW-UP 3: the 13 scripts that read the removed `backtest.initial_capital` are repaired
 
 At the operator's request, the 13 scripts registered in the entry above now pass `initial_capital=None`, which `WalkForwardConfig` resolves to `account.capital` of the loaded settings (as the `ablation_*` scripts already did); `run_integration_test.py` records `resolve_account_capital(None, <--config settings>)` in its archive metadata. **Checked without running any study:** the `WalkForwardConfig(...)` keyword expressions of all 13 evaluate against the real settings and the capital resolves to the `config.yaml` value; no script reads a missing `BacktestConfig` attribute. **Not shown:** that any of them completes a run (none was run; the historical ones also depend on the history tables as they are today). The scripts reference rows no longer say "Currently fails".
+
+
+---
+
+## 2026-10-25 - W99 FOLLOW-UP 4: merged to `main`; one review item remains open
+
+W99 (documentation restructure, launch-mode decision, scripts reference, repairs of the 13 scripts that read the removed `backtest.initial_capital`) is merged to `main` from `docs/w99-restructure` (four commits, not pushed). The operator has reviewed the go-live additions in the RUNBOOK checklist (the "for the operator to review" flag is removed).
+
+**STILL OPEN: D3.** The operator has not yet gone through the ten thin RUNBOOK alert rows (MARKS MISSING, TOUCH STOP NOT EVALUATING, EXIT REPEATEDLY REJECTED, EXIT DEFERRED / WITHOUT QUOTES, STALE EXIT FEED, LOOP IMPAIRED / BOT HUNG, MTM BRAKE NOT EVALUATING, PDT BLOCKED EXIT, ACCOUNT DATA STALE, the CRITICAL fill on a terminal row). The meaning of each alert is read from the code; whether the listed action is the best operational response is the operator's judgment. The rows and their current action text are in `reports/docs_review_20261024/RUNBOOK_alert_review_sheet.md`. When reviewed, the RUNBOOK is edited once and a "rows last reviewed by the operator on <date>" line is added.
