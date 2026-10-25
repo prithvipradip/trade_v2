@@ -1,0 +1,667 @@
+# Hand-checked facts about every script, read by scripts/gen_docs.py to write docs/reference/SCRIPTS.md.
+#
+# One entry per file; the key is the repository-relative path. The generator REFUSES a script with no entry and an entry with
+# no script, so a new script cannot be added undocumented. Fields:
+#   group      one of: Entry point, Operate, Data, Research tool, Study, IB paper probe, One-time migration, Developer, Historical
+#   what       what it does, written from reading the code (NOT copied from the docstring: several docstrings are copy-pasted or stale)
+#   when       when you would run it
+#   needs_ib   "yes" | "optional" | "no" | "indirect" (QUOTED: a bare no/yes is read as a boolean).  The generator parses the file: if it imports an IB client the value must be yes or
+#              optional; if it does not, no or indirect (indirect = it starts or calls something that connects)
+#   writes     what it writes ("nothing" only where every write site was read), and anything that touches git or the network
+#   example    a command that matches the code (flags read from the code; the docstring example was not trusted)
+#   explained  where it is explained in context, or "-"
+#   stamp      fingerprint of the script's code (its lines without docstrings, blank lines and whole-line comments) taken when this entry was
+#              verified. tests/test_docs_generated.py fails when the code changes. Re-read the entry, then run
+#              `python scripts/gen_docs.py --restamp <path>`. Do not restamp without reading the entry.
+# Write 'writes' from the code's write sites, not from the docstring (several docstrings are stale). Evidence for each entry
+# (file:line) is in reports/docs_review_20261024/SCRIPTS_claim_ledger.md.
+
+run_orchestrator.py:
+  group: Entry point
+  what: "Starts the supervisor: the trading bot, the three dashboards and the scheduled jobs. With a flag it does one job and exits. `--fetch-news` is retired and exits with an error."
+  when: "The normal way to run the system. The flags are for one-off runs: --status (is the bot running), --retrain (fetches daily bars from IB, then retrains the models), --report, --backtest (the weekly backtest job), --refresh-fundamentals."
+  needs_ib: "indirect"
+  writes: "With no flag, everything the running system writes: data/ait_state.db, data/ait_analytics.duckdb, logs, models, reports. A flag writes what that job writes (models, the daily report, a backtest log); --refresh-fundamentals writes equity statistics, fetched from Yahoo, into data/ait_analytics.duckdb."
+  example: "python run_orchestrator.py"
+  explained: "[GETTING_STARTED.md](../GETTING_STARTED.md#5-run)"
+  stamp: "9ac9284bfe8d"
+
+run_backtest.py:
+  group: Entry point
+  what: "Walk-forward backtest of the iron-condor rules on the stored research history. Prints the parity manifest and writes a run record."
+  when: "To test a change in research. --study-file records the run as a study."
+  needs_ib: "no"
+  writes: "reports/runs/<run_id>/run_record.json, and an MLflow run when MLflow is installed (--no-run-record skips both). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python run_backtest.py --symbols QQQ --study-file studies/_template.yaml"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#3-what-one-run-does)"
+  stamp: "0393b4af189b"
+
+run_optimizer.py:
+  group: Entry point
+  what: "Optuna search over strategy parameters (and optionally ML hyperparameters), then reports the best parameters."
+  when: "To search parameters outside a walk-forward. --apply is refused unless AIT_ALLOW_APPLY=1 is set, and is refused with --study-file."
+  needs_ib: "no"
+  writes: "reports/optimization_result.json (--output) and reports/runs/<run_id>/run_record.json (--no-run-record skips it). With --apply it rewrites the file named by --config as plain YAML: four parameters change and every comment in the file is lost. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python run_optimizer.py --strategies iron_condor --symbols QQQ --n-trials 20"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#8-the-optimizer)"
+  stamp: "82320c9a69ea"
+
+status.py:
+  group: Entry point
+  what: "Prints a status snapshot: whether the bot is running, last heartbeat and IB connection, today's events, open positions, realized P&L and the go-live scorecard. Does not connect to IB."
+  when: "Any time, including while the bot runs."
+  needs_ib: "no"
+  writes: "nothing. It only runs SELECT queries on data/ait_state.db (the connection is not opened read-only) and reads the logs and the heartbeat file."
+  example: "python status.py"
+  explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
+  stamp: "9ad733625f78"
+
+status_server.py:
+  group: Entry point
+  what: "Serves the live status page (port 8503 by default, `--port` overrides) from the same snapshot as status.py."
+  when: "The supervisor starts it; run it yourself only if the supervisor is not running."
+  needs_ib: "no"
+  writes: "nothing (the same SELECT-only queries as status.py)"
+  example: "python status_server.py"
+  explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
+  stamp: "873fa566e690"
+
+web_logs.py:
+  group: Entry point
+  what: "Serves the log viewer (port 8502 by default, `--port` overrides) on localhost. Reads the log files."
+  when: "The supervisor starts it; run it yourself only if the supervisor is not running."
+  needs_ib: "no"
+  writes: "nothing"
+  example: "python web_logs.py"
+  explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
+  stamp: "b250b3c691dd"
+
+start_bot.bat:
+  group: Entry point
+  what: "Windows launcher: refuses to start a second copy if an orchestrator or bot is already running, otherwise runs run_orchestrator.py."
+  when: "Double-click on the Windows trading box (the path inside it is that box's checkout)."
+  needs_ib: "indirect"
+  writes: "same as run_orchestrator.py"
+  example: "start_bot.bat"
+  explained: "[GETTING_STARTED.md](../GETTING_STARTED.md#5-run)"
+  stamp: "98e34f2b7b44"
+
+keeper_ait.bat:
+  group: Entry point
+  what: "Windows keeper. Every 90 seconds it checks whether a python process is running run_orchestrator or ait.main and relaunches the orchestrator if not. If data\\deadman_url.txt exists it pings that URL while the bot is demonstrably alive, and its /fail address when it is not. It logs to logs\\keeper.log (rotated at 20 MB). data\\KEEPER_PAUSE stops it relaunching."
+  when: "Left running on the Windows trading box. Create data\\KEEPER_PAUSE before a deliberate stop."
+  needs_ib: "indirect"
+  writes: "logs\\keeper.log; launches the orchestrator; network pings to the dead-man URL"
+  example: "keeper_ait.bat"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#kill-switches-no-kill--9-needed)"
+  stamp: "37b492e42d1b"
+
+scripts/smoke_deploy.py:
+  group: Operate
+  what: "Post-deploy smoke test: imports every module, loads the real config, runs one dry-run trading cycle against fakes in a throwaway sandbox, and exercises the state, analytics, digest and scorecard paths on the real databases."
+  when: "After every deploy, before walking away. It must print SMOKE PASS."
+  needs_ib: "no"
+  writes: "No rows in either database: it counts rows before and after and fails if they change (a new empty table or a schema-version change from the state manager's startup setup is only noted). It makes and removes a temporary sandbox directory. --telegram sends the verdict."
+  example: "python scripts/smoke_deploy.py [--telegram] [--check-live-corpus]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#deploy-checklist-every-deploy)"
+  stamp: "20d201a90aeb"
+
+scripts/check_first_rth_liveness.py:
+  group: Operate
+  what: "Automates the first-morning checks after a deploy: heartbeat under 10 minutes old, scan events logged since 13:30 UTC, no LOOP IMPAIRED or trading_cycle_error in the last 4 MB of the log, position marks under 10 minutes old; it also lists any halt files (information only)."
+  when: "About 09:40 ET on the first trading morning after a deploy. Exits 1 on any failure."
+  needs_ib: "no"
+  writes: "nothing in the databases (state database opened read-only). Sends the verdict to Telegram unless `--no-telegram` is on the command line (that flag is read directly, so it is not in the Flags column)."
+  example: "python scripts/check_first_rth_liveness.py [--no-telegram]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#deploy-checklist-every-deploy)"
+  stamp: "6334f4c8d61f"
+
+scripts/sync_ibkr_port.py:
+  group: Operate
+  what: "Makes .env's IBKR_PORT agree with the IB endpoint that is actually listening, within the same account type (it can never turn paper into live)."
+  when: "After an `IB port fallback` alert; restart the supervisor afterwards so it re-reads .env."
+  needs_ib: "no"
+  writes: "Dry run by default. With --apply it rewrites only the IBKR_PORT number in .env (temporary file, then an atomic replace; every other byte unchanged). It finds the listening port with a TCP connect, not an IB login."
+  example: "python scripts/sync_ibkr_port.py [--apply]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#alert--action)"
+  stamp: "677f7f9a7e6f"
+
+scripts/read_shared_logs.py:
+  group: Operate
+  what: "Prints a box's published bot events from the shared-logs branch, filtered by owner, date, event or symbol."
+  when: "To read the other box's logs, or to see who published which days (--list)."
+  needs_ib: "no"
+  writes: "Nothing local. It runs `git fetch` of origin/shared-logs first unless --no-fetch."
+  example: "python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD [--no-fetch]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#daily-2-minute-routine)"
+  stamp: "46cd5c3df2e7"
+
+scripts/publish_shared_logs.py:
+  group: Operate
+  what: "Exports this box's bot events for today and the last four weekdays and publishes them to the shared-logs branch."
+  when: "The supervisor runs it at 16:45 ET on weekdays; running it by hand does the same. Needs AIT_LOG_OWNER in .env (without it the script prints a message and does nothing)."
+  needs_ib: "no"
+  writes: "Commits and pushes to origin/shared-logs through a separate git worktree in a folder beside the checkout (named <checkout>_shared_logs), never the code branch. --dry-run writes only reports/shared_logs_dryrun/ and uses no git."
+  example: "python scripts/publish_shared_logs.py [--date YYYY-MM-DD] [--dry-run]"
+  explained: "-"
+  stamp: "cbe0b3364ce8"
+
+scripts/verify_deadman.py:
+  group: Operate
+  what: "Checks the dead-man ping end to end: curl is present, the keeper script for this OS (keeper_ait.bat on Windows; elsewhere ops/keeper_ait.sh, which is not in this checkout) pings and gates the ping on the bot being alive, and the bot's own liveness. If data/deadman_url.txt exists it pings that URL (the /fail address when the bot is not alive); if not, it only tests that hc-ping.com is reachable."
+  when: "Once when setting up the dead-man check (healthchecks.io), and again after changing the keeper. `--no-ping` sends nothing. Exit code 0 armed and alive, 1 a problem, 2 not armed, 3 armed but the bot is not alive."
+  needs_ib: "no"
+  writes: "nothing local; it makes network requests (the success or /fail ping, or the reachability test)"
+  example: "python scripts/verify_deadman.py [--no-ping]"
+  explained: "-"
+  stamp: "93f0a649a2df"
+
+scripts/shadow_referee.py:
+  group: Operate
+  what: "Recomputes per-trade P&L and the go-live numbers from the broker-derived executions ledger and compares them with the system's own books. Imports nothing from src/ait on purpose."
+  when: "Before trusting the scorecard, at a go-live review, or after a change to booking code. Exits nonzero on any BREAK."
+  needs_ib: "no"
+  writes: "nothing (state database opened read-only, DuckDB mirror read-only); --json for machine output"
+  example: "python scripts/shadow_referee.py [--db data/ait_state.db] [--mirror <duckdb>] [--json]"
+  explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
+  stamp: "03c5139e4a4e"
+
+scripts/unify_history_tables.py:
+  group: "One-time migration"
+  what: "Merges the old research_* history tables into the one shared set of tables in data/historical.db, verifies nothing was lost, then archives and finally drops the old copies."
+  when: "Do not run again unless PLAN.md says a step is still open. PLAN.md records the merge and the archive as done; --drop-archives is the remaining step, with its criteria. It refuses to write while the supervisor or bot runs (--allow-running overrides)."
+  needs_ib: "no"
+  writes: "Dry run by default. --apply backs up data/historical.db and merges into it; --archive renames research_X to archive_w91_research_X; --drop-archives drops them; reports under reports/."
+  example: "python scripts/unify_history_tables.py [--verify | --apply | --archive | --drop-archives]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#data-catch-up-and-maintenance)"
+  stamp: "96441a4a1ad3"
+
+scripts/backfill_historical_data.py:
+  group: Data
+  what: "Backfills history from IB into data/historical.db. --mode picks what: intraday (default, 5-minute bars), iv (daily implied vol), iv-intraday, both (intraday then iv), daily (daily bars with real volume), research (daily then iv), vix (the VIX-family indices)."
+  when: "To seed or catch up history (for example `--mode iv` after a gap, `--mode vix` for the VIX family)."
+  needs_ib: "yes"
+  writes: "Rows in data/historical.db (an empty --table-prefix is the one shared set of tables). The daily, iv and research modes also write reports/research_history_<date>.json. --dry-run prints the plan, makes no IB call and writes nothing. Default IB client id 90, port 4002."
+  example: "python scripts/backfill_historical_data.py --symbols QQQ SPY IWM --mode iv --years 1 [--dry-run]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#data-catch-up-and-maintenance)"
+  stamp: "642dbe3e8362"
+
+scripts/backfill_intraday.py:
+  group: Data
+  what: "Bulk backfill of 5-minute bars from IB into data/historical.db (INSERT OR REPLACE, so gaps can be refilled)."
+  when: "To seed 5-minute bars. `backfill_historical_data.py --mode intraday` covers the same ground."
+  needs_ib: "yes"
+  writes: "Rows in the 5-minute bar table of data/historical.db (empty --table-prefix = the shared tables; INSERT OR REPLACE, so re-running refills gaps). --dry-run prints the plan. Default IB client id 90, port 4002; the id must not be the bot's."
+  example: "python scripts/backfill_intraday.py --symbols SPY QQQ --years 2 [--dry-run]"
+  explained: "-"
+  stamp: "0d075a9d26fc"
+
+scripts/backfill_dividends.py:
+  group: Data
+  what: "Stores each symbol's past ex-dividend dates (from yfinance) in the dividends table."
+  when: "Before a study that ends after the last stored ex-date."
+  needs_ib: "no"
+  writes: "The dividends table in data/historical.db (shared tables by default) and reports/dividends_audit_<date>.json, which is written even with --dry-run (that stores no dividends). If a symbol returns no dividends nothing is stored. Uses the network (Yahoo)."
+  example: "python scripts/backfill_dividends.py --symbols QQQ SPY IWM [--dry-run]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#113-the-ex-dividend-entry-block)"
+  stamp: "0d3a910971bf"
+
+scripts/backfill_option_history.py:
+  group: Data
+  what: "Backfills historical option daily bars (with solved implied vol and greeks) for one symbol from Polygon."
+  when: "To extend the option-bar history an IV surface needs. Slow (about 12.5 s per request by default)."
+  needs_ib: "no"
+  writes: "option_daily_bars in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry."
+  example: "python scripts/backfill_option_history.py --symbol QQQ [--dry-run | --since-last]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
+  stamp: "3efdece63675"
+
+scripts/backfill_risk_free_rate.py:
+  group: Data
+  what: "Builds a historical risk-free-rate series from SOFR (fetched from FRED) and re-solves the stored option rows' implied vol and greeks with it."
+  when: "After backfill_option_history.py, to replace the placeholder rate stored in each row."
+  needs_ib: "no"
+  writes: "The risk_free_rates table (always, even with --dry-run) and, unless --dry-run, the iv, greeks and risk_free_rate columns of the stored option_daily_bars rows (raw prices untouched). Uses the network."
+  example: "python scripts/backfill_risk_free_rate.py --dry-run"
+  explained: "-"
+  stamp: "aa9f03cac020"
+
+scripts/build_research_calendars.py:
+  group: Data
+  what: "Builds the event calendars of the range study (FOMC, CPI and NFP dates; QQQ top holdings; 8-K earnings releases) into data/historical.db."
+  when: "To refresh or rebuild those calendars. Nothing is written unless every validation passes."
+  needs_ib: "no"
+  writes: "econ_schedule, qqq_holdings and earnings_schedule in data/historical.db, a download cache under data/research_cache/w83a, and an audit JSON under reports/ (written even with --dry-run or a failed validation). Uses the network (Fed, BLS, SEC EDGAR; needs SEC_EDGAR_CONTACT unless --offline)."
+  example: "python scripts/build_research_calendars.py --what all [--dry-run | --offline]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
+  stamp: "a9c1fb56164d"
+
+scripts/load_econ_calendar_csv.py:
+  group: Data
+  what: "Loads the operator's Investing.com economic-calendar CSV into the econ_events table, normalised to US/Eastern with its provenance recorded."
+  when: "When you receive a new economic-calendar CSV."
+  needs_ib: "no"
+  writes: "econ_events in data/historical.db, and reports/econ_calendar_audit_<date>.json, which is written even with --dry-run (that stores no events)."
+  example: "python scripts/load_econ_calendar_csv.py --csv <file> [--dry-run]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
+  stamp: "27b15f0cf240"
+
+scripts/calibrate_option_spreads.py:
+  group: Data
+  what: "Fits the option bid-ask spread model from real quotes. The default source is yfinance; --source ibkr and ib-bars read from IB, and ib-bars with --short-dte collects the short-DTE friction samples."
+  when: "To refit the research friction model, or to collect short-DTE samples (RESEARCH_GUIDE 10.1 describes the supervisor job that runs it once per session)."
+  needs_ib: "optional"
+  writes: "The option-spread tables in data/historical.db (samples accumulate). --update-config PATH writes the fitted values into that YAML with ruamel.yaml, which keeps its comments (needs ruamel.yaml installed). --dry-run prints the plan and fetches and stores nothing. Own IB client id (default 91), which must not be the bot's."
+  example: "python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ --client-id 91 --dry-run"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#101-short-dte-friction-collection)"
+  stamp: "c48914049299"
+
+scripts/backfill_mlflow.py:
+  group: Data
+  what: "Imports walk-forward run archives (folders with run_metadata.json under reports/runs/, the format run_integration_test.py writes) into MLflow, skipping runs already imported."
+  when: "Once, if you want old archives in MLflow. Needs mlflow installed (the research extra)."
+  needs_ib: "no"
+  writes: "MLflow's tracking store. The script sets no tracking address, so it uses MLflow's default unless MLFLOW_TRACKING_URI is set (run_backtest records use data/mlflow.db). --force deletes and re-imports runs already there."
+  example: "python scripts/backfill_mlflow.py [--symbol QQQ]"
+  explained: "-"
+  stamp: "1508f374906f"
+
+scripts/show_research_config.py:
+  group: Research tool
+  what: "Prints the effective research configuration and the layer (study, overlay, config.yaml, default) that decides each value, then the fixed limits."
+  when: "Before a run, to see what values it will use."
+  needs_ib: "no"
+  writes: "nothing (reads the YAML files; touches no database and no broker)"
+  example: "python scripts/show_research_config.py --section backtest [--differs] [--study-file studies/<name>.yaml]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#4-configuration-where-every-value-lives)"
+  stamp: "bd1c68fa239a"
+
+scripts/compare_runs.py:
+  group: Research tool
+  what: "Compares walk-forward run archives (the integration-test format with run_metadata.json) side by side."
+  when: "To compare archived integration runs. It does not read run records from run_backtest.py."
+  needs_ib: "no"
+  writes: "nothing"
+  example: "python scripts/compare_runs.py --symbol QQQ [--sort win_rate]"
+  explained: "[WALKFORWARD_DASHBOARD.md](../WALKFORWARD_DASHBOARD.md#1-what-it-can-show-today)"
+  stamp: "75e11a6c90db"
+
+scripts/export_production_params.py:
+  group: Research tool
+  what: "Takes the best parameters of the latest trained window in a run archive and merges them into a base config, writing a new YAML."
+  when: "To turn an archived run's parameters into a candidate config file. It does not apply them to the live config."
+  needs_ib: "no"
+  writes: "A new YAML (default config_<symbol>_production.yaml in the current directory) written as plain YAML, so comments are lost. --dry-run writes nothing."
+  example: "python scripts/export_production_params.py --symbol QQQ --dry-run"
+  explained: "-"
+  stamp: "ee1ae164737b"
+
+scripts/parity_replay.py:
+  group: Research tool
+  what: "Runs known real trades through the research engine's pricing and exit code and reports where research and reality disagree."
+  when: "Before trusting a DTE band in a study, and after any change to the pricing, friction or exit path."
+  needs_ib: "no"
+  writes: "data/replay/out/<YYYYMMDD>/ (git-ignored): summary.md holds statistics only; trades.csv and legs.csv carry per-trade prices and stay local. Databases opened read-only. Needs the operator's data/replay/manual_trades_*.json."
+  example: "python scripts/parity_replay.py [--trades data/replay/manual_trades_<dates>.json]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#102-parity-replay-research-versus-reality)"
+  stamp: "32710c0aa0af"
+
+scripts/fill_vs_model_report.py:
+  group: Research tool
+  what: "Forward check of the research friction model against real fills that carry quote context. A plumbing check while the sample is small."
+  when: "Occasionally, as paper fills accumulate."
+  needs_ib: "no"
+  writes: "Nothing in the state database (opened read-only). It opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/fill_vs_model_report.py [--state-db data/ait_state.db] [--hist-db data/historical.db]"
+  explained: "-"
+  stamp: "94cbf2087290"
+
+scripts/surface_validate.py:
+  group: Research tool
+  what: "Out-of-sample check of the real-bar implied-vol surface against the engine's current pricing, bar to bar, by DTE band and moneyness."
+  when: "After changing the surface or the pricing, before relying on surface pricing."
+  needs_ib: "no"
+  writes: "a cache under data/research_cache (git-ignored); the history database is opened read-only. Prints statistics."
+  example: "python scripts/surface_validate.py --underlying QQQ"
+  explained: "-"
+  stamp: "0c84cb3da9b9"
+
+scripts/run_integration_test.py:
+  group: Research tool
+  what: "Older end-to-end pipeline: backfills SPY 5-minute bars from IB, checks data quality and features, runs a walk-forward and an ablation, and archives the run in the format the Walk-Forward Lab reads."
+  when: "To produce an archive for the Walk-Forward Lab. Current research runs use run_backtest.py instead."
+  needs_ib: "yes"
+  writes: "Its own data/integration_test.db, reports/integration_test/ (old window_*.json files there are deleted at the start) and reports/runs/<run_id>/. IB client id 88, port 4002 by default; --skip-backfill avoids IB. With --archive-data it stashes the working tree (untracked files included), switches to data/experiment-archives, commits the run and PUSHES to origin, then switches back."
+  example: "python scripts/run_integration_test.py --symbols SPY --years 2 --skip-backfill"
+  explained: "[WALKFORWARD_DASHBOARD.md](../WALKFORWARD_DASHBOARD.md#1-what-it-can-show-today)"
+  stamp: "8a6f63dc6122"
+
+scripts/run_fractal_diagnostics.py:
+  group: Research tool
+  what: "Generates fractal-feature diagnostic reports (information-coefficient tables and charts) for symbols and a date range. Reads daily bars from data/historical.db and falls back to Yahoo; VIX comes from Yahoo."
+  when: "To inspect the fractal features."
+  needs_ib: "no"
+  writes: "fractal_report_<SYMBOL>.html for each symbol and ic_summary.csv under reports/fractal (or --output)"
+  example: "python scripts/run_fractal_diagnostics.py --symbols SPY QQQ"
+  explained: "-"
+  stamp: "248ac47abc14"
+
+scripts/gate_parity_ab.py:
+  group: Study
+  what: "Measures what the one-sided entry gates (research volatility cap, research trending-down veto, live's VIX halt) cost or earn, in four arms per symbol."
+  when: "Whenever the gate order, the IV-rank cap or the entry-DTE range changes."
+  needs_ib: "no"
+  writes: "nothing unless --dump FILE is given. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. VIX closes come from Yahoo (network)."
+  example: "python scripts/gate_parity_ab.py --workers 3 [--entry-dte 14]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#111-one-sided-entry-gates)"
+  stamp: "3a3fb0ae8f87"
+
+scripts/ex_div_gate_ab.py:
+  group: Study
+  what: "Runs the realistic engine with the ex-dividend entry block off, as live, exact and last-k-days, to see what the block costs or protects."
+  when: "To check the research twin of the ex-dividend block against live's rule."
+  needs_ib: "no"
+  writes: "no files (prints a table). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#113-the-ex-dividend-entry-block)"
+  stamp: "d2765b912c80"
+
+scripts/gate_study.py:
+  group: Study
+  what: "Entry-day outcome study for the fractal regime gate: one hypothetical condor per eligible day, with profit by fractal bucket."
+  when: "To judge the fractal gate cut-offs on every eligible day rather than on a few walk-forward trades."
+  needs_ib: "no"
+  writes: "reports/gate_study_<date>_<neutral|anydir>.csv. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/gate_study.py --symbols QQQ [--any-direction]"
+  explained: "-"
+  stamp: "aa830385a885"
+
+scripts/friction_sensitivity.py:
+  group: Study
+  what: "Sweeps multiples of the fitted per-leg friction model (0 to 2) to find the break-even cost. With --exit-ab it also compares take-profit fractions with the touch stop on and off at the fitted friction."
+  when: "To see how much the transaction-cost model matters to a result."
+  needs_ib: "no"
+  writes: "no files (prints tables). No database rows; the history store it opens creates any missing empty table in data/historical.db. It sets AIT_BT_TOUCH_STOP in its own process only."
+  example: "python scripts/friction_sensitivity.py --symbols QQQ [--exit-ab]"
+  explained: "-"
+  stamp: "0f288f48a224"
+
+scripts/dte_dimension_flatness.py:
+  group: Study
+  what: "Sweeps one DTE-study dimension at several entry DTEs on identical data to find dimensions that change no trade (flat, so not worth searching)."
+  when: "Before adding a dimension to a DTE search."
+  needs_ib: "no"
+  writes: "no files (prints a table). 5-minute bars are read with the database opened read-only; the engine runs it starts also open the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/dte_dimension_flatness.py --symbol QQQ [--dtes 1 3 7 14] [--workers 3]"
+  explained: "-"
+  stamp: "10c09d2a342a"
+
+scripts/iv_rank_parity_probe.py:
+  group: Study
+  what: "Compares the research IV-rank rise veto with live's IV-rank level gates: how the two ranks relate and how many vetoed days live would have traded anyway."
+  when: "To revisit whether the research veto belongs in research."
+  needs_ib: "no"
+  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table."
+  example: "python scripts/iv_rank_parity_probe.py [--ab --workers 6]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
+  stamp: "090ec11a0a69"
+
+scripts/range_horizon_study.py:
+  group: Study
+  what: "Trains the range model per rolling window and horizon and scores it out of sample: AUROC and Brier skill, the in-range rate above the floor, a reliability table and the time to train."
+  when: "Before enforcing the range gate, or when changing the entry DTE band."
+  needs_ib: "no"
+  writes: "nothing persistent (model artifacts go to a temporary directory that is deleted); history database opened read-only"
+  example: "python scripts/range_horizon_study.py --symbol QQQ"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#5-the-engine)"
+  stamp: "f186cbad8475"
+
+scripts/excursion_range_study.py:
+  group: Study
+  what: "The strike-aware range study: does a model of the holding-period excursion predict no-touch of the short strikes better than option prices and realised volatility?"
+  when: "To rerun that study (its rule was pre-registered in PLAN.md)."
+  needs_ib: "no"
+  writes: "reports/w83a_excursion_<date_time>.json and pickle caches under data/research_cache/w83a; every database is opened read-only"
+  example: "python scripts/excursion_range_study.py --workers 3 [--h 9] [--sensitivities]"
+  explained: "-"
+  stamp: "4c685daf0012"
+
+scripts/post_event_study.py:
+  group: Study
+  what: "Walk-forward study of blocking condor entries for N days after an FOMC event, as entries are already blocked before one."
+  when: "To revisit the post-event blackout question."
+  needs_ib: "no"
+  writes: "reports/post_event_study/entry_dte_<n>[_<tag>]/ (per-variant .json and _summary.txt, results.json, results.md). It changes into the --data-root tree to read its data/historical.db; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/post_event_study.py --entry-dte 14"
+  explained: "-"
+  stamp: "aba5e646519b"
+
+scripts/take_profit_study.py:
+  group: Study
+  what: "Walk-forward study of take-profit ladder variants against the live DTE ladder, with everything else at live parity."
+  when: "To revisit the take-profit ladder."
+  needs_ib: "no"
+  writes: "reports/take_profit_study/entry_dte_<n>/ (per-variant .json and _summary.txt, results.json, results.md); the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/take_profit_study.py [--entry-dte 14]"
+  explained: "-"
+  stamp: "995033d2493c"
+
+scripts/wing_budget_study.py:
+  group: Study
+  what: "Walk-forward study of a smaller maximum loss per condor (the per-trade budget cap) against the current one."
+  when: "To revisit the per-trade risk budget."
+  needs_ib: "no"
+  writes: "reports/wing_budget_study/entry_dte_<n>/ (per-variant .json and _summary.txt, results.json, results.md); the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/wing_budget_study.py [--entry-dte 14]"
+  explained: "-"
+  stamp: "dbccd3137f85"
+
+scripts/probe_w53_roll_atomicity.py:
+  group: IB paper probe
+  what: "Probe of whether IB accepts and fills ONE four-leg cross-expiry order that closes a vertical at one expiry and opens one at another. The subcommands `open`, `roll` and `flatten` PLACE ORDERS."
+  when: "Only as a deliberate experiment on a paper account. It refuses an account whose id does not start with D, and `open`, `roll` and `flatten` refuse outside regular trading hours."
+  needs_ib: "yes"
+  writes: "Orders on the paper account (open, roll, flatten: 1 contract, SPY only); JSONL evidence under reports/w53_probe/; data/ait_state.db read-only. IB client id 97. `preflight` (the default) and `status` place nothing. The subcommand is a positional argument, so it is not in the Flags column."
+  example: "python scripts/probe_w53_roll_atomicity.py preflight"
+  explained: "-"
+  stamp: "fffa35b2cf9a"
+
+scripts/validate_w55_synthetic_delta.py:
+  group: IB paper probe
+  what: "Compares the synthetic per-leg delta with real live option prices from IB on the paper account."
+  when: "Only as a deliberate check on a paper account (it refuses an account whose id does not start with D) before relying on synthetic deltas."
+  needs_ib: "yes"
+  writes: "No orders and no database changes (read-only against the broker); prints a result. IB client id 98."
+  example: "python scripts/validate_w55_synthetic_delta.py"
+  explained: "-"
+  stamp: "d28b1b8dfd5b"
+
+scripts/restate_d1.py:
+  group: One-time migration
+  what: "One-time correction of the scoreboard: replaces booked exit P&L, commissions and exit prices with the broker's own numbers and backfills capital at risk."
+  when: "Do not run again. PLAN.md records it as decided and executed on the trading box."
+  needs_ib: "no"
+  writes: "With --apply it UPDATES trades, daily_stats and bot_state in data/ait_state.db and the DuckDB mirror. Dry run by default (read-only)."
+  example: "python scripts/restate_d1.py"
+  explained: "-"
+  stamp: "3aa913037509"
+
+scripts/restate_r16_dailystats.py:
+  group: One-time migration
+  what: "Backfills the one missing daily_stats row (the date and the trade are fixed in the script) and records its provenance."
+  when: "Do not run unless you know it has not been applied: that cannot be established from this repository (check bot_state)."
+  needs_ib: "no"
+  writes: "With --apply it INSERTs into daily_stats and bot_state in data/ait_state.db. Dry run without the flag."
+  example: "python scripts/restate_r16_dailystats.py"
+  explained: "-"
+  stamp: "3d773462a291"
+
+scripts/restate_w21_tz_aware.py:
+  group: One-time migration
+  what: "Stamps the correct ET offset onto stored naive trade timestamps. Refuses to run if it meets a row it cannot vouch for."
+  when: "Only on a box whose timestamp migration is still outstanding (see the deploy checklist); stop the bot first."
+  needs_ib: "no"
+  writes: "With --apply it snapshots data/ait_state.db to data/backups/ and then UPDATES the timestamp columns of trades, open_positions and exit_outbox. Dry run without the flag."
+  example: "python scripts/restate_w21_tz_aware.py"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#deploy-checklist-every-deploy)"
+  stamp: "91c9df2fb45d"
+
+scripts/typecheck.py:
+  group: Developer
+  what: "The blocking type gate: runs mypy on the config, bot, execution and risk packages and fails on attribute, name and call-argument errors."
+  when: "Before committing a change to those packages; CI-style gate."
+  needs_ib: "no"
+  writes: "nothing"
+  example: "python scripts/typecheck.py"
+  explained: "[TECHNICAL_GUIDE.md](../TECHNICAL_GUIDE.md#6-quality-gates)"
+  stamp: "b8fd7872572e"
+
+scripts/gen_docs.py:
+  group: Developer
+  what: "Writes the generated parts of the documentation (blocks inside documents, and the files in docs/reference/, this scripts reference included); --check fails if anything is out of date; --restamp records a script's code fingerprint in the catalogue after you have re-read its entry."
+  when: "After a change to a setting, limit, job, feature or script."
+  needs_ib: "no"
+  writes: "the generated blocks and docs/reference/*.md (nothing with --check); --restamp edits the stamp lines of scripts/script_catalogue.yaml"
+  example: "python scripts/gen_docs.py [--check]"
+  explained: "[TECHNICAL_GUIDE.md](../TECHNICAL_GUIDE.md#8-maintaining-the-documentation)"
+  stamp: "5199796635df"
+
+scripts/literal_census.py:
+  group: Developer
+  what: "Counts the numeric literals in the result-affecting research code and compares them with an accepted list."
+  when: "When the census test fails, or after adding or converting a research number."
+  needs_ib: "no"
+  writes: "nothing; --update rewrites tests/data/literal_allowlist.json"
+  example: "python scripts/literal_census.py [--update]"
+  explained: "[TECHNICAL_GUIDE.md](../TECHNICAL_GUIDE.md#research-numbers-and-the-literal-census)"
+  stamp: "6d48d60d7af6"
+
+scripts/wingk_study.py:
+  group: Historical
+  what: "Walk-forward sweep of the wing width factor k over 0.6, 0.8, 1.0 and 1.2 for iron condors on SPY, QQQ and IWM."
+  when: "Not part of normal operation. Its pre-registered rule and result are in PLAN.md (the wing_k study entries: the pre-registered rule, then the result)."
+  needs_ib: "no"
+  writes: "reports/wingk_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/wingk_study.py"
+  explained: "PLAN.md (the wing_k study entries)"
+  stamp: "4488ef6c13e3"
+
+scripts/ablation_study.py:
+  group: Historical
+  what: "Walk-forward comparison of gates only versus gates plus per-window ML models (126-day training) for iron condors on SPY, QQQ and IWM. Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. Rule and verdict are in PLAN.md (the ML ABLATION entries). "
+  needs_ib: "no"
+  writes: "reports/ablation_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/ablation_study.py"
+  explained: "PLAN.md (the ML ABLATION entries)"
+  stamp: "5d85f082f828"
+
+scripts/ablation_armB.py:
+  group: Historical
+  what: "The single 'full stack v2' arm of the ablation (126-day training). Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. See the ML ABLATION entries in PLAN.md. "
+  needs_ib: "no"
+  writes: "reports/ablation_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/ablation_armB.py"
+  explained: "PLAN.md (the ML ABLATION entries)"
+  stamp: "8a1c00ddf8dd"
+
+scripts/ablation_confirm.py:
+  group: Historical
+  what: "Confirmation run of the ablation with 365-day training windows (gates only versus gates plus per-window models). Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. See the ML ABLATION and RERUN B VERDICT entries in PLAN.md. "
+  needs_ib: "no"
+  writes: "reports/ablation_confirm/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/ablation_confirm.py"
+  explained: "PLAN.md (ML ABLATION verdict; RERUN B VERDICT)"
+  stamp: "9813294635b2"
+
+scripts/ablation_rerun.py:
+  group: Historical
+  what: "Rerun of the ablation with 365-day training windows, same arms as ablation_confirm. Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. See the RERUN B VERDICT entry in PLAN.md. "
+  needs_ib: "no"
+  writes: "reports/ablation_rerun/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/ablation_rerun.py"
+  explained: "PLAN.md (RERUN B VERDICT)"
+  stamp: "451208c42593"
+
+scripts/range_floor_study.py:
+  group: Historical
+  what: "Walk-forward comparison of range-model confidence floors (0.50 and up) at wing_k 1.6. Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. Its rule is pre-registered in PLAN.md (the RANGE-FLOOR STUDY entry)."
+  needs_ib: "no"
+  writes: "reports/range_floor_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/range_floor_study.py"
+  explained: "PLAN.md (the RANGE-FLOOR STUDY entry)"
+  stamp: "cad70911d3a1"
+
+scripts/touch_stop_impact.py:
+  group: Historical
+  what: "Walk-forward comparison of the short-strike touch stop off versus on, everything else identical. Its docstring describes a different (wing_k) study."
+  when: "Not part of normal operation. Its rule is pre-registered in PLAN.md (the TOUCH-STOP MIRROR entry); the measured effect is in the SIM FIDELITY entry."
+  needs_ib: "no"
+  writes: "reports/touch_stop_impact/. Sets AIT_BT_TOUCH_STOP in its own process. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/touch_stop_impact.py"
+  explained: "PLAN.md (TOUCH-STOP MIRROR; SIM FIDELITY)"
+  stamp: "51fb301b5d6e"
+
+scripts/shadow_tournament.py:
+  group: Historical
+  what: "Tournament of candidate structures (iron condor baseline, iron butterfly, put credit spread, short strangle as a benchmark) on identical windows, 126-day training."
+  when: "Not part of normal operation. Rule and verdict are in PLAN.md (the SHADOW STRATEGY PIPELINE and SHADOW TOURNAMENT VERDICT entries)."
+  needs_ib: "no"
+  writes: "reports/shadow_tournament/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_tournament.py"
+  explained: "PLAN.md (SHADOW STRATEGY PIPELINE; SHADOW TOURNAMENT VERDICT)"
+  stamp: "261262467fd5"
+
+scripts/shadow_round1b.py:
+  group: Historical
+  what: "Second batch of the tournament: call credit spread and jade lizard on the same windows."
+  when: "Not part of normal operation. See the SHADOW ROUND 2 entry in PLAN.md."
+  needs_ib: "no"
+  writes: "reports/shadow_tournament/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_round1b.py"
+  explained: "PLAN.md (SHADOW ROUND 2)"
+  stamp: "190443d516ff"
+
+scripts/shadow_tournament_uncorr.py:
+  group: Historical
+  what: "The tournament on uncorrelated symbols (XLE, GLD, TLT) for six candidate structures. Its docstring names a different output folder."
+  when: "Not part of normal operation. Needs those symbols in the history store."
+  needs_ib: "no"
+  writes: "reports/shadow_tournament_uncorr/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_tournament_uncorr.py"
+  explained: "PLAN.md (SHADOW TOURNAMENT VERDICT)"
+  stamp: "e39dd1bba253"
+
+scripts/shadow_round3.py:
+  group: Historical
+  what: "Third round: iron condor against a wide-wing condor and a broken-wing condor (126-day training)."
+  when: "Not part of normal operation. See PLAN.md (shadow entries)."
+  needs_ib: "no"
+  writes: "reports/shadow_round3/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_round3.py"
+  explained: "PLAN.md (shadow tournament)"
+  stamp: "5c90a6fe0ff6"
+
+scripts/shadow_round3_gated.py:
+  group: Historical
+  what: "Round three again with the ML gates on (365-day training so models train)."
+  when: "Not part of normal operation. See PLAN.md (shadow entries)."
+  needs_ib: "no"
+  writes: "reports/shadow_round3_gated/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_round3_gated.py"
+  explained: "PLAN.md (shadow tournament)"
+  stamp: "a9edb2b8266f"
+
+scripts/shadow_round3_rerun.py:
+  group: Historical
+  what: "Round three again with no per-window models at all (126-day training)."
+  when: "Not part of normal operation. See PLAN.md (the RERUN B VERDICT entry)."
+  needs_ib: "no"
+  writes: "reports/shadow_round3_rerun/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/shadow_round3_rerun.py"
+  explained: "PLAN.md (RERUN B VERDICT)"
+  stamp: "b3b5869378b2"
