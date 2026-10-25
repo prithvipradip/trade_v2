@@ -293,13 +293,10 @@ def build_ait(report_dir: Path) -> dict:
             "step_days": meta.get("step_days", 30),
             "gap_days": meta.get("gap_days", 5),
             "initial_capital": initial_capital,
-            "optimize_per_window": True,
             "optimize_n_trials": meta.get("wf_trials", 50),
-            "objective": "composite",
-            "min_confidence": 0.55,
-            "range_min_confidence": 0.55,
-            "max_concurrent_positions": 1,
-            "optimize_patience": 20,
+            # The archive records no objective: the header shows a dash unless the run said (a fixed "composite"
+            # used to be written here whatever the run used, as were confidence floors that nothing displayed).
+            "objective": meta.get("objective"),
             "optimize_seed": meta.get("optuna_seed", 42),
         },
         "results": {

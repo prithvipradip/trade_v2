@@ -6,7 +6,7 @@ positions.max_position_pct 0.25 -> 0.30 (config VALUES unchanged). The same wave
   * backtest.position_size_pct (research per-trade size) no longer outranges live's per-trade ceiling
   * the per-trade budget must also fit under the aggregate cap (gate 6b-2) and the single-symbol cap
     (gate 6c); above either, every entry is refused at runtime, silently, so it is a startup error
-  * the RUNBOOK table of ranges is the model's (a drift test)
+  * the GUIDE table of ranges is the model's (a drift test)
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from ait.config.settings import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
+GUIDE = ROOT / "docs" / "GUIDE.md"          # the table of ranges lives there (generated: scripts/gen_docs.py)
 
 
 @pytest.fixture(scope="module")
@@ -121,11 +121,15 @@ class TestLinks:
                    risk__max_daily_loss_pct=0.05)
 
 
-class TestRunbookIsTheModel:
+def _ceilings_block() -> str:
+    m = re.search(r"<!-- BEGIN GENERATED: risk_ceilings -->\n(.*?)<!-- END GENERATED: risk_ceilings -->", GUIDE.read_text(), re.S)
+    assert m, "docs/GUIDE.md has no generated block 'risk_ceilings'"
+    return m.group(1)
+
+
+class TestGuideIsTheModel:
     def test_the_ranges_table_matches_the_schema(self):
-        text = RUNBOOK.read_text()
-        sec = text[text.index("## Risk-knob ceilings"):]
-        sec = sec[: sec.find("\n## ", 5)]
+        sec = _ceilings_block()
         rows = re.findall(r"^\|\s*`([a-z_.]+)`\s*\|[^|]*\|\s*([0-9.]+) - ([0-9.]+)\s*\|", sec, re.M)
         models = {"risk": RiskConfig, "positions": PositionConfig, "backtest": BacktestConfig}
         assert {n for n, _, _ in rows} == {
@@ -135,11 +139,10 @@ class TestRunbookIsTheModel:
         for name, lo, hi in rows:
             section, field = name.split(".")
             ge, le = _bounds(models.get(section, RiskConfig), field)
-            assert (float(lo), float(hi)) == (ge, le), f"RUNBOOK says {name} {lo}-{hi}, model {ge}-{le}"
+            assert (float(lo), float(hi)) == (ge, le), f"GUIDE says {name} {lo}-{hi}, model {ge}-{le}"
 
     def test_the_shipped_values_column_is_the_config(self, real_settings):
-        text = RUNBOOK.read_text()
-        sec = text[text.index("## Risk-knob ceilings"):]
+        sec = _ceilings_block()
         for name, value in (("risk.max_position_risk_pct", real_settings.risk.max_position_risk_pct),
                             ("risk.max_daily_loss_pct", real_settings.risk.max_daily_loss_pct),
                             ("positions.max_position_pct", real_settings.positions.max_position_pct)):

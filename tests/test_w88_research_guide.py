@@ -38,11 +38,11 @@ class TestLinks:
         assert real
         assert [n for n in real if not (ROOT / n).exists() and not any(ROOT.glob(f"src/ait/**/{Path(n).name}"))] == []
 
-    def test_named_runbook_sections_exist(self):
-        runbook = (ROOT / "docs" / "RUNBOOK.md").read_text()
-        for title in ("Studies and run records", "Research tunables", "Research fixed limits", "Model hyperparameters",
-                      "One-sided entry gates", "Research-vs-reality parity replay", "Searching the entry DTE", "Feature windows"):
-            assert re.search(rf"^## {re.escape(title)}", runbook, re.M), title
+    def test_named_models_sections_exist(self):
+        models = (ROOT / "docs" / "MODELS.md").read_text()
+        for title in ("Gating: observe and enforce",):
+            assert re.search(rf"^##+ (?:\d+\.? )?{re.escape(title)}", models, re.M), title
+            assert title in TEXT, f"the guide no longer names MODELS section {title!r}"
 
 
 class TestContent:
@@ -55,7 +55,7 @@ class TestContent:
 
     def test_the_quoted_defaults_match(self):
         w, o = WalkForwardTuningConfig(), ObjectivesConfig()
-        assert (w.warm_start_min_win_rate, w.warm_start_min_trades) == (0.75, 3) and "0.75" in TEXT
+        assert (w.warm_start_min_win_rate, w.warm_start_min_trades) == (0.75, 3) and "warm_start_min_win_rate" in TEXT
         assert (o.sharpe_weight, o.win_rate_weight, o.drawdown_penalty) == (0.4, 0.4, 0.2)
         assert "0.4 × Sharpe + 0.4 × win rate − 0.2" in TEXT
 

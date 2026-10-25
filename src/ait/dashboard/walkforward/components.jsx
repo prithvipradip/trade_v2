@@ -75,7 +75,7 @@ function ExperimentHeader({ exp, windowMetrics }) {
             <span><b>Strategy</b> {exp.strategy_label}</span>
             <span><b>Symbols</b> {exp.symbols.join(", ")}</span>
             <span><b>Range</b> {exp.date_range.start} → {exp.date_range.end}</span>
-            <span><b>Objective</b> {exp.config.objective}</span>
+            <span><b>Objective</b> {exp.config.objective ?? "–"}</span>
             <span><b>Windows</b> {r.windows} · train {exp.config.train_days}d / test {exp.config.test_days}d / step {exp.config.step_days}d</span>
             <span><b>Run</b> {exp.run_at.replace("T", " ")} · sha {exp.git_sha}</span>
           </div>
@@ -87,7 +87,7 @@ function ExperimentHeader({ exp, windowMetrics }) {
 }
 
 /* ---------- series / feature toggle panel ---------- */
-function SeriesPanel({ active, onToggle, windows, selectedWindow, onWindow, hasPredictions }) {
+function SeriesPanel({ active, onToggle, windows, selectedWindow, onWindow, hasPredictions, hasSentiment }) {
   const overlays = [
     { key: "ov:sma20", label: "SMA 20", swatch: "var(--c-sma20)" },
     { key: "ov:sma50", label: "SMA 50", swatch: "var(--c-sma50)" },
@@ -100,7 +100,8 @@ function SeriesPanel({ active, onToggle, windows, selectedWindow, onWindow, hasP
     { key: "pane:vol", label: "Realized Vol / ATR", desc: "volatility", swatch: "var(--c-down)" },
     { key: "pane:iv", label: "IV Rank / VIX", desc: "vol regime", swatch: "var(--c-data)" },
     { key: "pane:fractal", label: "Hurst", desc: "fractal regime", swatch: "var(--c-up)" },
-    { key: "pane:sent", label: "Sentiment / P-C", desc: "flow", swatch: "var(--c-data)" },
+    // Retired feature block: offered only when the run actually carries sentiment values.
+    ...(hasSentiment ? [{ key: "pane:sent", label: "Sentiment / P-C", desc: "flow", swatch: "var(--c-data)" }] : []),
   ];
   const Row = ({ item }) => (
     <button

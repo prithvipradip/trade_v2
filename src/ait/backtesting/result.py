@@ -17,8 +17,7 @@ from ait.config.settings import loaded_account_capital, loaded_cash_yield
 
 # W95: the cap on the Sharpe / Sortino annualization frequency: no strategy is treated as trading more often than once
 # per trading day (252 a year). A fixed methodology convention, not a tunable: it decides how EVERY reported Sharpe is
-# annualized, so letting a study change it would make reported Sharpes incomparable across runs. See RESEARCH_GUIDE.md,
-# "Sharpe annualization".
+# annualized, so letting a study change it would make reported Sharpes incomparable across runs. See docs/RESEARCH_GUIDE.md "How is Sharpe annualized?".
 SHARPE_ANNUALIZATION_CAP = 252.0
 
 

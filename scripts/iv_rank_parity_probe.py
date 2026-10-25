@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from ait.config.runtime_env import apply_runtime_env_defaults
 
-apply_runtime_env_defaults()  # before any trading-subsystem import (CLAUDE.md)
+apply_runtime_env_defaults()  # before any trading-subsystem import (docs/TECHNICAL_GUIDE.md "Conventions")
 
 import argparse  # noqa: E402
 import sqlite3  # noqa: E402

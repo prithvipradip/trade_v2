@@ -6,13 +6,14 @@ and written through HistoricalDataStore. The five release types the engine's mac
 gate uses (FOMC, CPI, NFP, PCE, GDP advance) are derived into `engine_event_type`
 by `ait.data.economic_calendar.derive_engine_event_types` (the single definition).
 
-A non-empty --table-prefix is required (research data; the live tables are never
-written) unless --allow-live-tables is passed.
+An empty --table-prefix (the default) writes the one shared set of history tables; every row carries its
+source tag. --allow-live-tables is an accepted no-op. (A non-empty prefix would create and fill a separate
+set of tables: do not pass one unless you mean to.)
 
 Usage:
     python scripts/load_econ_calendar_csv.py \\
         --csv data/investing_econ_calendar_2024-01-01_onward_UTC.csv \\
-        --table-prefix research_ [--db-path data/historical.db] [--dry-run]
+        [--db-path data/historical.db] [--dry-run]
 
 Also writes reports/econ_calendar_audit_<date>.json: the CSV's five engine event
 types compared with the live hardcoded calendar (read-only; fixing the hardcoded

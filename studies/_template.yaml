@@ -6,7 +6,7 @@
 # Commit the file BEFORE running the study; do not edit it afterwards (a changed study is a new file).
 # Every run writes a run record (resolved settings, raw files, commit, data fingerprints, seeds, merged
 # search space and its hash) to its run folder and, if MLflow is installed, to MLflow.
-# See docs/RUNBOOK.md "Studies and run records".
+# See docs/RESEARCH_GUIDE.md "Studies and run records".
 
 name: template_example          # lowercase letters, digits, underscores; names the run folder / MLflow experiment
 question: >

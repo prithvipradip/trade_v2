@@ -188,7 +188,7 @@ SHUTDOWN_MARKS_SNAPSHOT_TIMEOUT_SECONDS = 10
 # They are deliberately CODE, not config: they are the line the paper-relaxed
 # config values (spread 0.40, volume 0) are checked AGAINST, so making them
 # tunable would let the same edit that loosens a gate also loosen its check.
-# docs/RUNBOOK.md's go-live checklist documents both numbers.
+# docs/RUNBOOK.md "Go-live day checklist" lists both numbers.
 _LIVE_MAX_SPREAD_PCT = LIVE_MAX_SPREAD_PCT   # W70: values live in ait.config.invariants
 _LIVE_MIN_VOLUME = LIVE_MIN_VOLUME
 
@@ -397,7 +397,7 @@ class TradingOrchestrator:
             _vol_env = int(_os_g5.environ.get("AIT_LIQ_MIN_VOLUME", str(_LIVE_MIN_VOLUME)))
             _spread_cfg = float(getattr(settings.options, "max_bid_ask_spread_pct",
                                         _LIVE_MAX_SPREAD_PCT) or _LIVE_MAX_SPREAD_PCT)
-            # W42 (R26 policy-vs-impl-4): docs/RUNBOOK.md:153 documents this
+            # W42 (R26 policy-vs-impl-4): docs/RUNBOOK.md "Go-live day checklist" documents this
             # gate as "AIT_LIQ_MIN_VOLUME >= 10" and claims the live-mode
             # startup assertion enforces it. It was `< 1`, so any value 1-9
             # passed — the volume half of the documented floor was never
@@ -409,7 +409,7 @@ class TradingOrchestrator:
                     f"paper-relaxed (AIT_LIQ_MAX_SPREAD={_spread_env}, "
                     f"AIT_LIQ_MIN_VOLUME={_vol_env}, "
                     f"config max_bid_ask_spread_pct={_spread_cfg}). Tighten "
-                    "them before live (see docs/RUNBOOK.md go-live checklist)."
+                    "them before live (see docs/RUNBOOK.md \"Go-live day checklist\")."
                 )
 
         # GOV-6 retired (W50): W41 added a startup refusal here for

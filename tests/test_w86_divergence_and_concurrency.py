@@ -216,7 +216,9 @@ class TestDivergenceReport:
     def test_the_known_classes(self, real):
         by = classify_divergences(default_divergences(real))
         assert "ml.entry_gates_enabled" in by["deliberate_research_difference"]
-        assert "sentiment.enabled" in by["dead"]
+        # sentiment.enabled is registered as dead; config.yaml now ships it at the code default (false), so it no longer
+        # diverges and does not appear in the report, but the registry entry stays so the class remains demonstrable.
+        assert st.DIVERGENCE_CLASSES["sentiment.enabled"][0] == st.DIVERGENCE_DEAD
         assert "backtest.max_concurrent_positions" in by["research_reads_loaded"]
         assert "trading.max_daily_trades" in by["live_only"]
 

@@ -367,7 +367,7 @@ EXEMPT: dict[str, str] = {
     "meta_label.retrain_with_primary":
         "the live trainer has no meta-labeler retrain; the gate itself is off (enabled: false).",
     "exit.auto_hedge":
-        "no hedging code exists anywhere in src/; docs/AUDIT_R12.md's 'one flip from live' is false.",
+        "no hedging code exists anywhere in src/; docs/archive/AUDIT_R12.md's 'one flip from live' is false.",
     # Read, but only inside settings.py through a derived property, which this scan skips:
     "trading.first_hour_end_et": "read via TradingConfig.first_hour_end_hour (property)",
     "trading.midday_end_et": "read via TradingConfig.midday_end_hour (property)",

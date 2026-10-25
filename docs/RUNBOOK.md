@@ -1,7 +1,12 @@
 # AIT v2 — Operator Runbook
 
-One page: what each alert means and what YOU do. The bot manages exits on its
-own; your job is responding to these messages. (Governance audit GOV-5.)
+One page: what each alert means and what YOU do. The bot manages exits on its own; your job is responding to these messages and keeping the box healthy.
+Not for: how the system works ([GUIDE.md](GUIDE.md)), installing and first run ([GETTING_STARTED.md](GETTING_STARTED.md)), the models ([MODELS.md](MODELS.md)) or research ([RESEARCH_GUIDE.md](RESEARCH_GUIDE.md)).
+Limits, timers and ceilings these procedures refer to are generated tables in [GUIDE.md](GUIDE.md) sections 7 and 8; every setting is in [reference/SETTINGS_LIVE.md](reference/SETTINGS_LIVE.md). Terms: [GLOSSARY.md](GLOSSARY.md).
+
+**Contents:** [Kill switches](#kill-switches-no-kill--9-needed) · [Alert → action](#alert--action) · [Books versus broker](#resolving-a-books-versus-broker-break) · [Manual intervention](#manual-intervention-procedure-closingadjusting-any-tracked-position-yourself) ·
+[Daily routine](#daily-2-minute-routine) · [Deploy checklist](#deploy-checklist-every-deploy) · [Data catch-up](#data-catch-up-and-maintenance) · [Troubleshooting](#troubleshooting) ·
+[Quarterly drills](#quarterly-drills-scheduled--first-week-of-jan--apr--jul--oct) · [Go-live checklist](#go-live-day-checklist-from-planmd-gates--do-not-skip)
 
 ## Kill switches (no `kill -9` needed)
 | Action | How |
@@ -13,683 +18,212 @@ own; your job is responding to these messages. (Governance audit GOV-5.)
 | Resume auto-relaunch | delete `data/KEEPER_PAUSE` |
 | Full stop | `data/KEEPER_PAUSE` FIRST (or the keeper relaunches within ~90s and undoes the stop), then `data/HALT`, then stop processes if truly needed |
 
+`data/HALT_UNTRACKED` is set by the bot itself (see "UNTRACKED OPTION POSITION" below); do not create it by hand. It clears itself at the next reconcile once every untracked position is declared or gone ([Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break)).
+
 ## Alert → action
-| Telegram alert | Meaning | Do this |
+
+Alerts arrive on Telegram; most are also in `logs/`. The text before the first colon or dash is the key. `{...}` varies. A row says what it means and what to do; "nothing" means informational.
+Every refusal below blocks **entries only**; open positions keep being managed unless the row says otherwise.
+
+### The bot or the broker connection is down
+| Alert | Meaning | Do this |
 |---|---|---|
-| `READ-ONLY: orders rejected (Error 321)` | Gateway session lost trade rights | Gateway → Configure → API → Settings: CHECK "Read-Only API" → Apply → UNCHECK → Apply → OK. Bot recovers on next probe. |
-| `IB Gateway unreachable (daily maintenance)` | Normal overnight restart | Nothing for 30–60 min. If persists into pre-market: start Gateway manually (IBC should auto-login). |
-| `IB port fallback: .env IBKR_PORT=7497 (...) but 4002 (...) is what is up` (W94) | `.env` names TWS but IB Gateway is running (or the reverse). The bot and the supervisor now use the other endpoint of the SAME account type (paper 7497 <-> 4002, live 7496 <-> 4001; never across) instead of waiting, so nothing is down. The status page (:8503 "IB endpoint"), the digest line and log `ib_port_fallback` / `ibkr_port_fallback` keep showing it | Fix `.env` when convenient: `python scripts/sync_ibkr_port.py` (dry run), then `--apply` (changes only the IBKR_PORT value), then restart the supervisor. The file `data/ib_endpoint.json` is the supervisor's record; never edit it. |
-| `BOT DOWN — gave up after N restarts` | Supervisor exhausted restart budget | Check Gateway is logged in; then start manually: `python run_orchestrator.py`. Investigate logs/bot_stdout.log tail. |
-| `CIRCUIT BREAKER: Trading halted` | Consecutive losses / API failures tripped the breaker | Entries frozen until the breaker resets (see reason in the message). Review what tripped it on :8503 + logs. Notification is throttled (once per trip + hourly); the per-cycle log line `trading_halted` shows it's still active. |
-| `LOOP IMPAIRED` | The trading loop errored N consecutive cycles | Stops/TPs may not be running. Check `logs/bot_stdout.log` tail for the exception; if it repeats, `data/HALT` + restart per the deploy checklist. A restart does NOT fix a code bug — capture the traceback first. |
-| `component down/degraded (watchdog)` | A subsystem (ibkr/market_data/...) stopped heartbeating | Usually self-recovers (watchdog restarts it). Two in a row for the same component: check Gateway login + data lines before restarting anything. |
-| `DAILY MTM LOSS HALT` | Day's mark-to-market loss breached the cap | Entries auto-frozen; exits still run. Review the book on :8503. Halt clears at next ET day. If you decide to close a bleeder manually, FOLLOW THE MANUAL-INTERVENTION PROCEDURE below — the bot's exit engine is live on that position every 30s and will fight an unannounced manual close. |
-| `RECONCILE NEEDS ATTENTION: ASSIGNMENT` | Short option assigned — stock appeared | In TWS/Gateway: liquidate the assigned stock, verify the remaining legs, then delete `data/HALT_UNTRACKED` if present. |
-| `UNTRACKED OPTION POSITION ... ENTRIES FROZEN` | Order filled during a crash window; bot has no record | In TWS: identify the position and resolve it AT THE BROKER (usually: close it). Only after the broker book is flat of it, delete `data/HALT_UNTRACKED`. Deleting the file while the position still exists just re-freezes at the next reconcile — "leave it and note it" is not an option the code supports. |
-| `PDT BLOCKED EXIT` | A stop wanted to fire but PDT rules block same-day close | Decide: accept overnight risk, or close manually (accepting the PDT strike). |
-| `MARKS MISSING x10 ticks` | No option marks → stop/TP protection NOT running | Check: is the live account logged in elsewhere (mobile/web steals the ONE data slot)? Log it out. Check Gateway data lines. |
-| `EOD RECON: N BREAK(S) ...` | Books vs broker mismatch | Compare :8503 positions vs TWS portfolio. Common cause: manual action at broker. Fix the DB via close/adopt or ask the assistant. |
-| `EOD RECON: CLEAN | ... gap stress: $X` | Daily all-clear | Glance at the −10% gap-stress number. If it approaches your pain threshold, reduce short-premium count. |
-| `model retrain FAILED/HUNG` | Models stale | Not urgent same-day. Re-run: `python run_orchestrator.py --retrain`. W89: the retrain takes its daily bars from IB only (own session, `ml.retrain_ib_client_id`, never Yahoo) and aborts with exit 3 **before any model or `daily_prices` write** when TWS/Gateway is down, the client id is refused, or IB returns no daily bars for `^VIX`/SPY/the universe (`retrain_*.log` says which). Bring TWS/Gateway up first, then re-run. |
-| `order_rate_limit_tripped` (log CRITICAL) | >8 orders/min — malfunction | Create `data/HALT`, inspect logs, contact assistant. Do NOT just restart. |
-| `STATE DB BACKUP FAILED` | Track record unprotected | Check disk space; run a manual copy of `data/ait_state.db`. |
+| `BOT DOWN — gave up after N restart attempts` | The supervisor used its restart budget and stopped restarting the bot. **The supervisor itself is still running** | Read the tail of `logs/bot_stdout.log` and fix the cause (Gateway not logged in, a config error, a traceback). The supervisor tries again by itself once more than 30 minutes have passed since its last restart attempt. To restart sooner, do a full stop and start (Kill switches, "Full stop"): `python run_orchestrator.py` is refused while the old supervisor holds the lock |
+| `bot restarting (attempt n/N, exit_code=…)` | The bot exited and was restarted | Nothing for one or two; by attempt 3 something is wrong: read `logs/bot_stdout.log`. A restart does not fix a code bug: capture the traceback first |
+| `BOT RELAUNCH FAILED: the process exited within Ns` | The new bot died at launch | `logs/bot_stdout.log`; the keeper keeps retrying, so fix the cause (config error, Gateway) |
+| `BOT HUNG: trading-loop heartbeat N min stale` | The loop stopped answering; positions were unmanaged for that window; the supervisor restarted it | Check it came back (:8503). If it repeats, `data/HALT`, capture the traceback, then follow the deploy checklist |
+| `REFUSING to start the trading bot: …` (two variants) | Another `ait.main` is already running, or the process table is unreadable; a second bot would double-trade | Verify the PID, kill the orphan by hand (never auto-killed), and the supervisor starts a fresh bot on the next health cycle; if "unreadable", check permissions on the host |
+| `REFUSING to start: the mode is paper but IBKR_PORT … is a LIVE-account endpoint`, `REFUSING to start LIVE: …` (no `AIT_ALLOW_LIVE`, not a live-account endpoint, or a paper account id), `… could not decide paper or live` | The mode and the IB endpoint disagree, or live was requested without the interlock. Nothing was started. Repeats are throttled to one alert per 30 minutes | Make `config.yaml` `trading.mode`, `.env` `TRADING_MODE`, `AIT_ALLOW_LIVE`, `IBKR_PORT` and `IBKR_ACCOUNT` agree: paper needs a paper endpoint (4002 / 7497); live needs all of the go-live conditions. The supervisor retries on the next health cycle |
+| `SINGLETON LOCK UNAVAILABLE` | Supervisor cannot take its lock (permissions or disk) and refused to start | Check `data/` permissions and free disk space, then start again |
+| `cannot start bot — IB Gateway not available on port N` | Bot start deferred: Gateway/TWS is not answering | Is Gateway/TWS logged in? Start it. This alert repeats at most every 30 minutes |
+| `IB Gateway unreachable on port N (likely daily maintenance)` | Normal overnight restart | Nothing for 30–60 min (IB restarts nightly); the alert says no restart budget is spent. If the port stays closed the supervisor tries to bring Gateway back itself after a grace period (next rows) |
+| `IB Gateway was down N min — attempted automatic restart (k/K)` | The supervisor tried to bring Gateway back | Nothing; the bot resumes on its own once the port answers |
+| `IB Gateway STILL down … MANUAL ACTION NEEDED`, `IB Gateway/TWS has not answered … no automated recovery`, `… automatic restart could not be launched` | Automatic recovery is exhausted or unavailable | Look for a login or 2FA prompt on the Gateway window; start Gateway/TWS by hand |
+| `IB port fallback: .env IBKR_PORT=… but … is what is up` | `.env` names TWS but Gateway is up (or the reverse). The bot and supervisor use the other endpoint of the **same account type** (never across), so nothing is down. The status page ("IB endpoint"), the digest and `ib_port_fallback` keep showing it | Fix `.env` when convenient: `python scripts/sync_ibkr_port.py` (dry run), then `--apply` (changes only the `IBKR_PORT` value), then restart the supervisor. `data/ib_endpoint.json` is the supervisor's record; never edit it |
+| `dashboard NOT started: port N is held by a process the supervisor won't kill` | A foreign process owns a dashboard port | See `dashboard_port_held_foreign` in `logs/orchestrator.log` for the holder; free the port or change `dashboard.*_port` |
+| `supervisor started`, `BOT STARTED \| Mode: …`, `Bot shutting down`, `Telegram channel RECOVERED` | Lifecycle notices. After a Telegram outage, alerts sent while it was down were **not** re-delivered | Nothing; after "RECOVERED" check `notification_dropped_after_retries` in the logs |
+
+### Can it trade?
+| Alert | Meaning | Do this |
+|---|---|---|
+| `READ-ONLY: IB Gateway is rejecting all orders (Error 321)` | The bot's test order was rejected as read-only, so **nothing can trade or exit**. The code's own diagnosis is a Gateway login that came up read-only (a session state rather than the Read-Only API setting) | Restart Gateway and log in as IB API, as the alert says. Also keep the Read-Only API setting unchecked ([GETTING_STARTED.md](GETTING_STARTED.md) section 3). The bot keeps re-probing and sends `Trading ENABLED again` when orders are accepted |
+| `CANNOT VERIFY TRADING: the read-only probe did not complete` | Unknown whether orders are accepted; a read-only session rejects silently | Check the Gateway window |
+| `CIRCUIT BREAKER: Trading halted - {reason}` | Daily loss, consecutive losses or API failures tripped the breaker; **entries frozen** until it resets | Read the reason in the alert. It is sent once per trip and then hourly while the breaker stays tripped; `trading_halted` in `logs/` repeats it every scan cycle. The breaker persists across restarts and a daily-loss trip clears at the next ET day |
+| `DAILY MTM LOSS HALT: day P&L … breached the daily-loss cap` | Entries auto-frozen for the day; exits still run | Review the book on :8503. Clears at the next ET day. If you decide to close a bleeder by hand, follow the manual-intervention procedure so your close and a working bot exit order cannot both fill |
+| `MTM BRAKE NOT EVALUATING` | The daily-loss halt is inactive until fixed; entries are **not** blocked by it | Read the error in the message and `mtm_check_failed`; consider `data/HALT` until fixed |
+| `MTM BASELINE DEGRADED` | Today's loss baseline was taken after the open; an overnight gap may be under-counted | Informational; the next clean pre-stamp fixes it |
+| `LOOP IMPAIRED — {kind}: N consecutive failures` | The trading loop is erroring; **stops/take-profits may not be running** | Check the tail of `logs/bot_stdout.log` for the exception. If it repeats: `data/HALT` and restart per the deploy checklist (a restart does not fix a code bug: capture the traceback first) |
+| `WATCHDOG ALERT: {component} is DOWN and recovery failed. Errors: N, Last: …` | The watchdog tracks three components: `trading_loop`, `ibkr` and `market_data`. One goes DOWN after 10 recorded errors, or after a missed heartbeat (`market_data` allows three scan intervals). `ibkr` is first retried by reconnecting; this alert means that failed. The other two have no automatic recovery | Read `Last:`. `ibkr`: check the Gateway login and connection. `market_data`: check the market-data feed and subscriptions. `trading_loop`: see `ERROR:` and `LOOP IMPAIRED` and `logs/bot_stdout.log`. At most one alert per component per hour |
+| `ACCOUNT DATA STALE N min` | Risk uses a stale account snapshot; the breaker halts trading if it can ("COULD NOT HALT — halt manually" means create `data/HALT`) | Check the Gateway connection and that the account is the one you expect |
+| `ERROR: {…}` | An unhandled error in a phase; the bot waits a minute and continues | Read the log around it; repeated errors: `data/HALT` and investigate |
+| `CAP-GRID INCOHERENT at NLV $…` | The startup/size self-test found the per-trade budget, breaker or caps incoherent (entries may silently build nothing) | Fix the named knobs (`risk.max_position_risk_pct`, `positions.max_position_pct`, breaker); ranges and links: [GUIDE.md](GUIDE.md) section 7.4 |
+| `WARNING: live-mode capital base is the HARDCODED DEFAULT` | Live mode with no capital base set; every risk % and drawdown reading is wrong | Set `AIT_CAPITAL_BASE` before trading live |
+
+### Data and gate failures (all fail closed: entries refused, exits unaffected)
+| Alert | Meaning | Do this |
+|---|---|---|
+| `VIX DATA OUTAGE` | No VIX print from either source for longer than the last-known-good window; credit entries refused | Check the market-data feed and Yahoo/IB VIX; clears itself |
+| `IV DATA OUTAGE — {symbol}` | IV rank could not be measured for that symbol | Check IB option-IV data for the symbol; clears itself |
+| `EARNINGS DATA UNAVAILABLE for {symbol}` / `DIVIDEND DATA UNAVAILABLE for {symbol}` | No confirmed calendar answer and no usable last-known-good | Check the data source; clears itself when a fetch succeeds |
+| `RANGE GATE UNAVAILABLE` | In enforce mode, the range model produced no prediction | Check `models/range.pkl` exists and loaded; re-run the retrain (below). Irrelevant in observe mode |
+| `ENTRY GATE BROKEN — the pre-event blackout check has failed N times` | The macro-calendar check is erroring; credit entries are refused | Read the error in the message; check the calendar tables in `src/ait/data/economic_calendar.py` |
+| `ECONOMIC CALENDAR NEARLY EXHAUSTED` | The hard-coded FOMC/CPI/NFP/GDP/PCE tables are about to run out; the event guards would go blind | Extend the tables in `src/ait/data/economic_calendar.py` |
+| `COOLDOWN CHECK FAILED ({symbol})` | The post-stop re-entry guard could not run; credit entries blocked | Read the exception in the log; clears when it can run |
+
+### Positions and exits
+| Alert | Meaning | Do this |
+|---|---|---|
+| `MARKS MISSING xN ticks` | No option marks: stop/take-profit protection is **not running** (only DTE safety exits) | One common cause: the live account is logged in elsewhere (mobile or web takes the single market-data slot, Error 10197): log it out. Otherwise check the Gateway data lines |
+| `STALE EXIT FEED: {symbol}` | The underlying quote stopped advancing; the touch stop now needs corroborating ticks | Check the market-data feed |
+| `TOUCH STOP NOT EVALUATING` | The short-strike touch check raised an error: the only loss exit on a credit structure is off for that position | Check the trade's legs data in :8503 and the log; consider closing by hand via the manual-intervention procedure |
+| `PDT BLOCKED EXIT` | A stop wanted to fire but PDT rules block a same-day close; the position rides until tomorrow | Decide: accept the overnight risk, or close manually (accepting the PDT strike) |
+| `EXIT REFUSED (position not at broker)` | The bot wanted to exit (stop, target or time) but a fresh broker query shows the legs are gone, usually because you closed them. It placed no order and booked the trade itself | Usually nothing: the alert ends "Booked closed from broker records." Compare the booked P&L with your TWS fill. If it ends "booking it failed — the row needs manual review", the trade is still open in the books: see [Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break) |
+| `EXIT REFUSED (partial structure)` | Only some legs are at IBKR (manual close? assignment?); reversing all would open inverted positions | **Close the remainder at IBKR yourself** |
+| `EXIT DEFERRED (no quotes)` / `(no quotes, no mark)` / `EXIT WITHOUT QUOTES` | No combo NBBO to price a close; the bot will not market-order a multi-leg or short blind. It retries each cycle, or prices from a fallback with a cap | Check the market-data feed; if it repeats, consider closing by hand |
+| `EXIT REPEATEDLY REJECTED: {trade}` | Several fast rejects: the contract may be halted or too illiquid at the quoted price | Check it manually at the broker |
+| `SEC 8-K filed for {symbol} — flattening positions` | A material filing triggered a flatten of that symbol | Watch the exit complete on :8503 |
+| `CRITICAL: fill landed on a TERMINAL trade row` | A real position may be live at the broker with no managing row | Check TWS and the untracked-option freeze immediately |
+| `order_rate_limit_tripped` (log, CRITICAL) | More orders in a minute than the fixed backstop allows: a malfunction | Create `data/HALT`, inspect logs, do **not** just restart |
+
+### Books versus broker
+| Alert | Meaning | Do this |
+|---|---|---|
+| `RECONCILE NEEDS ATTENTION: …` | The reconcile found either an assignment (`UNTRACKED STOCK POSITION (possible ASSIGNMENT)`: stock appeared) or an incomplete structure (`PARTIAL legs missing for <trade>: [...] — possible assignment`: some legs are gone at the broker, by a manual close or an assignment) | Assignment: in TWS liquidate the assigned stock and verify the remaining legs; the freeze clears itself at the next reconcile once the stock is gone or declared. Partial legs: the bot never closes half a structure, so close the remainder at the broker, then see [Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break) |
+| `UNTRACKED OPTION POSITION … ENTRIES FROZEN` | An option position at the broker has no record in the bot's books (a trade you placed yourself, or an order that filled in a crash window). It was seen on two separate reconcile passes, so new entries are frozen (`data/HALT_UNTRACKED`) and a Telegram prompt asks whether it is yours | Reply **yes** (or tap "Yes, mine") if you placed it: the bot will not manage it but still counts it in its risk totals, and the freeze lifts at once. Otherwise close it at the broker; the file clears itself at the next reconcile. "No, investigate" keeps the freeze. See [Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break) |
+| `Position discrepancies found` | A pre-market (or deferred) reconcile found differences between the books and the broker | Compare :8503 with the TWS portfolio; the usual cause is a manual action at the broker. See [Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break) |
+| `{PHASE}: broker NOT connected — positions were NOT reconciled` | A reconcile ran against a disconnected broker; **this is not a clean result** | Fix the connection; the bot reconciles as soon as it returns |
+| `EOD RECON: N BREAK(S) …` | The end-of-day reconcile listed N findings and shows the first three. A finding is not always an open problem: a trade you closed by hand appears as `Local position not in IBKR (likely closed)` and is booked in the same pass | Read the lines under it, compare :8503 with TWS, and follow [Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break) |
+| `EOD RECON: CLEAN \| … gap stress: $X` | Daily all-clear | Glance at the −10% gap-stress number; if it nears your pain threshold, reduce the short-premium count |
+
+### Models, backups and reporting
+| Alert | Meaning | Do this |
+|---|---|---|
+| `model retrain FAILED (exit N)` / `model retrain HUNG` | Models are stale (not urgent same day) | Re-run `python run_orchestrator.py --retrain`. The retrain takes its daily bars from IB only (own session) and aborts with exit 3 **before any write** when TWS/Gateway is down, the client id is refused, or IB returns no daily bars (`retrain_*.log` says which): bring TWS/Gateway up first |
+| `STATE DB BACKUP FAILED` | The track record is unprotected | Check disk space; make a manual copy of `data/ait_state.db` |
+| `Short-DTE friction collection {status}` | The optional research collection failed; that day's samples may be lost for good | Only if you enabled it: see [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md) section 10.1 |
+| `GO-LIVE SCORECARD: GATE READOUT FAILED` | The Friday scorecard could not be computed | Run `python status.py` for the scorecard; read the error |
+| `DIGEST: …` and `GO-LIVE SCORECARD (since …)` | The morning and evening summaries and the Friday scorecard. A **missing** morning digest is itself an alarm | Read them; investigate a missing one |
+
+## Resolving a books-versus-broker break
+The bot keeps its own books (`data/ait_state.db`); the broker holds the truth. Some trades are yours, placed at the broker, not the bot's. The **reconciler** compares the two and treats the broker as right. It runs at startup, pre-market, post-market (this produces `EOD RECON`), again if an earlier pass found the broker disconnected, and at once when you answer a Telegram prompt below. Separately, before the bot acts on any exit it checks that trade's legs against a fresh broker query.
+
+| What happened | What the bot does by itself | What you do |
+|---|---|---|
+| You closed **all legs** of a bot trade by hand | If an exit then fires first (stop, target, time), the exit path confirms the legs are gone, places **no order**, books the trade and sends `EXIT REFUSED (position not at broker)`. Otherwise the next reconcile books it (`Local position not in IBKR`). If the broker shows no option positions at all, it first re-queries the broker and books only if that confirms the book is flat; if the broker does not answer, it books nothing and tries again at the next pass | Nothing to repair. Compare the booked P&L with your TWS fill (below) |
+| You closed **only some legs** | Nothing is closed. The reconcile reports `PARTIAL legs missing for <trade>` (`RECONCILE NEEDS ATTENTION`) and an exit that fires is refused (`EXIT REFUSED (partial structure)`) | Close the remainder at the broker. The trade is then booked as in the row above |
+| You **opened** an option or stock position the bot has no record of (also: a fill during a crash window, or an assignment) | An **option** is first reported as a break (`UNTRACKED OPTION POSITION (1st sighting, freeze deferred)`); if the next reconcile pass still sees it, entries freeze (`data/HALT_UNTRACKED`) and a Telegram prompt is sent. A **stock** position (usually an assignment) freezes at once (`UNTRACKED STOCK POSITION`). The bot never closes either | Reply **yes** if it is yours: the bot ignores it for management but still counts it in its risk totals (capital at risk, concentration, open positions), and the freeze lifts at once. Or close it at the broker. The file clears itself at the next reconcile once the position is declared or gone. When a declared position later disappears the bot tells you and forgets it |
+| A **bot position expired** while the books still show it open | The reconcile books it at intrinsic value (`reconciler_expired_intrinsic`), or as `reconciler_unknown_exit_expired_needs_review` ($0) when the underlying price is unavailable | Check the booked row if it says needs review |
+| The bot could **not book** it (`booking it failed — the row needs manual review`) | The trade stays open in the books and a later reconcile tries again | If it is still open after the next end-of-day reconcile, a developer session must close the row; see "What to give a developer session" |
+
+**How a vanished trade is booked.** The bot takes the realized P&L the broker reports for exactly that trade's legs, when every leg's figure is a usable number (exit reason `reconciler_ibkr_realized`). Otherwise it books **$0** with exit reason `reconciler_unknown_exit` and flags it for review. Rows booked as `reconciler_unknown_exit*` do not count in the go-live verdict (`reporting/go_live.py`), so a $0 placeholder cannot flatter or damage the track record; your TWS fills remain the truth for the real P&L.
+
+**What to give a developer session** when a row must be closed by hand: the trade id, the broker's position or the fill you saw in TWS (price, time, quantity), and the state of the bot (stopped, with a copy of `data/ait_state.db` taken first). Do not edit the live database by hand: it is the track record, and a trade that is already closed must never be closed twice.
 
 ## Manual intervention procedure (closing/adjusting ANY tracked position yourself)
-The exit engine evaluates every tracked position every 30 seconds and does not
-know you are acting. R13 executed proof: after a manual flatten the monitor
-still demanded the exit and `_execute_exit` places the reverse combo without a
-broker-position check — the bot would rebuild what you just closed, inverted
-(same end-state class as the 07-13 incident). So, in order:
+The exit engine evaluates every tracked position every 30 seconds and does not know you are acting. Since it checks the broker before it exits, a manual close no longer makes it rebuild the position inverted: with all legs gone it places no order, books the trade and alerts, and with some legs gone it refuses and alerts ([Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break)). The risk that remains is a bot exit order that is *working* while you close: if both fill, the position is closed twice and an opposite position opens. So, in order:
 1. `New-Item -ItemType File data\HALT` (freezes entries; exits keep managing).
-2. In TWS, CANCEL the bot's working exit orders on that position — or, if
-   you're closing the whole book, `New-Item -ItemType File data\KEEPER_PAUSE`
-   FIRST (else keeper_ait.bat relaunches the whole stack within ~90s and
-   undoes your stop — this raced the operator once, R13), then stop the bot
-   processes.
+2. In TWS, CANCEL the bot's working exit orders on that position. If you are closing the whole book, create `data\KEEPER_PAUSE` FIRST (else `keeper_ait.bat` relaunches the whole stack within ~90s and undoes your stop), then stop the bot processes.
 3. Do your manual close(s). Verify fills in TWS.
-4. Positions NOT in the bot's books (untracked): safe to close anytime; the
-   bot has no exit path referencing them (verified). Then delete
-   `data/HALT_UNTRACKED` once the broker is flat of them.
-5. Restart/resume the bot; the next reconcile books your closes (note: if you
-   flattened the LAST option position, the zero-options mass-close guard
-   refuses to book it — expect an `EOD RECON` break and resolve via
-   close/adopt with the assistant). If you created `data/KEEPER_PAUSE` at
-   step 2, delete it too so the keeper resumes relaunching.
+4. A position that is **not** in the bot's books (untracked) can be closed any time; the bot has no exit path referencing it, and the freeze file clears itself at the next reconcile.
+5. Restart/resume the bot. The books are corrected by the reconcile or the next exit, as in the table above; no manual repair is needed unless an alert says booking failed. If you created `data\KEEPER_PAUSE`, delete it too so the keeper resumes relaunching.
 
 ## Daily 2-minute routine
-1. Glance at Telegram: any non-CLEAN EOD recon? any CRITICAL?
-2. Open http://localhost:8503 — positions green/red, unrealized total sane?
-3. Friday extra: confirm the off-box mirror has CURRENT CONTENT (timestamps
-   lie — `copy2` back-dates them; the backup job now hash-verifies, so any
-   `STATE DB BACKUP FAILED` alert this week means the mirror is suspect):
-   `python -c "import sqlite3; print(sqlite3.connect(r'file:C:/Users/prith/Documents/ait_backups/ait_state.latest.db?mode=ro', uri=True).execute('SELECT MAX(exit_time) FROM trades').fetchone())"`
-   — must show this week's latest close. (And that folder syncs to cloud.)
-4. Reading the OTHER box's logs: the supervisor fetches `origin/shared-logs` itself every
-   weekday at **16:50 ET** (5 min after this box's 16:45 publish; a fetch only, it never
-   touches the checkout, and it does not need `AIT_LOG_OWNER`). Its log line
-   `shared_logs_fetched` carries `latest_by_owner`: a stale date there means that box has
-   stopped publishing. Read a day with
-   `python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD --no-fetch`
-   (drop `--no-fetch` to force a fresh fetch). Publishing your OWN days additionally needs
-   `AIT_LOG_OWNER=<name>` in this box's `.env` (the job is silent without it).
+1. Glance at Telegram: any non-CLEAN EOD recon? any CRITICAL? Did the morning digest arrive?
+2. Open http://localhost:8503: positions green/red, unrealized total sane?
+3. Friday extra: confirm the off-box mirror has CURRENT CONTENT (timestamps lie; the backup job hash-verifies, so any `STATE DB BACKUP FAILED` alert this week means the mirror is suspect):
+   `python -c "import os,sqlite3; p=os.path.expanduser('~/Documents/ait_backups/ait_state.latest.db'); print(sqlite3.connect('file:'+p+'?mode=ro', uri=True).execute('SELECT MAX(exit_time) FROM trades').fetchone())"`
+   (the mirror is written under the home folder of the user running the supervisor). It must show this week's latest close.
+4. Reading the OTHER box's logs: the supervisor fetches `origin/shared-logs` itself every weekday at 16:50 ET (a fetch only; it never touches the checkout and does not need `AIT_LOG_OWNER`). Its log line
+   `shared_logs_fetched` carries `latest_by_owner`: a stale date there means that box has stopped publishing. Read a day with
+   `python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD --no-fetch` (drop `--no-fetch` to force a fresh fetch). Publishing your OWN days additionally needs `AIT_LOG_OWNER=<name>` in this box's `.env` (the job is silent without it).
 
-## Deploy checklist (EVERY deploy — the 2026-07-10 incident is why)
-A green test suite is not a safe deploy: on 07-10 unit tests passed and the
-deployed code still killed the trading loop for a full session (stops/TPs
-unmanaged), found a day later. Do all five steps, in order:
+## Deploy checklist (EVERY deploy)
+A green test suite is not a safe deploy: unit tests once passed and the deployed code still killed the trading loop for a full session (stops/TPs unmanaged), found a day later. Do all five steps, in order:
 
-1. **Tests green.** Locally (the fast lane — same selection as CI):
-   `python -m pytest tests/ -q -m "not ibkr and not slow"`
-   and the CI run for the pushed commit is green (`.github/workflows/ci.yml`
-   also byte-compiles all of src on every push).
-   (The old duckdb-pollution warning is retired: since R12, `_init_duckdb()`
-   derives its path from the state-DB path, so `StateManager(tmp_path…)`
-   isolates BOTH stores — verified by execution 2026-07-14.)
-2. **Deploy outside RTH** (before 09:30 or after 16:00 ET) whenever possible.
-   If it truly must happen during RTH: `New-Item -ItemType File data\HALT`
-   first, deploy, smoke (step 3), then `Remove-Item data\HALT`.
-3. **Run the smoke — no exceptions:** `python scripts/smoke_deploy.py`
-   must print `SMOKE PASS (…)`. It executes the runtime paths unit tests
-   don't (imports, real-config load, real-DB row mapping, digests, learning
-   state, wing sizing) read-only, no IBKR needed — this is the 5-minute check
-   that would have caught 07-10. Optional: `--telegram` sends the verdict.
+1. **Tests green.** Locally (the fast lane, same selection as CI): `python -m pytest tests/ -q -m "not ibkr and not slow"`, and the CI run for the pushed commit is green (`.github/workflows/ci.yml` also byte-compiles all of `src` on every push).
+2. **Deploy outside RTH** (before 09:30 or after 16:00 ET) whenever possible. If it truly must happen during RTH: `New-Item -ItemType File data\HALT` first, deploy, smoke (step 3), then `Remove-Item data\HALT`.
+3. **Run the smoke, no exceptions:** `python scripts/smoke_deploy.py` must print `SMOKE PASS (…)`. It executes the runtime paths unit tests don't (imports, real-config load, real-DB row mapping, digests, learning state, wing sizing),
+   read-only, no IBKR needed. Optional: `--telegram` sends the verdict.
 
-   **One-off, on a box whose W21 timestamp migration is still outstanding**
-   (R26 F5 — the Windows box as of 2026-09-20; the macOS box is already
-   migrated). Stop the bot first; the script snapshots and writes:
+   **One-off, on a box whose timestamp migration is still outstanding** (the Windows box at the last record; the macOS box is migrated). Stop the bot first; the script snapshots and writes:
 
    ```
-   python scripts/restate_w21_tz_aware.py              # dry run — read the plan
+   python scripts/restate_w21_tz_aware.py              # dry run: read the plan
    python scripts/restate_w21_tz_aware.py --apply      # snapshot + write
    python scripts/smoke_deploy.py --check-live-corpus  # 14 checks, not 13
    ```
 
-   Do **not** treat the script's own exit code as proof. Its post-check could
-   not fail before W38, and a migration should not be verified by the tool
-   that performed it — `--check-live-corpus` re-reads the DB independently and
-   is what closes F5. If it reports naive rows, the migration did not land;
-   the snapshot path is printed by the `--apply` run.
-   `--apply` aborts rather than relabelling any row written on or after
-   `HOST_MOVE` (2026-09-14) — those are a restatement, not a convention
-   change, and need handling by hand.
-4. **Confirm liveness after the next RTH open** (~09:35–09:45 ET):
-   - fresh heartbeat: `Get-Item data\bot_heartbeat | Select-Object LastWriteTime`
-     — must be minutes old and refreshing;
-   - one completed trading cycle in the logs:
-     `Select-String -Path logs\bot_stdout.log -Pattern "scan_symbol_timing" | Select-Object -Last 3`
-     (fires at the end of each symbol scan; timestamps must be post-open), and no fresh
+   Do not treat the script's own exit code as proof: `--check-live-corpus` re-reads the DB independently and is what closes the migration. If it reports naive rows, the migration did not land; the snapshot path is printed by the `--apply` run.
+   `--apply` aborts rather than relabelling any row written on or after the host move date; those need handling by hand.
+4. **Confirm liveness after the next RTH open** (~09:35–09:45 ET). `python scripts/check_first_rth_liveness.py` makes the heartbeat, scan-event, LOOP IMPAIRED / cycle-error and marks checks below in one go, prints the verdict, sends it to Telegram (unless `--no-telegram`) and exits 1 on a failure. To check by hand:
+   - fresh heartbeat: `Get-Item data\bot_heartbeat | Select-Object LastWriteTime` must be minutes old and refreshing;
+   - one completed trading cycle in the logs: `Select-String -Path logs\bot_stdout.log -Pattern "scan_symbol_timing" | Select-Object -Last 3` (timestamps post-open), and no fresh
      `Select-String -Path logs\bot_stdout.log -Pattern "LOOP IMPAIRED|trading_cycle_error" | Select-Object -Last 5`;
    - no `LOOP IMPAIRED` Telegram alert arrived;
-   - marks updating: dashboard :8503 unrealized P&L moving, or
-     `python -c "import sqlite3; print(sqlite3.connect('file:data/ait_state.db?mode=ro', uri=True).execute('SELECT symbol, mark_time, unrealized_pnl FROM open_positions').fetchall())"`
-     — `mark_time` within the last few minutes.
-5. **Rollback path** = `git checkout <last-good-tag>` + restart the bot
-   (stop processes, then `python run_orchestrator.py` / `keeper_ait.bat`).
-   For this to exist: TAG every verified deploy going forward —
-   `git tag -a deploy-YYYYMMDD -m "smoke pass + first-RTH liveness OK"` then
+   - marks updating: dashboard :8503 unrealized P&L moving, or `python -c "import sqlite3; print(sqlite3.connect('file:data/ait_state.db?mode=ro', uri=True).execute('SELECT symbol, mark_time, unrealized_pnl FROM open_positions').fetchall())"` with `mark_time` within the last few minutes.
+5. **Rollback path** = `git checkout <last-good-tag>` + restart the bot (stop processes, then `python run_orchestrator.py` / `keeper_ait.bat`). For this to exist: TAG every verified deploy: `git tag -a deploy-YYYYMMDD -m "smoke pass + first-RTH liveness OK"` then
    `git push origin --tags`. Only tag AFTER step 4 passes.
 
-**W89 deploy note (daily retrain on IB).** `master.py`'s retrain script is part of the supervisor, so a
-change to it needs a **full supervisor restart** (not just a bot restart). From then on the 07:30 ET retrain
-needs TWS/Gateway up (see the retrain alert row above); with it down the retrain aborts and the models stay
-as they were. The first successful IB retrain re-tags the last ~504 `daily_prices` rows per symbol back to
-`IB_TRADES_RTH` (they had been overwritten with `YAHOO_UNADJ`); check with
-`sqlite3 "file:data/historical.db?mode=ro" "SELECT source, COUNT(*) FROM daily_prices WHERE symbol='QQQ' GROUP BY source"`.
-Mid-session, today's partial bar is never stored.
+**A change to `orchestration/master.py`, or to the retrain it launches, needs a full supervisor restart**, not just a bot restart. The 07:30 ET retrain needs TWS/Gateway up (see its alert row); with it down the retrain aborts and the models stay as they were.
 
-## Fixed limits (NOT configurable — visible on purpose)
+## Data catch-up and maintenance
 
-These values are deliberately fixed in code, in ONE module: `src/ait/config/invariants.py`.
-They are not in `config.yaml` or `.env` because each is either a **backstop that exists to
-catch the system (or its configuration) being wrong**, a **rule imposed from outside**, or
-the **line a config value is checked against**. Anything in `config.yaml` is tunable
-regardless of a comment — the file is shared between machines through git and edited by
-people and AI sessions — so putting these there would let one edit loosen both a gate and
-its check. They are logged at every start (`fixed_limits_in_effect`). To change one: edit
-the module, update this table (a test compares them), and record it in PLAN.md.
+- **The retrain is append-only** for stored daily bars: a stored completed session is never rewritten and today's partial bar is never stored. Backfill scripts overwrite only when you run them. The first successful IB retrain re-tags the last ~504
+  `daily_prices` rows per symbol to `IB_TRADES_RTH`; check with `sqlite3 "file:data/historical.db?mode=ro" "SELECT source, COUNT(*) FROM daily_prices WHERE symbol='QQQ' GROUP BY source"`.
+- **Implied vol stays fresh without a new job:** the 07:30 ET retrain, after its IB pre-flight, refreshes it for the universe and the VIX family (`iv_refresh QQQ:+2->… ` in `retrain_*.log`). A failure there is a warning, not a failed retrain; the next run fills the gap. Catch up
+  by hand: `python scripts/backfill_historical_data.py --symbols QQQ SPY IWM --mode iv --years 1`, and the VIX family: `--mode vix --symbols VIX --years 8`. The table-by-table list of what writes what: [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md) section 1.
+- **The history-table merge tool** (`scripts/unify_history_tables.py`) merged the old `research_*` copies into the shared tables. Dry run by default; `--apply` backs up, merges (additive; research rows win on overlap, live-only rows kept) and verifies; `--verify`
+  re-checks any time; `--archive` renames `research_X` to `archive_w91_research_X` (refused unless verification passes); `--drop-archives` drops them. It refuses to write the real database while the supervisor/bot runs (`--allow-running` overrides). Order:
+  merge, merge the code and restart the supervisor, one clean retrain and a research run, THEN archive, THEN drop. Do not run it during the Sunday 20:00 weekly backtest or an option-history refresh.
 
-| Name | Value | Why it is fixed (and where enforced) |
+## Troubleshooting
+
+| Symptom | Likely cause | What to do |
 |---|---|---|
-| `ORDER_RATE_LIMIT_MAX` | 8 | Max orders in the window below; the next is refused and logged CRITICAL. A backstop against a logic bug spamming placements — if config could raise it, the bug it exists to stop would not be stopped. `executor.py` (entry + roll placement share one bucket). |
-| `ORDER_RATE_LIMIT_WINDOW_S` | 60 | The rolling window for the limit above. |
-| `NBBO_DISORDERLY_SPREAD_RATIO` | 1.0 | A combo entry whose (ask − bid) is wider than its own mid is rejected. Backstop against a bad quote (delayed data, crossed/locked market). Distinct from the configurable per-contract `options.max_bid_ask_spread_pct`. `executor.py`. |
-| `NBBO_STALE_SIGNAL_DEVIATION` | 0.35 | A combo entry whose signal price differs from the live mid by more than 35% is rejected: the signal was priced on a market that has since moved. `executor.py`. |
-| `NBBO_MID_FLOOR` | 0.05 | The two tests above apply only when \|mid\| exceeds this; below it ratios blow up and mean nothing. `executor.py`. |
-| `LIVE_MAX_SPREAD_PCT` | 0.15 | Startup refuses a non-paper mode if `AIT_LIQ_MAX_SPREAD` or `options.max_bid_ask_spread_pct` exceeds it. It is the line config is checked AGAINST (paper is relaxed to 0.40), so it cannot live in the file it checks. `orchestrator.py` GOV-5. |
-| `LIVE_MIN_VOLUME` | 10 | Startup refuses a non-paper mode if `AIT_LIQ_MIN_VOLUME` is below it. Same reason. Documented in the go-live checklist below. |
-| `PDT_MAX_DAY_TRADES` | 3 | Day trades the bot allows itself per window. FINRA's pattern-day-trader rule flags margin accounts under $25,000 at 4 in 5 business days; this is the law, not a preference. The *switches* are config: `account.pdt_protection`, `account.pdt_account_under_25k`. `pdt_guard.py`. |
-| `PDT_WINDOW_DAYS` | 5 | The rolling window for the rule above. |
-| `BROKER_SNAPSHOT_TTL_SECONDS` | 5.0 | How long the all-clients open-order snapshot is re-used within and across fill checks. A cache lifetime that avoids repeated broker round trips — API-call pacing, not a trading preference. `executor.py`. |
-| `IC_BUDGET_CAPPED_MIN_WING` | 1.0 | Narrowest wing a budget-capped iron condor may shrink to, in dollars: $1 is the narrowest the listed-strike grid offers. The *configurable* minimum wing is `backtest.wing_floor_dollars` (`AIT_IC_WING_FLOOR`, default $2), which binds only when the per-trade budget does not. `iron_condor.py`, `engine.py`. |
-
-The 30 s fast-monitor tick is not repeated here: its single source is
-`ait/utils/cadence.py::FAST_MONITOR_CADENCE_SECONDS`.
-
-## Research fixed limits (W88a; NOT configurable — visible on purpose)
-
-The research counterpart of the table above, in ONE module: `src/ait/config/invariants_research.py`. Each value is a correctness constraint of the research engine's own arithmetic, not a modelling choice, so it is not
-in `config_research.yaml` or a study file (anything in those files is editable regardless of a comment). They are logged once per research process (`research_fixed_limits_in_effect`) and stored in every run record. To change
-one: edit the module, update this table (a test compares them), and record it in PLAN.md; a change moves research numbers.
-
-| Name | Value | Why it is fixed (and where enforced) |
-|---|---|---|
-| `RESEARCH_DELTA_MIN` | 0.05 | Lower end of the \|delta\| band a strike search may be asked for; below it a modelled quote is noise. Also the lower bound for `delta_short` / `delta_long` search-space overrides. `engine.py`, `param_spaces.HARD_BOUNDS`. |
-| `RESEARCH_DELTA_MAX` | 0.45 | Upper end of the same band; above it a leg is no longer out of the money. `engine.py`, `param_spaces.HARD_BOUNDS`. |
-| `IV_SCALE_MIN` | 0.5 | Lower clamp of the `iv_floor / iv` scaling a builder applies to its delta; one stale IV print cannot move a strike by more than a factor of two. `engine.py`. |
-| `IV_SCALE_MAX` | 1.5 | Upper clamp of the same scaling. `engine.py`. |
-| `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | Dollars by which a settled loss may exceed the defined max loss before it is counted as `over_max_loss`; a floating-point tolerance. `engine.py`. |
-| `PROB_CLIP_EPS` | 0.0000001 | Probabilities are clipped to [eps, 1 - eps] before log-loss; numerical safety. `walkforward.py`. |
-
-## Research tunables (W88b; research only)
-
-`config_research.yaml` has three jobs (its header says so): the **diff** against `config.yaml` (shared keys appear only where research deliberately differs), the **overlay** applied by research entry points only, and, since W88b, the
-**full list of research-only tunables**. A research-only key has no `config.yaml` counterpart, so it is listed in the overlay IN FULL, with its default and a comment; the schema default in `src/ait/config/settings.py` is only the
-fallback for a bare construction (`Backtester()`, `BacktestLearner()` in a unit test). A test fails if a field of these blocks is missing from the file, and the file's values equal the schema defaults today on purpose
-(the same convention as the `parity:` block). A study (`studies/<name>.yaml`) may override any of them for one run.
-
-| Block (`backtest.`) | What it holds | Code that reads it |
-|---|---|---|
-| `learner` | Thresholds of the research `BacktestLearner`: trades needed to learn / disable, win-rate cutoffs, step sizes, multiplier and confidence bounds, protected strategies. Not the live learning layer. | `backtesting/learner.py` |
-| `legacy_engine` | Constants of the dormant paths: fallback direction model, naked-margin fraction, bearish margin, thesis-invalidation confidence, vol-regime ratio. None is on the iron-condor path under `engine_model: realistic`. | `backtesting/engine.py` |
-| `objectives` | Composite objective weights and the profit-factor cap. | `optimization/objectives.py` (the optimizer passes its own copy) |
-| `walkforward_tuning` | Warm-start thresholds, the adaptive range threshold (multiplier, clips, lookback, fallback band), the validation-split ratio, the inert-parameter probe fallbacks. | `backtesting/walkforward.py`, `optimization/optimizer.py` |
-| `walkforward_tuning` also holds (W90b / W90e) | The window lengths and Optuna trial counts, the training / test row floors, the context and fetch paddings, the out-of-sample diagnostic bins and minimums, the minimum number of windows, the window-score shrink; W95: the test-window feature context (`oos_feature_context_bars`, refused below the feature spec's IV-rank look-back), the meta-labeler's minimum window (`meta_label_min_window_rows`), the minimum fetched rows (`min_fetched_rows`) and the optimizer's minimum rows (`min_backtest_rows`). | `backtesting/walkforward.py`, `optimization/optimizer.py`, `run_backtest.py`, `run_optimizer.py` |
-| `engine_tuning` | The IV-skew coefficients, the realized-vol and IV-rank-rise look-backs, the minimum history, the fallback volatility (W90c / W90e); the drawdown gate's rolling-high window and the replay's history pad (W95). | `backtesting/engine.py`, `pricing.py`, `replay.py` |
-| `surface_tuning` | The acceptance rules of the research IV surface (volume, price, moneyness, points, span, IV bounds, clamp margin, stale days). The fit rules are in the surface cache key. | `backtesting/iv_surface.py`, `engine.py` (W90f) |
-| `friction_fit` | Minimum samples, sessions, training rows and affine points to fit a leg-spread model. Offline calibration only. | `backtesting/friction.py` (W90f) |
-| `spread_tuning` | Max cost as a share of capital (0.25) and the wing as a fraction of the expected move (0.5) in the non-condor builders; the iron-condor builder does not read them. | `backtesting/engine.py` (W90f) |
-
-**A new research number goes in a setting, not in code (W88e).** `tests/test_w88_literal_census.py` compares the non-trivial numeric literals of the result-affecting research modules
-(`scripts/literal_census.py` lists them: `backtesting/`, `optimization/`, the ML modules, `run_backtest.py`, `run_optimizer.py`) with `tests/data/literal_allowlist.json`. A function whose literals differ from its entry
-fails the test: a NEW literal, a CHANGED one, a REMOVED one (converting a literal to a setting must also update the allowlist), or a stale entry. Either make it a schema field listed in `config_research.yaml` (or a fixed limit in
-`config/invariants_research.py`), or run `python scripts/literal_census.py --update` and give the new entry a category: `display`, `epsilon`, `fixed_feature_group`, `dormant_path`, `structural`, or `registered_followup` (a note
-saying what it is and where it should go). A new module in `backtesting/`, `optimization/` or `ml/` must be added to the census list (or excluded with a reason). `param_spaces.py` (the search-range registry) and `settings.py` (schema defaults) are the excluded registries.
-
-`python scripts/show_research_config.py [--section backtest] [--differs]` prints every value with the layer that decides it (`study` > `overlay` > `config.yaml` > `default`); the same map is stored in every run record
-(`settings_origin`). Values that are **not** tunable (clamps, numerical tolerances) are in "Research fixed limits" above.
-
-Known, preserved behaviour worth knowing before tuning the learner: with the shipped `reduce_min_change` (0.03) and `strategy_multiplier_min` (0.30), a reduced strategy's multiplier stalls at 0.3277, so the "disable a
-strategy" branch is unreachable by default; `boost_min_trades` and `reenable_min_trades` are inert at any value at or below `min_trades_to_learn` (15). The module's old `MIN_CONFIDENCE` constant (0.55) was read by nothing and was dropped. Each is documented on the field.
-
-## Model hyperparameters (W88c; shared by live and research)
-
-The tree hyperparameters of the gradient-boosted models are settings, not code literals: `ml.hyperparams` (direction ensemble, range model, vol-magnitude model) and `ml.meta_label_hyperparams` (the meta-labeler's own, shallower
-profile), both `TreeHyperparamsConfig` (`n_estimators`, `max_depth`, `learning_rate`, `subsample`, `colsample_bytree`, `random_state`; `null` = unseeded). `config.yaml` lists them with the values the code used before, so listing them
-changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different value there (or in a study); the parity manifest then warns (`ml_hyperparams`).
-Not settings, on purpose: `n_jobs` / `verbosity`, each task's objective and metric, LightGBM's `class_weight` / `deterministic`, and `ml/trainer.py::_objective` (a search-time proxy).
-
-Every saved model (`ensemble.pkl`, `range.pkl`, `vol_magnitude.pkl`, the meta-label artifact) records the hyperparameters it was trained with (`spec`). Loading **never refuses**: a model trained under other values than the current
-config is served and logs `model_spec_mismatch` with the differences; an artifact saved before W88c has no `spec` and loads silently. A change to the LIVE values takes effect for live at the next retrain (and bot restart), not by
-editing `config.yaml` alone. The run record stores the resolved settings and the ML seed.
-
-## Model labels, validation folds and retrain constants (W90d; shared by live and research)
-
-The numbers that define what the live models learn and how they are validated are `ml.*` settings, listed in `config.yaml` with the values the code used before (so listing them changed nothing): the range band
-`range_threshold_pct` (0.05) and its edge floor `range_min_edge_over_baseline`; the vol-magnitude move, horizon and edge floor (`vol_magnitude_threshold_pct` 0.07, `vol_magnitude_horizon_days` 30,
-`vol_magnitude_min_edge_over_baseline` 0.10); the direction label (`direction_label_threshold_pct` 0.01 over `direction_label_horizon_days` 5); the walk-forward folds (`direction_cv_splits` / `direction_cv_gap_days` /
-`cv_min_val_rows` / `cv_min_train_rows` for the direction model, `binary_cv_splits` / `binary_cv_min_gap_days` for range and vol-magnitude, whose gap is never shorter than the label horizon); the class-balance guards
-(`label_balance_min` / `label_balance_max` warn, `min_class_samples` refuses); and the retrain (`retrain_optuna_trials`, `retrain_optuna_seed`, `rollback_margin`).
-A change to a LIVE value takes effect at the next bot restart, and a changed label constant needs a retrain: a saved range or vol-magnitude model records the band and horizon it was trained at, and a mismatch is flagged
-(`range_model_spec_mismatch`, CRITICAL) and the model retrained. An artifact written before the spec was recorded is compared as +/-5% / 30 days (range) or +/-7% / 30 days (vol-magnitude), whatever the settings say now. Research does not
-read the band keys (it adapts its range band per window: `backtest.walkforward_tuning`); the other keys it shares with live.
-
-## Drift detection, the regime classifier and saved model versions (W92; live)
-
-Their numbers are settings in `config.yaml` (`ml.drift_*`, `ml.model_versions_kept`, the `regime:` block, `meta_label.min_trades_for_training` / `min_class_trades` / `cv_*`), each with a comment and a table in
-`docs/RESEARCH_GUIDE.md` ("Drift detection (live; off by default)", "The regime classifier (live)", "Saved model versions and the meta-labeler"). **Drift detection is OFF by default**
-(`ml.drift_detection_enabled: false`): the live book trades iron condors only, and outcomes are recorded only for directional strategies, so the detector could never report. To use it, set the switch
-to `true` and restart the bot; the full check then runs at most once per `ml.drift_check_interval` newly recorded predictions. All values equal the old literals; they take effect at the next bot restart.
-
-W95 added three more `regime:` keys, `min_history_rows` (60), `iv_rank_min_rows` (60) and `iv_rank_window_rows` (252): the history the classifier needs and the window of its price-only IV-rank proxy. Same defaults as the old literals, same rule: they take effect at the next bot restart. `min_history_rows` below the trend measure's look-back (55 at the defaults) is a startup error.
-
-## Feature windows (W88d; shared by live and research)
-
-The indicator windows of the core feature groups are settings: `ml.features` (`momentum`, `volatility`, `volume`, `trend`, `multi_timeframe`, `vol_regime`), listed in `config.yaml` with the values the code used before, so listing them
-changed nothing. **Shared keys are diff-only in `config_research.yaml`**: research differs only if you put a different window there (or in a study); the parity manifest then warns (`ml_features`).
-In scope: RSI / MACD / ROC, ATR / Bollinger / realized vol, volume averages, SMAs and slopes, the simulated-weekly features, and the realized-vol regime ("IV proxy") features. **W97 added the remaining windows:** `market_structure`
-(including the 200-day SMA behind `above_sma200` / `distance_sma200`), `cross_asset`, `macro`, `fractal` (Hurst short / long, PSD and MFDFA minimums) and `intraday` (hour = 12 bars, the minimum-bar guards), 50 settings listed in
-`config.yaml` with the old values (RESEARCH_GUIDE "The remaining feature windows"). Fourteen more model columns follow their window in the name (`vix_change_5d`, `rel_strength_60d`, `above_sma200`, ...); the 26 VLMC intraday names are a fixed list and do not.
-**The hash rule:** these five groups enter the saved-model hash only when a value differs from its default, so at the defaults nothing is refused or retrained. Fixed (not settings): clip bounds, neutral values, the wavelet family and MFDFA scales, the
-seasonality encoding and the 252 annualisation constant.
-
-**What changes when you change a window.** (1) The feature VALUES. (2) For the thirteen model columns whose name embeds a window the NAME follows it: `rsi_long: 21` turns `rsi_14` into `rsi_21`; `sma_mid: 30` turns `price_vs_sma_20`,
-`sma_20_slope` and `sma_10_20_cross` into `price_vs_sma_30`, `sma_30_slope`, `sma_10_30_cross`. The meta-labeler's inputs, the engine's and the live orchestrator's meta-context keys, and the entry-signals snapshot follow; the dashboard series keep
-their stable keys (`rsi_14`, `sma_20`, ...). (3) A hash of the windows (`feature_spec_hash`) is recorded in every saved model and in every run record.
-
-**A model trained under other windows is never served.** Its columns would not exist in the new frames, and `predict` zero-fills missing columns, so it would predict on silent zeros. Loading a model whose recorded hash differs logs
-`model_feature_spec_mismatch` (CRITICAL) and returns False, so the normal needs-training path retrains under the new windows. A model with no recorded hash predates W88d and is treated as having the default windows, so today's artifacts keep loading
-while the windows are at their defaults. The research engine also drops a predictor whose windows differ from its own feature frames. After a LIVE change: restart, expect a retrain of the direction, range, vol-magnitude and meta-label models;
-old `entry_signals` snapshots keep the old names, so the meta-labeler's live training reads defaults for them until new trades accumulate.
-
-**Constraints enforced at load** (a violation is a startup error): ordered pairs (`rsi_short < rsi_long`, `macd_fast < macd_slow`, `roc_short < roc_mid < roc_long`, `rv_short < rv_long`, `sma_fast < sma_mid < sma_slow`, `volume_fast_window < volume_avg_window`)
-and `vol_regime.fast < rv_short < rv_long < vol_regime.slow`; derived names must be distinct and must not collide with a fixed column. Very short RSI periods make RSI undefined whenever a window has no down days, and those rows are dropped; `iv_rank_min_periods`
-only matters once it exceeds the warm-up that other windows already drop.
-
-### Feature switches (W98; shared by live and research)
-
-Next to its windows, every `ml.features` group in `config.yaml` has a `use:` block: one `true`/`false` switch per feature (the complete list of what the models can use; the comment shows the column). `false` leaves the column out of the
-inputs of the direction, range and vol-magnitude models and of the tuner; the column is still computed (the meta-labeler and the gates read some), so the warm-up does not shorten. Five columns the code computes but no model used
-(`put_call_proxy`, `vix_term_structure`, `skew_proxy`, `momentum_divergence`, `range_compression`) ship `false`. **At the shipped switches nothing changes**: the model list and its order are today's and the spec hash is still `6e0e3f8f922f6b88`.
-
-* **Live:** flipping a switch in `config.yaml` is a live change and the operator's call. The hash changes, so after the restart the direction, range and vol-magnitude models (and the tuner) are refused and retrained (`model_feature_spec_mismatch`
-  at CRITICAL on the first load, one retrain). Do it outside market hours; run `smoke_deploy.py` first; the rollback is reverting the line (then one more retrain). The meta-labeler's inputs do not change.
-* **Research:** never edit `config.yaml` for an experiment. A study (or `config_research.yaml`) writes only the difference, e.g. `fractal: {use: {hurst_psd_divergence: false}}`. The parity manifest warns (`ml_features`) and the run record
-  stores the resolved `feature_list` and the hash. How to drop, add and try features, and how to add a brand-new one: RESEARCH_GUIDE "Choosing the model's features".
-* A typo or a feature under the wrong group is a startup error that lists the valid names; switching every daily feature off is refused.
-
-## Risk-knob ceilings and the links between them (W86)
-
-Unlike the fixed limits above, these are **tunable** (they live in `config.yaml`), but the **range** each may take is part of the schema in `src/ait/config/settings.py`, so a typo or a bad edit fails
-at startup instead of trading. The ranges sit in code on purpose (a limit in the same file as the value lets one edit loosen both). To widen one: edit `settings.py`, update this table (a test compares it),
-and record the decision in PLAN.md. A change takes effect at the next bot restart, which is the operator's call.
-
-| Setting | Shipped value | Allowed range | What it bounds |
-|---|---|---|---|
-| `risk.max_position_risk_pct` | 0.05 | 0.005 - 0.25 | One structure's max loss, fraction of NLV (gate 6b), and the budget the condor builder is handed |
-| `risk.max_daily_loss_pct` | 0.045 | 0.005 - 0.20 | The daily-loss breaker; blocks new ENTRIES only, exits keep running |
-| `positions.max_position_pct` | 0.05 | 0.01 - 0.30 | The position sizer's hard per-position cap |
-| `positions.max_portfolio_risk_pct` | 0.20 | 0.005 - 0.50 | Aggregate open capital-at-risk (gate 6b-2) |
-| `risk.max_symbol_concentration_pct` | 0.20 | 0.05 - 0.50 | Exposure in one symbol (gate 6c) |
-| `backtest.position_size_pct` | null (= `risk.max_position_risk_pct`) | 0.01 - 0.25 | Research per-trade size, never looser than live's per-trade range |
-
-**Links enforced at startup** (a violation is a `ValueError`, because the runtime symptom is a silent total brick):
-`risk.max_position_risk_pct` must be <= `positions.max_position_pct` (the sizer would refuse what gate 6b passes), <= `positions.max_portfolio_risk_pct` (gate 6b-2 would refuse every entry) and
-<= `risk.max_symbol_concentration_pct` (gate 6c would refuse every entry). **Not** a startup error: the breaker below one full max loss. The launch coherence check (orchestrator A2) reports it by Telegram
-only, because it is a measurement of the real condor builder, and the breaker never closes a position (it blocks entries after the loss). Raising the per-trade budget also needs the aggregate and
-concentration caps raised with it, or the startup refuses.
-
-## Order lifecycle timeline (what happens to an order, and for how long)
-
-Every age below is evaluated on the **30 s fast-monitor tick** (measured 2026-09: median
-30.9 s between ticks, 98% under 35 s, worst 100 s), so a duration under 30 s takes effect at
-the next tick. Tunables live in `config.yaml` (each key carries Floor / Ceiling / IMPACT next
-to it); the startup log `order_timeline_in_effect` prints every effective value.
-
-**Exit order (position is CLOSING)**
-
-| Age | What happens | Key (default) | Floor and why |
-|---|---|---|---|
-| 0 – grace | Ignored by the fill checker so it can appear in IBKR's trade list; a brand-new order would otherwise read as cancelled. | `exit.order_visibility_grace_seconds` (10) | 5 s. A margin, not a measurement: the one acknowledgement we could time took < 1 s (an entry). Must be below the stop rest. |
-| rest | Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stops rest less than ordinary exits. | `exit.exit_stop_pending_rest_seconds` (120) / `exit.exit_pending_rest_seconds` (300) | 15 s / 30 s. The stop rest may not exceed the ordinary rest. |
-| band TTL | A broker "price band" reject stops capping later attempts. | `exit.exit_band_ttl_seconds` (300) | 30 s. |
-| foreign | The order belongs to ANOTHER clientId and cannot be cancelled from here: the operator is paged instead. | `exit.foreign_exit_escalation_seconds` (300) | 60 s, and not below the ordinary rest (paging earlier is noise). |
-| zombie | Still unresolved: the broker is asked; only if it answers and does not list the order is CLOSING reverted to FILLED so a fresh exit can fire (otherwise held CLOSING and paged). | `exit.zombie_exit_revert_seconds` (900) | 120 s hard floor, and **>= 2 x the longer rest time** (600 s today): the cancel needs at least as long to resolve as the order was given to fill, or a fill that is merely not yet visible is re-armed as a duplicate close. Raising a rest therefore raises this and the foreign threshold too; startup names each. |
-
-**Entry order**
-
-| Age | What happens | Key (default) | Floor and why |
-|---|---|---|---|
-| every step | An unfilled entry combo's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset). | `positions.entry_ladder_step_seconds` (45) | 30 s = the tick; below it steps are skipped, not honored. Observed: the first reprice of a real order fired at +49 s because it is only seen on a tick. |
-| partial | A PARTIALLY filled entry has its remainder cancelled so legs are not orphaned. | `positions.partial_fill_cancel_seconds` (30) | 5 s; below the entry timeout. |
-| absent | An entry ABSENT from the trade list is treated as still pending while younger than this (a disconnect makes every working entry look cancelled for a moment). | `positions.absent_order_grace_seconds` (30) | 10 s; below the entry timeout. |
-| timeout | An unfilled entry is cancelled. | `positions.entry_order_timeout_seconds` (240) | 30 s. |
-
-**What the floors rest on, honestly.** One entry order (2026-09-28) was acknowledged by IBKR
-in under 1 s; two more (QQQ and SPY, Prithvi's box) filled in 11.4 s and 14.4 s; no exit
-order has been timed and no mid-session disconnect occurred in the retained logs. The floors
-are engineering margins. The `order_ack_latency` log event (entry and exit, sub-second, from
-ib_insync's own `Trade.log`) and `order_absent_judged` collect the real distribution and are
-published to the `shared-logs` branch; revisit the floors once a few dozen paper orders,
-including exits, exist.
-
-## Short-DTE friction collection (W76; research only, read-only against the broker)
-
-The research engine had no real bid/ask sample below 11 DTE, so every 0-6 DTE leg was charged an
-extrapolated half-spread. IB serves historical BID/ASK bars for currently LISTED contracts only
-(nothing for expired ones), so this data cannot be backfilled: it has to be collected forward,
-one RTH session at a time, while the 0-6 DTE contracts are still listed.
-
-**Each trading day** (paper Gateway/TWS is fine; it only requests historical data, never orders).
-The port defaults to `IBKR_PORT` from `.env` (7497 for TWS paper, 4002 for Gateway paper), the
-same value the bot uses; pass `--port` only to override. A "could not connect" error almost
-always means TWS/Gateway is not running on that port:
-
-```bash
-# 1) see the plan first (no data requested, nothing stored)
-python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
-    --client-id 91 --dry-run
-
-# 2) collect + fit (about 40-55 min per symbol: IB paces historical requests at 60 / 10 min)
-python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --symbols QQQ \
-    --client-id 91
-```
-
-- **When: about 15:30 ET, BEFORE the close.** Measured 2026-10-13: after the session ends IB no
-  longer serves that day's expiring contracts, so an after-close run can never capture DTE 0 (its
-  expiry list starts at the next day). At 15:30 the entry window's last bar (14:30-15:30) has ended,
-  so one run holds the whole expiry day; the DTE-0 contracts are requested first. A run any later
-  adds no bar (the 15:30 bar is outside the entry window). Bars whose hour had not ended are never
-  stored (`in_progress_bars_skipped` in the summary).
-- **Client id:** use one that is not the bot's (`IBKR_CLIENT_ID`, currently 1, and its fallback ladder
-  base+100..+104). Convention: 90 = `backfill_historical_data.py`, 91 = this collection (script and
-  supervisor job), 94 = the daily retrain (`ml.retrain_ib_client_id`, W89); ad-hoc runs pick another free
-  id. Two sessions on one id make the second fail ("clientId already in use?"; seen 2026-10-21). The
-  example uses 91, the repo's calibration convention. W66 verified this request type against the paper
-  Gateway (historical BID and ASK bars of listed options, market closed). If a run
-  returns no bars for every contract, that is an account/permission question for IB, not a bug here.
-- **Coverage:** the run prints samples and distinct sessions per DTE 0..6 and, per band
-  (`0-2`, `3-6`), `collecting: N/15 sessions (M more needed)` until `ACTIVE`.
-- **Target:** at least 15 sessions per band (`backtest.friction_min_sessions_per_band`). Weekends
-  and holidays do not count; missing a day only delays the date, nothing is lost.
-- **Failure:** a pacing violation backs off 60 s and continues; an unqualifiable contract is skipped.
-  Re-running the same day is safe (`INSERT OR IGNORE`).
-- **Using it:** set `backtest.friction_short_dte: true` in `config_research.yaml`. A band below the
-  minimum is charged the all-DTE model floored at `friction_extrapolated_floor_usd` ($0.01 per leg)
-  and the run logs `friction_summary` (fitted / extrapolated counts). Off by default.
-- **Storage:** `data/historical.db` tables `option_spread_bar_samples` (raw) and
-  `option_leg_spread_band_params` (fits). Both are research tables; the live bot never reads them.
-
-### Lifecycle capture (W82): one run a day, each contract downloaded about twice in its life
-
-The per-day collector above asks every contract in range for its last 7 days, every day, so a
-contract is downloaded 5-11 times and `INSERT OR IGNORE` throws the overlap away. IB serves 30 days
-of hourly BID/ASK bars for any LISTED option in one request, and what is perishable is the contract
-at its EXPIRY, not each day. `--lifecycle` therefore captures a contract's life:
-
-```bash
-python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
-    --symbols QQQ --client-id 91 --dry-run      # the plan: stage A / stage B and the minutes
-python scripts/calibrate_option_spreads.py --source ib-bars --short-dte --lifecycle \
-    --symbols QQQ --client-id 91
-```
-
-- **Stage A (perishable):** expiries today..today+`--expiring-days` (default 1, so one missed day is
-  recoverable). DTE 0 is requested first; run at 15:30 ET like the per-day collector.
-- **Stage B (coverage debt):** far-listed expiries at 15-21 DTE whose DTE 31-45 tail is not stored,
-  nearest first, capped by `--max-far-contracts` (default 120, about 43 minutes); the rest is
-  deferred to the next run. "Not stored" is read from the database (a logged stage-B capture, or
-  at least 5 stored sessions at DTE >= 31), so a missed day or a manual catch-up needs no state file.
-- **Strikes:** the union, over every `--thin-every`-th session of the underlying's path, of what a
-  condor would have sold that day (that day's spot, stored IV and DTE), instead of the strikes near
-  the CURRENT spot. `--thin-every 1` is every session (2-3x the contracts).
-- **Every request asks 30 D**, so a run also recovers the preceding month of sessions for contracts
-  still listed; a run any time within 30 days of a volatility spike retrieves the spike's mid/far-DTE
-  sessions. Only contracts that EXPIRE during a spike need the daily run.
-- **Bands:** 0-2, 3-6, 7-13, 14-29, 30-45 DTE are each fitted and gated on 15 sessions
-  (`backtest.friction_min_sessions_per_band`). Only 0-6 DTE is extrapolated (floored at the tick)
-  while unfitted; a 7+ band without a fit is answered by the all-DTE model as before.
-- **TWS or IB Gateway:** the script and the supervisor job accept either endpoint of the configured
-  account type (paper 7497 <-> 4002, live 7496 <-> 4001) and never probe across account types. The
-  log prints `[port] 7497 ... is not listening; using 4002 (IB Gateway (paper))` when it falls back.
-- **Capture log:** `option_capture_log` in `data/historical.db` (one row per requested expiry and
-  run); the status file adds `stage_a`, `stage_b` and `deferred_b`.
-- **Supervisor job:** set `data_collection.lifecycle: true` (with `short_dte_enabled: true`); the
-  per-day behaviour stays the default.
-
-### Automatic collection (supervisor job, W76)
-
-Instead of running the command by hand every session, the supervisor (`run_orchestrator.py`) can
-run it Mon-Fri after the close. It is OFF by default.
-
-1. Prove it manually once: the `--dry-run`, then one real run (above).
-2. In `config.yaml` uncomment the `data_collection:` block at the bottom and set
-   `short_dte_enabled: true` (time defaults to 15:30 ET, symbols `[QQQ]`, client id 91).
-3. **Restart the supervisor** (`run_orchestrator.py`): a process runs on the settings it started with.
-   It logs `short_dte_collection_scheduled | time_et=15:30 ...` at startup if it took effect.
-4. Keep the supervisor and TWS/Gateway running at that time. The box being off skips that day
-   (nothing else is lost); the supervisor gives a job an hour of grace if it was only just started.
-
-What it does at the scheduled time: skips non-trading days; refuses to run if the IB port
-(`IBKR_PORT`) is not listening or the client id collides with the bot's (`IBKR_CLIENT_ID` and
-+100..+104); runs the same script with an idle timeout (20 min of silence) and a hard cap
-(150 min); never touches the bot or any order.
-
-How to see progress, without opening logs:
-
-- `data/short_dte_collection_status.json`: counters of the last run, stored samples per DTE and
-  sessions, and per band `sessions` vs `needed`, `active` once the band has a fit and 15 sessions.
-- `logs/short_dte_collect_YYYYMMDD.log`: the script's own output for that day.
-- `logs/orchestrator.log`: `short_dte_collection_ok | stored=... bands={...}`.
-
-You get a Telegram message (at most one per day) only when something is wrong: the IB port is
-closed, the client id is refused, the run failed or timed out, or it stored zero samples. A
-healthy day is silent.
-
-## Research-vs-reality parity replay (W72; research only, never touches live state)
-
-Runs known real trades through the RESEARCH engine's pricing and exit code and reports where
-research disagrees with what actually filled. Use it before trusting a DTE band in an Optuna
-study, and after any change to `backtesting/pricing.py`, `friction.py` or the engine's exit path.
-
-```bash
-python scripts/parity_replay.py                 # reads data/replay/manual_trades_*.json
-```
-
-- **Inputs (all read-only):** the replay file (`data/replay/`, git-ignored; never commit it),
-  `data/historical.db` research tables, and the bot's combo-fill context in `data/ait_state.db`.
-- **Outputs:** `data/replay/out/<YYYYMMDD>/` (`summary.md` = statistics only and safe to quote;
-  `trades.csv` / `legs.csv` carry per-trade prices and stay local). The CLI refuses any output
-  directory inside the repo outside `data/replay/`.
-- **Reading it:** error = model - actual, so positive means research is RICHER than reality.
-  `engine` = what the engine does today (daily close + same-day IV); `clean` = what was knowable at
-  the fill. A band with fewer trades than `parity.min_trades_per_band` is INSUFFICIENT, never PASS.
-- **Tolerances:** `parity:` in `config_research.yaml` (operator-owned).
-- **Expiry settlement (W77):** `summary.md` also carries an "Expiry settlement parity" section for
-  every structure that reached its expiry bell: how many leg outcomes (expired / exercised /
-  assigned) `ait.backtesting.settlement` reproduced from the statement's close codes, whether the
-  shares left over the gap match, and the P&L error. The model marks leftover shares at the NEXT
-  session's open; a trader who waited shows up as error and the section says how long they waited.
-  The assumptions (`backtest.pin_band_usd`, `assignment_fee_per_share`,
-  `stock_commission_per_share`) are operator-owned. In the research engine the settlement path is
-  only reached with `engine_model: realistic` AND a position the take-profit ladder / touch stop did
-  not already close, so it matters most for studies that disable those exits.
-- **Never paste** per-trade prices, P&L or any account identifier into PLAN.md: it is shared via
-  git with the other box. Report error statistics by DTE band only.
-
-## Per-horizon range models and the decision frame (W78; research only)
-
-- **Range models per horizon.** The walk-forward trains the range gate's model for the horizon the
-  study's entry DTE can actually reach (`ait.ml.range_spec.horizon_for`, shared with the live spec).
-  The configured band's own horizon is the base model (unchanged: 9 bars at `dte_range [14, ...]`);
-  any other DTE is rounded UP to a bucket in `RANGE_HORIZON_BUCKETS` and trained once per window, on
-  demand. Non-base buckets save under `models/research/h<N>/`; the live `models/range.pkl` is never
-  touched. `python scripts/range_horizon_study.py --symbol QQQ` measures out-of-sample skill, abstention
-  and reliability per horizon (read-only; artifacts go to a temp directory).
-- **Abstention is not a bug.** When no ensemble member has cross-validated edge over the base rate the
-  model returns no probability; the engine's range gate then rejects (enforce) or would-reject
-  (observe). The study reports how often that happens per horizon: read it before enforcing the gate.
-- **Decision frame.** With `engine_model: realistic` and intraday entries, the entry gates and models
-  see history through the PREVIOUS session (a 10:30 decision cannot know that day's close), and an
-  entry counts positions that were still alive at its fill time toward `max_concurrent_positions`.
-  Legacy and daily-close studies are unchanged.
-
-## The IV-rank rise veto is research-only (W71)
-
-- **What it is.** The research engine blocks a neutral credit entry when the FeatureEngine `iv_rank`
-  (a REALIZED-vol range rank, 0-1) rose by more than `backtest.iv_rank_rise_threshold` (0.30) over
-  10 rows. **Live has no such veto**: it gates on the LEVEL of the stored-IV percentile (condor floor
-  15, credit cap 85; `ait.data.iv_rank`). `tests/test_w71_iv_rank_parity.py` pins that nothing outside
-  the research modules reads the threshold.
-- **Measure it:** `python scripts/iv_rank_parity_probe.py [--ab --workers 6]` (read-only; seconds for
-  the series comparison, minutes for the engine A/B). It reports how the two ranks relate, how many of
-  the veto's days live would have refused anyway and how many are days live WOULD trade.
-- **It is OFF in research (W71c, decision D9):** `backtest.iv_rank_rise_gate: false` in
-  `config_research.yaml`. The code, the 0.30 threshold and its 0.25-0.60 search range are kept; while
-  the gate is off the rise is still recorded per entry (`iv_rank_rise_10d`) and the optimizer does not
-  search the threshold. The parity manifest prints a RESEARCH-ONLY warning only while it is ON.
-- **The bar for turning it back on** (also written next to the key): a MULTI-WINDOW walk-forward with
-  the gate ON vs OFF, same windows / engine / pricing / friction (`iv_rank_parity_probe.py --ab` is
-  the starting tool), showing an OUT-OF-SAMPLE gain beyond the window-to-window noise on days live's
-  level gates would have TRADED. If it earns its place, port it to live as well (W80-class).
-- The research IV series and live's stored series are the same IB historical IV except on the few days
-  live's own scan wrote (a median across expiries), so the level gates are at parity.
-
-## One-sided entry gates: what research blocks that live does not, and the reverse (W81)
-
-- **Why this section exists.** Research and live can disagree about whether a condor may open
-  without any parameter differing: a gate that exists on ONE side only. The 2026-10-13 audit found
-  three: the research realized-vol cap (`backtest.max_entry_vol_annual`, 0.80; Optuna searches it),
-  the research trending-down regime veto (`backtest.regime_veto_gate`), and live's VIX halt
-  (`risk.credit_vix_halt`, 28, plus the VIX-tiered credit caps), which research does not simulate.
-- **Where it is visible.** `python run_backtest.py` prints one warning per ACTIVE one-sided gate
-  (`vol_gate`, `regime_veto`, `vix_halt`, plus the existing rise-veto line) and records
-  `live_only_gates_not_simulated`. The registry is `ait.backtesting.gate_parity`: every reason the
-  engine can reject on is classified there as a live twin, a research-only gate (with its switch) or
-  mechanics, and `tests/test_w81_gate_parity.py` fails if the engine grows a reason without a row.
-- **The switch.** `backtest.regime_veto_gate` (schema default true, so nothing moves; the overlay does
-  not set it: decision D10). False skips the veto only; the day class is still recorded per entry
-  (`regime_class`; a day the veto would have blocked is flagged `regime_veto_suppressed`). Its
-  thresholds are `backtest.regime_down_threshold` (-0.05) and `regime_up_threshold` (0.02), which
-  were bare literals at three engine sites.
-- **Measure it:** `python scripts/gate_parity_ab.py --workers 3 [--entry-dte N]` (read-only; about 8
-  minutes at three symbols and four arms; the VIX closes come from Yahoo). Arms: baseline, regime
-  veto off, vol cap off, both off; then live's VIX halt is applied after the fact (no slot re-use).
-  **Re-run it whenever the gate order, the IV-rank cap or the entry-DTE range changes: these gates
-  only matter on the days that reach them.** First result (2026-10-13): at entry DTE 14 the veto
-  reached 0 / 0 / 3 days (QQQ / SPY / IWM), the vol cap 0, and no trade entered on a day whose
-  previous VIX close was >= 28 (18 such sessions); the same at DTE 1, 3 and 7 on QQQ and IWM.
-- **Research `r`.** The engine now prices with `options.risk_free_rate` (the key live's Greeks read);
-  it was a bare 0.05 at three sites. Same value today.
-
-### The ex-dividend entry block (W84; research twin of live's W51 block)
-
-- **What live does.** The bot refuses a new position that SELLS A CALL when the projected next
-  ex-dividend date falls between today and the chosen expiry (log event `trade_blocked_ex_div`): a
-  short call can be assigned early the day before an ex-date. The projection is
-  `ait.data.dividends.project_next_ex_div` (the last 4 ex-dates from yfinance, mean gap, stepped to
-  today). It blocks 14-17% of sessions at entry DTE 14.
-- **The research twin.** `backtest.ex_div_entry_gate`: `off` | `live` (live's rule exactly, from the
-  ex-dates known before the entry day) | `exact` (any real ex-date in [entry, expiry]) |
-  `last_k_days` (a real ex-date within `backtest.ex_div_entry_k_days`, default 5, of expiry). The
-  schema default is `off`; `config_research.yaml` sets `live`. The manifest warns whenever research
-  differs from live (`ex_div_entry:`); the registry row is a live twin.
-- **Data.** The gate reads the `dividends` table in `data/historical.db` (the shared set, W91); any mode but `off`
-  raises without it. Refresh it (yfinance; prints per-year counts and off-cycle gaps; writes
-  `reports/dividends_audit_<date>.json`):
-  `python scripts/backfill_dividends.py --symbols QQQ SPY IWM [--dry-run]`.
-  Re-run it before a study that ends after the last stored ex-date.
-- **Measure it:** `python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]`
-  (read-only; about 15 minutes for 36 runs). Real engine runs, so a blocked entry frees its slot.
-  The `live` arm answers the parity question; `exact` and `last_k_*` are the evidence for changing
-  live's rule (decisions F2 / F3, the operator's call). Research does NOT model early assignment, so
-  the A/B shows what the block costs, not what it protects against.
-
-## Searching the entry DTE (W79a; research only)
-
-- **Switch:** `python run_backtest.py --optimize-per-window --search-dte [--dte-range 0 45]
-  [--optimize-strict]`. Off by default; `backtest.dte_search` (schema defaults, overlay-overridable)
-  holds the ranges. The existing `IRON_CONDOR_SPACE` is untouched, so every other study is unchanged.
-- **What is searched:** entry DTE, the expiry guard (sampled only for entries it can exempt: at or
-  below the top of its range) and the hold fraction (which REPLACES `max_hold_days`). The flatten is
-  not searched: `scripts/dte_dimension_flatness.py` showed it moves nothing while the take-profit
-  ladder is on. The credit floors (`ic_min_credit*`) are never searched; run them as sensitivities.
-- **Always pass `--optimize-strict` for numbers you will quote.** Without it a window whose
-  optimisation fails runs the BASE config and the summary only reports a count
-  (`optimization_failures`); with it the study stops.
-- **Reading the report:** a band is a *candidate* only if it holds a top-decile trial in at least two
-  thirds of windows. Promotion also needs its parity band to PASS (`scripts/parity_replay.py`) and its
-  friction band to be ACTIVE (`data/short_dte_collection_status.json`). The report prints a reminder;
-  it does not check either.
-- **History limit:** the option-bar history is about two years (free tier), so a surface-priced study
-  has only a handful of out-of-sample quarters. Use shorter training windows and/or pool symbols, and
-  say so next to any number.
-- **Decisions D1 and D8** (realistic engine, short-DTE friction floor) are in `config_research.yaml`;
-  the live bot never loads it. `run_optimizer.py --apply` still writes only four named params.
-
-## Studies and run records (W87; research only)
-
-> New to research mode? Start with [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md): what it contains, how a run works, the learner, studies and how to read results. This section is the operations reference.
-
-A **study** is a committed file, `studies/<name>.yaml`, that says what one research run changes relative to `config.yaml` +
-`config_research.yaml`. `config_research.yaml` stays the stable default for ordinary research runs; editing it per study would silently
-change every later default run.
-
-```yaml
-name: w88_wing_k_wider
-question: Does a wider wing_k range change the wings Optuna picks, or the out-of-sample PF on QQQ?
-rule: exploratory            # or the text of a PLAN.md heading where the pass rule was written before the run
-settings:                    # merged over config.yaml + config_research.yaml; same validation
-  backtest:
-    max_concurrent_positions: 1
-search_space:                # per-dimension overrides; defaults stay in optimization/param_spaces.py
-  iron_condor:
-    wing_k: [1.0, 2.0]
-```
-
-* **Run it:** `python run_backtest.py --study-file studies/<name>.yaml ...` (also `run_optimizer.py`). `--study-file`, not `--study`: the optimizer
-  already has the Optuna `--study-name`. Commit the file before the run and never edit it afterwards (a changed study is a new file). A study whose
-  `rule:` is not `exploratory` and names no PLAN.md heading is refused at start.
-* **Refused on purpose:** `ibkr` / `api_keys`; any setting the **env contract** reads (`backtest.wing_k`, `backtest.ic_*`, `risk.iv_rank_cap`, ...): the
-  contract reads the raw `config.yaml` and ignores both overlays, so the value would be silently ignored (use the environment variable or the CLI
-  flag). Walk-forward window workers (`optimize_n_jobs > 1`) receive the parent's resolved settings through a pool initializer (W88a), and the
-  optimizer's `--n-jobs` uses threads, so both see the overlay and the study. `run_optimizer.py --apply` is refused with a study: params found under a study's settings are not promotable to the live config.
-* **Search-space overrides** are validated (known dimension, same type, `low < high`, inside the hard limits in `param_spaces.HARD_BOUNDS`) and the run
-  warns when a range excludes the live value (`wing_k` 1.6, `delta_short` 0.20). The optimizer stores a hash of the effective space on the Optuna study
-  and refuses to resume a stored study created over a different space.
-* **The run record** (`run_record.json` in the run folder `reports/runs/<backtest|optimize>_<symbols>_<study|adhoc>_<timestamp>/`, gitignored; `--no-run-record` skips it) holds the resolved settings
-  (secrets excluded), the RAW `config.yaml` / overlay / study text with sha256, the effective `AIT_*` env-contract values, the git commit and a dirty flag,
-  data fingerprints (rows and date span per research table and a hash of each symbol's close series, read through a read-only connection), seeds, the
-  command line and the merged search space with its hash. **MLflow is optional:** when installed the record is also logged (experiment
-  `research_<study name or adhoc>`, tracking URI `MLFLOW_TRACKING_URI` or `sqlite:///data/mlflow.db`); a failure never fails a run.
-* **When does a study need a PLAN.md entry?** A **pre-registered** study (the result could change a gate, a live parameter or a go-live criterion) gets
-  an AS PLANNED entry BEFORE the run, with the pass rule and a pointer to the study file, and a result entry after; its `rule:` names that heading. An
-  **exploratory** study needs only the file and its record; its results may not be quoted as evidence, and a decision that leans on one cites it (file and
-  commit) in its own PLAN entry. `tests/test_w87b_study_layer.py` fails when a study names a PLAN heading that does not exist.
-* **Defaults for a bare run (W87):** `--symbols` is `backtest.default_symbols` (QQQ: the symbol with historical option prices, so an IV surface can be
-  built) and `--strategies` is `options.strategies` (iron condor); explicit lists win. Before W87 a bare `python run_backtest.py` ran ten symbols and four
-  strategies and crashed on the first name without dividend rows (AAPL). The supervisor job passes explicit arguments and is unaffected. The walk-forward
-  `slippage_pct` also follows `backtest.slippage_pct` (0.01; debit structures only) instead of a 0.03 literal.
+| "Competing live session" (Error 10197), or marks go missing | The live account is logged in elsewhere (mobile/web) and holds the single market-data slot | Log the other session out; paper data is delayed by design (`AIT_MARKET_DATA_TYPE=4`) |
+| `Delayed market data` warnings (Error 10167) | The paper account has no live subscription for that exchange | Expected on paper. The bot works with delayed data; fills are modelled and may be less favourable |
+| Entry orders do not fill | The combo limit starts near mid and steps toward marketable, then is cancelled after the entry timeout; an entry is refused outright if its combo quote is disorderly or stale (`combo_spread_disorderly_rejected`, `combo_signal_price_stale_rejected` in the log) | Look for those events and for `order_ack_latency`; the timeline and its timers are in [GUIDE.md](GUIDE.md) section 8.4 |
+| Models look stale or missing at startup | The retrain is due or failed | The bot trains in the background and keeps managing positions meanwhile; force one with `python run_orchestrator.py --retrain` |
+| Telegram alerts not arriving | Token or chat id wrong, or the channel is marked dead | Check `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`; test: `curl -X POST "https://api.telegram.org/bot<TOKEN>/sendMessage" -d "chat_id=<CHAT_ID>&text=test"`. The supervisor probes a dead channel hourly and announces `Telegram channel RECOVERED` |
+| `No module named 'ait'` | The package is not installed in the active environment | Activate the environment and run `pip install -e . -c constraints.txt` from the project root ([GETTING_STARTED.md](GETTING_STARTED.md)) |
+| `torch`, `transformers` or FinBERT import or install errors | They concern the retired sentiment extra, which nothing under `src/` imports | Ignore them; do not install the extra. The package installs without it ([GETTING_STARTED.md](GETTING_STARTED.md)) |
+| The bot will not start | Gateway not listening, a stale process, or a lock | Check the port (`netstat -ano \| findstr 4002` on Windows); read `logs/orchestrator.log` and the alerts above; stop stale Python processes by PID, never blindly |
 
 ## Quarterly drills (scheduled — first week of Jan / Apr / Jul / Oct)
-Run both, then record the date in the log table below. An untested kill
-switch or backup is a hope, not a control.
+Run both, then record the date in the log table below. An untested kill switch or backup is a hope, not a control.
 
 **Kill-switch drill** (~5 min, during RTH on a quiet day):
 1. `New-Item -ItemType File data\HALT`
-2. Within one scan cycle (≤5 min) confirm the bot acknowledged it:
-   `Select-String -Path logs\ait.log -Pattern "entries_frozen" | Select-Object -Last 1`
-   (R13: the old `entries_halted` event only fired when a signal reached
-   execution — on a gated day it NEVER logged and the drill read as a fail.
-   `entries_frozen` now logs once per scan cycle whenever any HALT* file
-   exists.)
-3. Confirm exits are STILL managed while halted (open positions' marks keep
-   updating on :8503 — HALT blocks entries only).
+2. Within one scan cycle confirm the bot acknowledged it: `Select-String -Path logs\ait.log -Pattern "entries_frozen" | Select-Object -Last 1` (`entries_frozen` logs once per scan cycle whenever any `HALT*` file exists).
+3. Confirm exits are STILL managed while halted (open positions' marks keep updating on :8503; HALT blocks entries only).
 4. `Remove-Item data\HALT` and confirm normal scanning resumes.
 
-**Backup-restore drill** (~10 min, outside RTH — proves the backups restore):
-1. Latest snapshot:
-   `Get-ChildItem data\backups\ait_state.*.db | Sort-Object Name | Select-Object -Last 1`
-2. Restore to scratch and verify integrity + row parity:
+**Backup-restore drill** (~10 min, outside RTH; proves the backups restore):
+1. Latest snapshot: `Get-ChildItem data\backups\ait_state.*.db | Sort-Object Name | Select-Object -Last 1`
+2. Restore to scratch and verify integrity and row parity:
    `Copy-Item data\backups\ait_state.<YYYYMMDD>.db $env:TEMP\restore_test.db`
    `python -c "import sqlite3; c=sqlite3.connect(r'$env:TEMP\restore_test.db'); print(c.execute('PRAGMA integrity_check').fetchone()); print('trades:', c.execute('SELECT COUNT(*) FROM trades').fetchone()[0]); print('open:', c.execute('SELECT COUNT(*) FROM open_positions').fetchone()[0])"`
    (integrity must be `('ok',)`; trades count within a day's worth of the live DB)
-3. Confirm the off-box mirror is fresh:
-   `Get-Item $HOME\Documents\ait_backups\ait_state.latest.db | Select-Object LastWriteTime`
+3. Confirm the off-box mirror is fresh: `Get-Item $HOME\Documents\ait_backups\ait_state.latest.db | Select-Object LastWriteTime`
 4. `Remove-Item $env:TEMP\restore_test.db`
 
 | Drill | Last run | Result |
 |---|---|---|
-| Kill switch | _(not yet run — next quiet RTH day)_ | |
-| Backup restore | 2026-07-11 (R11) | PASS |
+| Kill switch | _(not yet run; next quiet RTH day)_ | |
+| Backup restore | 2026-07-11 | PASS |
 
 ## Go-live day checklist (from PLAN.md gates — do not skip)
-- [ ] Paper verdict passed (≥50 closes, PF > 1.3, criteria fixed beforehand)
+The criteria the scorecard grades are in [GUIDE.md](GUIDE.md) section 12; the decision to go live is the operator's, against `PLAN.md`.
+- [ ] The paper verdict has passed against the criteria in [GUIDE.md](GUIDE.md) section 12 (fixed beforehand in `PLAN.md`)
 - [ ] Remove `AIT_ALLOW_UNDEFINED_RISK` (strangles refuse at the executor)
-- [ ] Revert paper-relaxed liquidity gates: `AIT_LIQ_MAX_SPREAD` ≤ 0.15,
-      `AIT_LIQ_MIN_VOLUME` ≥ 10, config `max_bid_ask_spread_pct` ≤ 0.15
-      (startup asserts this in live mode and will refuse to run otherwise)
-- [ ] simulated capital OFF: `account.simulate_live_capital: false` in config.yaml (W63; was `AIT_SIMULATED_CAPITAL` in .env — also make sure no `AIT_SIMULATED_CAPITAL` override remains in .env); account funded $3k CAD
+- [ ] Revert paper-relaxed liquidity gates: `AIT_LIQ_MAX_SPREAD` ≤ 0.15, `AIT_LIQ_MIN_VOLUME` ≥ 10, config `max_bid_ask_spread_pct` ≤ 0.15 (startup asserts this in live mode and will refuse to run otherwise)
+- [ ] Simulated capital OFF: `account.simulate_live_capital: false` in `config.yaml` (also make sure no `AIT_SIMULATED_CAPITAL` override remains in `.env`); account funded
 - [ ] Fresh DB backup taken; PLAN.md gates re-read
 
-
-## History tables: one set, one source per field (W91)
-
-`data/historical.db` used to keep the same history twice (un-prefixed "live" tables and `research_*` twins). Since W91
-there is ONE set; research reads it through `backtest.research_history: true` (research overlay) and
-`research_table_prefix: ""`. See `docs/RESEARCH_GUIDE.md` ("Where each field comes from") for the source of every field.
-
-- **The retrain is append-only** (`HistoricalDataStore.save(overwrite=False)`): a stored completed session is never
-  rewritten; today's partial bar is never stored. Backfill scripts overwrite only when you run them.
-- **Implied vol stays fresh without a new job:** the 07:30 ET retrain, after its IB pre-flight, runs
-  `ait.data.iv_refresh` for the universe and the VIX family (`iv_refresh QQQ:+2->2026-10-22 ...` in `retrain_*.log`). A
-  failure there is a WARNING, not a failed retrain; the next run fills the gap. Catch up by hand:
-  `python scripts/backfill_historical_data.py --symbols QQQ SPY IWM --mode iv --years 1`, and the VIX family:
-  `--mode vix --symbols VIX --years 8`.
-- **Studies pin an end date:** `backtest.history_end_date` (a study file or the overlay). The run record stores it and the
-  data fingerprint hashes the closes up to it.
-- **The merge tool** (`scripts/unify_history_tables.py`): dry run by default; `--apply` backs up, merges (additive,
-  research rows win on overlap, live-only rows kept) and verifies; `--verify` re-checks any time; `--archive` renames
-  `research_X` to `archive_w91_research_X` (refused unless verification passes); `--drop-archives` drops them. It
-  refuses to write the real database while the supervisor/bot runs (`--allow-running` overrides). Order: merge, merge
-  the code and restart the supervisor, one clean retrain and a research run, THEN archive, THEN drop. Do not run it
-  during the Sunday 20:00 weekly backtest or an option-history refresh.
+**Configuration to confirm before going live** (the operator has reviewed these; each is read from the file named):
+- [ ] Live needs all of these together, and the supervisor and the bot refuse to start live otherwise (`src/ait/config/launch_mode.py`): `trading.mode: live` in `config.yaml`, `TRADING_MODE=live` in `.env`, `AIT_ALLOW_LIVE=1` in `.env`, an IB endpoint of the live account (Gateway 4001 or TWS 7496) and, when `IBKR_ACCOUNT` is set, a live account id (paper ids start with `D`). If `config.yaml` and `.env` disagree the start is paper. Settings are read at start, so restart the supervisor after the change. Live mode then shows a 10-second abort window at start (`main.py`) that is only useful when the bot is started by hand
+- [ ] `learning.paper_trading_mode: false` (the `config.yaml` comment says it MUST be false at go-live; it bypasses the adaptor, Thompson re-ranking and the meta-label gate)
+- [ ] In `.env` only (never in `config.yaml` or these documents): `IBKR_PORT` and `IBKR_ACCOUNT` for the live account (Gateway live 4001, TWS live 7496), `TRADING_MODE`, `AIT_ALLOW_LIVE`; `AIT_MARKET_DATA_TYPE=1` once the live data entitlement is in place (the default is 4, delayed; this variable lives in `.env` on purpose)
+- [ ] If IBC starts Gateway for you (the supervisor relaunches it through IBC after an outage): IBC's own `config.ini` decides paper or live (`TradingMode`, `OverrideTwsApiPort`); the `trading_mode` the code passes is only logged
+- [ ] `account.pdt_account_under_25k: true` if the funded account is under $25,000
+- [ ] The entry-gate mode (`ml.entry_gates_enabled`) is the operator's decision after a pre-registered test; do not change it as part of the cut-over by accident

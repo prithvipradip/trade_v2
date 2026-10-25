@@ -138,7 +138,7 @@ async def run_variant(name, ladder, bc, data, n_jobs, entry_dte, out) -> dict:
     cfg = WalkForwardConfig(
         train_days=126, test_days=63, step_days=63, gap_days=5,
         train_window_models=False,
-        initial_capital=bc.initial_capital,
+        initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
         position_size_pct=bc.position_size_pct,
         wing_floor_dollars=bc.wing_floor_dollars,
         iv_floor=bc.iv_floor,

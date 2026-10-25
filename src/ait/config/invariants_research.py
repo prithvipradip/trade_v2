@@ -8,9 +8,9 @@ choice. A key in a YAML file is editable regardless of any comment, and the rese
 edited by people and AI sessions, so putting these there would let one edit loosen both a limit and its check.
 
 They are code, in ONE place, named, documented, logged once per research process (``research_fixed_limits_in_effect``),
-stored in every run record, and listed in docs/RUNBOOK.md ("Research fixed limits"; a drift test keeps them in step).
+stored in every run record, and listed in docs/RESEARCH_GUIDE.md "Are some values not configurable?" (generated; scripts/gen_docs.py --check keeps them in step).
 
-HOW TO CHANGE ONE: edit this file, update the RUNBOOK row, record it in PLAN.md. A change moves research numbers.
+HOW TO CHANGE ONE: edit this file, run scripts/gen_docs.py, record it in PLAN.md. A change moves research numbers.
 
 THIS MODULE MUST STAY A LEAF: stdlib plus ``ait.config.invariants`` (itself a leaf). It does not name the research
 overlay or any loader, so it may be imported from ``backtesting/`` and ``optimization/``.
@@ -84,6 +84,7 @@ def log_research_invariants() -> None:
         get_logger("config.invariants_research").info(
             "research_fixed_limits_in_effect", count=len(limits), limits=limits,
             note="fixed in code on purpose (ait/config/invariants_research.py); not set by config.yaml, "
-                 "the research overlay or a study. Why each is fixed: docs/RUNBOOK.md 'Research fixed limits'.")
+                 "the research overlay or a study. Why each is fixed: "
+                 "docs/RESEARCH_GUIDE.md \"Are some values not configurable?\".")
     except Exception:  # noqa: BLE001 - diagnostics must never block a run
         pass

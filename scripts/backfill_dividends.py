@@ -5,11 +5,12 @@ live's W51 block) and the W83a range study read this table; the engine never fet
 the network. Source: yfinance `Ticker.dividends` (ex-date + cash amount per share), the same
 source live's `ait.data.dividends` uses, tagged SOURCE_YAHOO_DIVIDENDS with the fetch time.
 
-A non-empty --table-prefix is required (research data; the live tables are never written)
-unless --allow-live-tables is passed.
+An empty --table-prefix (the default) writes the one shared set of history tables; every row carries its
+source tag. --allow-live-tables is an accepted no-op. (A non-empty prefix would create and fill a separate
+set of tables: do not pass one unless you mean to.)
 
 Usage:
-    python scripts/backfill_dividends.py --symbols QQQ SPY IWM --table-prefix research_ \\
+    python scripts/backfill_dividends.py --symbols QQQ SPY IWM \\
         [--since 2009-01-01] [--db-path data/historical.db] [--dry-run]
 
 Prints per-year counts and flags ex-date gaps outside the quarterly band (80-100 days) for

@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Round 10 maturity assessment (2026-07-11), against external checklists as of that date. Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # R10 Maturity Assessment — external best-practice checklists (2026-07-11)
 
 ## TRADING

@@ -125,7 +125,7 @@ function App() {
         <main className="analysis">
           <ExperimentHeader exp={data.experiment} windowMetrics={windowMetrics} />
           <div className="workspace">
-            <SeriesPanel active={activeSeries} onToggle={toggleSeries} windows={data.windows} selectedWindow={selectedWindow} onWindow={setSelectedWindow} hasPredictions={!!data._has_predictions} />
+            <SeriesPanel active={activeSeries} onToggle={toggleSeries} windows={data.windows} selectedWindow={selectedWindow} onWindow={setSelectedWindow} hasPredictions={!!data._has_predictions} hasSentiment={(data.features || []).some(f => f.sentiment_composite != null)} />
             <div className="work-main">
               <div className="work-toolbar">
                 <div className="seg view-seg">
