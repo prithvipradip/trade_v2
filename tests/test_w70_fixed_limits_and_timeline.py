@@ -3,7 +3,7 @@
 Two halves, matching the operator's rule "separate VISIBLE from TUNABLE":
 
   * the values deliberately fixed in code live in ONE module
-    (ait.config.invariants), are logged at startup and documented in the RUNBOOK;
+    (ait.config.invariants), are logged at startup and documented in the GUIDE;
   * the six order-lifecycle durations that were literals in execution/executor.py
     are config (positions.* / exit.*), with floors and cross-field rules.
 
@@ -39,7 +39,7 @@ from tests.test_r16_broker_fixes import BrokerAwareClient, _closing_state, _regi
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "ait"
 CONFIG_PATH = ROOT / "config.yaml"
-RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
+GUIDE = ROOT / "docs" / "GUIDE.md"          # the fixed-limits and timeline tables live there (generated: scripts/gen_docs.py)
 
 # --------------------------------------------------------------------------- #
 # 1. The invariants module
@@ -594,25 +594,25 @@ class TestOrderAckLatencyTelemetry:
 
 
 # --------------------------------------------------------------------------- #
-# 6. Documentation drift: the RUNBOOK and the config.yaml pointer block
+# 6. Documentation drift: the GUIDE tables and the config.yaml pointer block
 # --------------------------------------------------------------------------- #
 
-def _runbook_section(title: str) -> str:
-    text = RUNBOOK.read_text()
-    start = text.index(f"## {title}")
-    nxt = text.find("\n## ", start + 5)
-    return text[start: nxt if nxt != -1 else len(text)]
+def _guide_block(name: str) -> str:
+    """The generated block ``name`` of docs/GUIDE.md (between its BEGIN/END GENERATED markers)."""
+    m = re.search(rf"<!-- BEGIN GENERATED: {name} -->\n(.*?)<!-- END GENERATED: {name} -->", GUIDE.read_text(), re.S)
+    assert m, f"docs/GUIDE.md has no generated block {name!r}"
+    return m.group(1)
 
 
 class TestFixedLimitsDocumentation:
-    def test_runbook_table_is_the_registry(self):
-        sec = _runbook_section("Fixed limits")
+    def test_guide_table_is_the_registry(self):
+        sec = _guide_block("fixed_limits")
         rows = re.findall(r"^\|\s*`([A-Z0-9_]+)`\s*\|\s*([0-9.]+)\s*\|", sec, re.M)
         assert {n for n, _ in rows} == {i.name for i in inv.INVARIANTS}, (
-            "RUNBOOK 'Fixed limits' rows must be exactly the invariants registry")
+            "GUIDE 'fixed_limits' rows must be exactly the invariants registry")
         by_name = {i.name: i.value for i in inv.INVARIANTS}
         for name, shown in rows:
-            assert float(shown) == float(by_name[name]), f"{name}: RUNBOOK says {shown}"
+            assert float(shown) == float(by_name[name]), f"{name}: GUIDE says {shown}"
 
     def test_yaml_pointer_block_is_the_registry(self):
         rows = re.findall(r"^#\s{3}([A-Z0-9_]+) = ([0-9.]+)\s*$",
@@ -626,13 +626,20 @@ class TestFixedLimitsDocumentation:
         assert not any(k.isupper() for k in raw), "an invariant leaked into config.yaml keys"
 
     def test_timeline_section_documents_every_duration_with_its_default(self):
-        sec = _runbook_section("Order lifecycle timeline")
+        sec = _guide_block("order_timeline")
         s = Settings()
+        shown: dict[str, float] = {}
+        for line in sec.splitlines():
+            cols = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cols) == 5 and cols[2].startswith("`"):
+                keys = re.findall(r"`([a-z_.]+)`", cols[2])
+                defaults = [d.strip() for d in cols[3].split("/")]
+                assert len(keys) == len(defaults), line
+                shown.update({k: float(d) for k, d in zip(keys, defaults)})
         for dotted in list(NEW_KEYS) + [
                 "exit.exit_stop_pending_rest_seconds", "exit.exit_pending_rest_seconds",
                 "exit.exit_band_ttl_seconds", "positions.entry_order_timeout_seconds"]:
-            m = re.search(rf"`{re.escape(dotted)}`\s*\(([0-9.]+)\)", sec)
-            assert m, f"RUNBOOK timeline does not document {dotted} with its default"
-            assert float(m.group(1)) == float(_dig(s, dotted)), (
-                f"{dotted}: RUNBOOK says {m.group(1)}, model default {_dig(s, dotted)}")
-        assert "30 s fast-monitor tick" in sec
+            assert dotted in shown, f"GUIDE timeline does not document {dotted} with its default"
+            assert shown[dotted] == float(_dig(s, dotted)), (
+                f"{dotted}: GUIDE says {shown[dotted]}, model default {_dig(s, dotted)}")
+        assert "30-second fast-monitor tick" in GUIDE.read_text()

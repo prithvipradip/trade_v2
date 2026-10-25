@@ -1,6 +1,6 @@
 """W83a-1: build the event calendars of the strike-aware range study into historical.db.
 
-    python scripts/build_research_calendars.py --what all --table-prefix research_ [--dry-run]
+    python scripts/build_research_calendars.py --what all [--dry-run]
         [--what econ|holdings|earnings] [--cache-dir data/research_cache/w83a] [--since 2009-01-01]
 
 Three research tables (PLAN.md 2026-10-17, W83a AS PLANNED + amendment 4):

@@ -11,7 +11,8 @@ WHY THIS MODULE EXISTS
     there would let one edit loosen both a gate and its check.
 
     They are therefore code, in ONE place, named, documented, logged at startup
-    (``fixed_limits_in_effect``) and listed in docs/RUNBOOK.md ("Fixed limits").
+    (``fixed_limits_in_effect``) and listed in
+    docs/GUIDE.md "Fixed limits, and the ceilings of tunable settings" (generated).
 
 HOW TO CHANGE ONE
     Edit this file, update the RUNBOOK row (a drift test compares them), and record the
@@ -114,8 +115,8 @@ INVARIANTS: tuple[Invariant, ...] = (
         "LIVE_MIN_VOLUME", LIVE_MIN_VOLUME, "contracts",
         "Minimum option volume (AIT_LIQ_MIN_VOLUME) allowed when started in a non-paper "
         "mode.",
-        "Same reason as LIVE_MAX_SPREAD_PCT; docs/RUNBOOK.md's go-live checklist "
-        "documents both numbers.",
+        "Same reason as LIVE_MAX_SPREAD_PCT; docs/RUNBOOK.md \"Go-live day checklist\" "
+        "lists both numbers.",
         "bot/orchestrator.py (GOV-5 live-profile assertion at startup)"),
     Invariant(
         "IC_BUDGET_CAPPED_MIN_WING", IC_BUDGET_CAPPED_MIN_WING, "dollars",

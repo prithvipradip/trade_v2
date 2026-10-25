@@ -49,11 +49,16 @@ def _parse_hhmm(value: str, field: str = "time") -> tuple[int, int]:
 
 
 class TradingConfig(_StrictModel):
-    mode: Literal["paper", "live"] = "paper"
-    universe: list[str] = ["SPY", "QQQ", "AAPL"]
-    scan_interval_seconds: int = Field(default=300, ge=30, le=3600)
-    max_daily_trades: int = Field(default=5, ge=1, le=50)
-    trading_hours_only: bool = True
+    mode: Literal["paper", "live"] = Field(default="paper",
+        description="Paper or live trading. Live needs this AND .env TRADING_MODE to say live, plus AIT_ALLOW_LIVE=1 and a live-account IB endpoint; otherwise the bot starts as paper, and a paper bot pointed at a live endpoint is refused (config/launch_mode.py; docs/RUNBOOK.md \"Go-live day checklist\").")
+    universe: list[str] = Field(default=["SPY", "QQQ", "AAPL"],
+        description="Symbols the bot scans for entries. Each needs stored history, option chains and a model.")
+    scan_interval_seconds: int = Field(default=300, ge=30, le=3600,
+        description="Seconds between entry scans, counted from when the previous scan finishes. Position protection runs on its own 30-second cadence whatever this is.")
+    max_daily_trades: int = Field(default=5, ge=1, le=50,
+        description="Upper bound on new positions opened per day; the time-of-day trade budget (first hour, midday, rest of the session) is bounded by it.")
+    trading_hours_only: bool = Field(default=True,
+        description="Not read by any code: regular trading hours are enforced unconditionally by the scheduler and by the executor (the executor override is the environment variable AIT_ALLOW_AFTER_HOURS=1).")
     no_new_entries_minutes_before_close: int = Field(default=15, ge=0, le=120,
         description="W35 (R26 entry-blackout-cutoff-900s-is-a-bare-literal): "
                     "no new entries inside this many minutes of the session "
@@ -111,8 +116,10 @@ class TradingConfig(_StrictModel):
 
 
 class AccountConfig(_StrictModel):
-    pdt_protection: bool = True
-    pdt_account_under_25k: bool = True
+    pdt_protection: bool = Field(default=True,
+        description="Enables the pattern-day-trader guard; it applies only together with pdt_account_under_25k.")
+    pdt_account_under_25k: bool = Field(default=True,
+        description="True when the funded account is a margin account under $25,000, so the pattern-day-trader guard applies. Set it back to true if the funded account is under that size.")
     capital: float = Field(
         default=5_000.0, ge=1_000.0, le=10_000_000.0,
         description="THE one capital number. Research (run_backtest, run_optimizer, "
@@ -155,7 +162,8 @@ class AccountConfig(_StrictModel):
 
 
 class PositionConfig(_StrictModel):
-    max_open_positions: int = Field(default=5, ge=1, le=20)
+    max_open_positions: int = Field(default=5, ge=1, le=20,
+        description="Maximum number of positions open at once (the risk manager's position-count gate; the research pool applies the same cap).")
     max_position_pct: float = Field(default=0.05, ge=0.01, le=0.30,
         description="The position sizer's hard per-position cap, fraction of NLV (a defined-risk "
                     "structure's max loss per contract must fit). Must stay >= risk.max_position_risk_pct "
@@ -163,7 +171,8 @@ class PositionConfig(_StrictModel):
                     "sizer cap can sit above a raised per-trade budget (risk.max_position_risk_pct, ceiling "
                     "0.25); the value in config.yaml is unchanged. The ceilings are in code on purpose: "
                     "a limit in the same file as the value lets one edit loosen both.")
-    max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0)
+    max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0,
+        description="Net portfolio delta limit as a fraction of account value. The bot has no live greeks feed, so this gate is largely inert; the aggregate-risk and concentration limits carry the load.")
     max_portfolio_risk_pct: float = Field(default=0.20, ge=0.005, le=0.50,
         description="Aggregate capital-at-risk across ALL open positions as a "
                     "fraction of NLV. Was a phantom knob (never read) while the "
@@ -347,10 +356,14 @@ class RiskConfig(_StrictModel):
                     "trade can't halt the day alone). 1.0 = one full max-loss condor "
                     "exactly reaches the breaker; 1.5 = the original, most conservative "
                     "rule. Alert-only: it never changes live sizing or the breaker.")
-    max_consecutive_losses: int = Field(default=3, ge=1, le=10)
-    pause_minutes_after_losses: int = Field(default=30, ge=5, le=120)
-    max_api_failures: int = Field(default=5, ge=2, le=20)
-    min_confidence: float = Field(default=0.65, ge=0.50, le=0.95)
+    max_consecutive_losses: int = Field(default=3, ge=1, le=10,
+        description="Consecutive losing closes that trip the circuit breaker.")
+    pause_minutes_after_losses: int = Field(default=30, ge=5, le=120,
+        description="Minutes new entries stay paused after the consecutive-losses trip.")
+    max_api_failures: int = Field(default=5, ge=2, le=20,
+        description="Broker API failures within 10 minutes that trip the circuit breaker (10-minute pause).")
+    min_confidence: float = Field(default=0.65, ge=0.50, le=0.95,
+        description="Minimum model confidence for an entry. Direction-neutral structures are validated on the configured neutral baseline instead, and the learning layer may move the effective floor between its own bounds.")
     pre_event_blackout_days: int = Field(default=1, ge=0, le=7,
         description="Block NEW credit entries within N calendar days of a "
                     "macro event (NFP/CPI/PCE). PLAN 2026-08-03: relaxed 4->1 "
@@ -493,24 +506,30 @@ DEFAULT_RISK_FREE_RATE = 0.05
 
 
 class OptionsConfig(_StrictModel):
-    delta_range: list[float] = [0.20, 0.50]
-    dte_range: list[int] = [14, 45]
-    min_open_interest: int = Field(default=100, ge=0)
-    min_volume: int = Field(default=50, ge=0)
-    max_bid_ask_spread_pct: float = Field(default=0.10, ge=0.01, le=0.50)
+    delta_range: list[float] = Field(default=[0.20, 0.50],
+        description="Not read by any code: long-option strike targeting uses its own constant, and live trades iron condors only.")
+    dte_range: list[int] = Field(default=[14, 45],
+        description="Days-to-expiry band, [minimum, maximum], for new entries; the range model's horizon is derived from its minimum.")
+    min_open_interest: int = Field(default=100, ge=0,
+        description="Option contracts with less open interest than this are dropped from the chain.")
+    min_volume: int = Field(default=50, ge=0,
+        description="Option contracts with less volume than this are dropped from the chain.")
+    max_bid_ask_spread_pct: float = Field(default=0.10, ge=0.01, le=0.50,
+        description="Option contracts whose bid-ask spread is wider than this fraction of the mid are dropped. A live start requires it not to exceed the fixed live limit (docs/GUIDE.md \"Fixed limits, and the ceilings of tunable settings\").")
     risk_free_rate: float = Field(default=DEFAULT_RISK_FREE_RATE, ge=0.0, le=0.25,
         description="W36: the Black-Scholes risk-free rate used to solve IVs "
                     "and backfill Greeks (was a bare `r = 0.05` in "
                     "options_chain._calculate_greeks). No dividend yield is "
                     "modelled: the R24 register checked carry/dividend "
                     "structure and cleared it.")
-    strategies: list[str] = [
+    strategies: list[str] = Field(default=[
         "long_call",
         "long_put",
         "bull_call_spread",
         "bear_put_spread",
         "iron_condor",
-    ]
+    ],
+        description="Strategy names the selector may use. Enabling a structure is a recorded decision.")
 
     @field_validator("delta_range")
     @classmethod
@@ -1892,7 +1911,8 @@ class MLConfig(_StrictModel):
         default_factory=lambda: TreeHyperparamsConfig(n_estimators=100, max_depth=3, random_state=None),
         description="W88c: the meta-labeler's own profile (100 trees, depth 3, unseeded: small dataset, shallow "
                     "on purpose).")
-    ensemble_weights: dict[str, float] = {"xgboost": 0.5, "lightgbm": 0.5}
+    ensemble_weights: dict[str, float] = Field(default={"xgboost": 0.5, "lightgbm": 0.5},
+        description="Weights of XGBoost and LightGBM in the direction ensemble.")
     retrain_interval_days: int = Field(default=7, ge=1, le=30)
     lookback_days: int = Field(default=504, ge=60, le=2520)
     retrain_ib_client_id: int = Field(default=94, ge=2, le=999_999,
@@ -1989,7 +2009,7 @@ class MLConfig(_StrictModel):
                     "classifier floors high-vol confidence at 0.80 so any "
                     "VIX/vol trigger clears it — keep this at or below regime.high_vol_confidence_floor, 0.80). "
                     "Iron condors ignore the direction, so this only matters for direction-sensitive strategies.")
-    # --- Drift detection (ml/drift.py). W92: switchable, default OFF; every number explained. Guide: RESEARCH_GUIDE "Drift detection". ---
+    # --- Drift detection (ml/drift.py). W92: switchable, default OFF; every number explained. Guide: docs/MODELS.md "The drift detector". ---
     drift_detection_enabled: bool = Field(default=False,
         description="W92: master switch of the live drift detector. OFF (default): it records nothing and always reports 'no "
                     "drift', so it can never ask for an early retrain. ON: it scores the direction model's live calls against "
@@ -2091,8 +2111,8 @@ class RegimeConfig(_StrictModel):
     strong_trend: float = Field(default=0.35, ge=0.05, le=1.0,
         description="|trend strength| above this (outside the branches above) "
                     "classifies TRENDING_UP/DOWN.")
-    # --- W92: how the trend strength (-1 to +1) is measured, and the confidence each class reports. Guide: RESEARCH_GUIDE "The regime
-    # classifier". Live-only: research does not use the RegimeDetector. ---
+    # --- W92: how the trend strength (-1 to +1) is measured, and the confidence each class reports. Guide: docs/MODELS.md "The regime classifier".
+    # Live-only: research does not use the RegimeDetector. ---
     trend_sma_periods: list[int] = Field(default=[10, 20, 50], min_length=1, max_length=6,
         description="W92: the trend score averages the slope of the simple moving average of each of these lengths (days).")
     trend_slope_lookback: int = Field(default=5, ge=1, le=60,
@@ -2128,7 +2148,7 @@ class RegimeConfig(_StrictModel):
         description="W92: a TRENDING_UP / TRENDING_DOWN classification reports min(this, |trend strength|) (reported only).")
     range_confidence_floor: float = Field(default=0.50, ge=0.0, le=1.0,
         description="W92: a RANGE_BOUND classification reports max(this, 1 - 2 x |trend strength|) (reported only).")
-    # --- W95: how much history the classifier needs. Guide: RESEARCH_GUIDE "The regime classifier" ---
+    # --- W95: how much history the classifier needs. Guide: docs/MODELS.md "The regime classifier" ---
     min_history_rows: int = Field(default=60, ge=21, le=1000,
         description="W95: the classifier needs at least this many daily bars; with fewer it returns RANGE_BOUND at confidence 0 "
                     "(it makes no call). Must cover the longest look-back of the trend measure (the longest trend_sma_periods "
@@ -2173,9 +2193,12 @@ class MetaLabelConfig(_StrictModel):
     # on corrupted data and rejects everything; config.yaml has carried
     # `enabled: false` since that finding, so this only changes what happens
     # if the key is ever omitted — default-off is the safe direction.
-    enabled: bool = False
-    min_probability: float = Field(default=0.50, ge=0.30, le=0.80)
-    retrain_with_primary: bool = True  # Retrain when primary model retrains
+    enabled: bool = Field(default=False,
+        description="Master switch for the meta-labeler gate (off today). The guards that apply before it can act are in docs/MODELS.md \"The models one by one\".")
+    min_probability: float = Field(default=0.50, ge=0.30, le=0.80,
+        description="Minimum predicted probability of profit for the meta-labeler to let a trade through, when it acts.")
+    retrain_with_primary: bool = Field(default=True,
+        description="Not read by any code: the live trainer has no meta-labeler retrain, and the gate itself is off.")  # Retrain when primary model retrains
     min_trades_for_training: int = Field(default=30, ge=10, le=1000,
         description="W92: the meta-labeler is not trained on fewer closed trades than this (it was the module constant "
                     "MIN_TRADES_FOR_TRAINING = 30). min_closes_to_enable below is the separate question of when its output is "
@@ -2449,7 +2472,8 @@ class SentimentConfig(_StrictModel):
     what the values are.
     """
 
-    enabled: bool = False
+    enabled: bool = Field(default=False,
+        description="Retired: the sentiment subsystem was removed from the live tree and nothing reads this.")
     model_config = {"extra": "allow"}
 
 
@@ -2520,16 +2544,23 @@ class ExitConfig(_StrictModel):
         description="W36: config home for AIT_CREDIT_TOUCH_STOP — close a "
                     "credit structure when the underlying touches a short "
                     "strike (R12-B1: the best-ranked credit stop).")
-    trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50)
-    breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80)
-    partial_exit_levels: list[dict] = [
+    trailing_stop_pct: float = Field(default=0.25, ge=0.10, le=0.50,
+        description="Trailing stop distance below the high-water mark, as a fraction of cost (debit structures; credit structures use the short-strike touch exit).")
+    breakeven_trigger_pct: float = Field(default=0.30, ge=0.10, le=0.80,
+        description="Profit, as a fraction of cost, at which the stop moves to breakeven (debit structures).")
+    partial_exit_levels: list[dict] = Field(default=[
         {"pnl_pct": 0.50, "close_pct": 0.33},
         {"pnl_pct": 1.00, "close_pct": 0.33},
-    ]
-    time_decay_scaling: bool = True
-    volatility_adjusted_stops: bool = True
-    initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75)
-    auto_hedge: bool = False
+    ],
+        description="Scale-out milestones: at each pnl_pct the position closes close_pct of itself, once per level (strategies that use them).")
+    time_decay_scaling: bool = Field(default=True,
+        description="Shrinks the take-profit target as expiry nears (the take-profit ladder).")
+    volatility_adjusted_stops: bool = Field(default=True,
+        description="Widens the stop for volatile underlyings (debit structures only).")
+    initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75,
+        description="Fixed stop, as a fraction of cost, before the breakeven trigger activates (debit structures).")
+    auto_hedge: bool = Field(default=False,
+        description="Not read by any code: no hedging code exists in the live tree.")
     # R14: staleness gate on exit inputs. The touch stop is the only exit rule
     # that acts DIRECTLY on the underlying's price, and it read that price with
     # no quality check at all — a frozen feed could fire it on a breach that had
@@ -2687,15 +2718,20 @@ class LearningAnalyzerConfig(_StrictModel):
 
 
 class LearningConfig(_StrictModel):
-    enabled: bool = True
-    lookback_days: int = Field(default=30, ge=7, le=180)
+    enabled: bool = Field(default=True,
+        description="Runs the learning cycle (pre-market and post-market) that mines closed trades and applies bounded adaptations.")
+    lookback_days: int = Field(default=30, ge=7, le=180,
+        description="Days of closed trades the learning cycle analyses.")
     max_adaptations_per_cycle: int = Field(default=3, ge=1, le=10,
         description="W69: now actually read — LearningEngine builds its "
                     "AdaptationLimits from these four keys (they were "
                     "silently ignored; the dataclass defaults ran instead).")
-    min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95)
-    min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80)
-    min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99)
+    min_insight_confidence: float = Field(default=0.60, ge=0.40, le=0.95,
+        description="Minimum confidence an insight needs before the strategy adaptor acts on it.")
+    min_confidence_floor: float = Field(default=0.50, ge=0.40, le=0.80,
+        description="Lowest value the adaptor may set the minimum-confidence override to.")
+    min_confidence_ceiling: float = Field(default=0.90, ge=0.70, le=0.99,
+        description="Highest value the adaptor may set the minimum-confidence override to.")
     analyzer: LearningAnalyzerConfig = LearningAnalyzerConfig()
     paper_trading_mode: bool = Field(
         default=False,
@@ -2761,10 +2797,14 @@ class DashboardConfig(_StrictModel):
 
 
 class LoggingConfig(_StrictModel):
-    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    file: str = "logs/ait.log"
-    max_bytes: int = Field(default=10_485_760, ge=1_048_576)
-    backup_count: int = Field(default=5, ge=1, le=20)
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO",
+        description="Minimum level written to the log.")
+    file: str = Field(default="logs/ait.log",
+        description="Path of the main structured log file.")
+    max_bytes: int = Field(default=10_485_760, ge=1_048_576,
+        description="Size in bytes at which the main log file rotates.")
+    backup_count: int = Field(default=5, ge=1, le=20,
+        description="Number of rotated log files kept.")
 
 
 class SizingProbeConfig(_StrictModel):
@@ -2858,7 +2898,7 @@ class DataCollectionConfig(_StrictModel):
     expired contract, so a day nobody runs it is a day of data lost for good. With
     ``short_dte_enabled`` the supervisor runs it itself on weekdays. It only requests
     historical bid/ask bars: no orders, a separate client id, no interaction with the bot.
-    Default OFF: enable it after one successful manual ``--dry-run`` (docs/RUNBOOK.md).
+    Default OFF: enable it after one successful manual ``--dry-run`` (docs/RESEARCH_GUIDE.md "Short-DTE friction collection").
     """
 
     short_dte_enabled: bool = Field(default=False,
@@ -2937,10 +2977,14 @@ class DataCollectionConfig(_StrictModel):
 class IBKREnvConfig(BaseSettings):
     """IBKR connection settings from environment variables."""
 
-    ibkr_host: str = "127.0.0.1"
-    ibkr_port: int = 7497
-    ibkr_client_id: int = 1
-    ibkr_account: str = ""
+    ibkr_host: str = Field(default="127.0.0.1",
+        description="Host where IB Gateway or TWS listens. From .env (IBKR_HOST).")
+    ibkr_port: int = Field(default=7497,
+        description="Port where IB Gateway or TWS listens. From .env (IBKR_PORT).")
+    ibkr_client_id: int = Field(default=1,
+        description="Client id of the bot's broker session. From .env (IBKR_CLIENT_ID).")
+    ibkr_account: str = Field(default="",
+        description="Broker account id. From .env (IBKR_ACCOUNT); never written to logs or reports.")
 
     model_config = {"env_file": ".env", "env_prefix": "", "case_sensitive": False, "extra": "ignore"}
 
@@ -2948,10 +2992,14 @@ class IBKREnvConfig(BaseSettings):
 class APIKeysConfig(BaseSettings):
     """API keys from environment variables — never stored in config.yaml."""
 
-    polygon_api_key: str = ""
-    finnhub_api_key: str = ""
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
+    polygon_api_key: str = Field(default="",
+        description="Polygon API key. From .env (POLYGON_API_KEY); used only by the research option-history backfill.")
+    finnhub_api_key: str = Field(default="",
+        description="Finnhub API key. From .env (FINNHUB_API_KEY); no current code calls Finnhub.")
+    telegram_bot_token: str = Field(default="",
+        description="Telegram bot token for alerts. From .env (TELEGRAM_BOT_TOKEN); never logged.")
+    telegram_chat_id: str = Field(default="",
+        description="Telegram chat id that receives alerts. From .env (TELEGRAM_CHAT_ID).")
 
     model_config = {"env_file": ".env", "env_prefix": "", "case_sensitive": False, "extra": "ignore"}
 
@@ -3306,8 +3354,8 @@ def _report_order_timeline(settings: "Settings") -> None:
                 "entry_order_timeout_seconds": po.entry_order_timeout_seconds,
             },
             note="each age is evaluated on the fast-monitor tick, so a duration under "
-                 "the tick takes effect at the next tick. Meaning of each: docs/RUNBOOK.md "
-                 "'Order lifecycle timeline'.",
+                 "the tick takes effect at the next tick. Meaning of each: docs/GUIDE.md "
+                 "\"Order lifecycle timeline\".",
         )
     except Exception:  # noqa: BLE001 — diagnostics must never block startup
         pass
@@ -3319,8 +3367,8 @@ def _report_fixed_limits() -> None:
     Sits beside `config_default_divergence` so a log reader sees both halves of
     "what the system will do": the tunables that differ from code defaults, and
     the fixed limits no config edit can change. Source of truth and the reason
-    each one is fixed: ait/config/invariants.py (and docs/RUNBOOK.md, which a drift
-    test keeps in step). Like its sibling it can never block startup.
+    each one is fixed: ait/config/invariants.py (and docs/GUIDE.md
+    "Fixed limits, and the ceilings of tunable settings", generated from it). Like its sibling it can never block startup.
     """
     try:
         from ait.config.invariants import invariant_values
@@ -3331,7 +3379,8 @@ def _report_fixed_limits() -> None:
             count=len(limits),
             limits=limits,
             note="fixed in code on purpose (ait/config/invariants.py); not set by "
-                 "config.yaml or .env. Why each is fixed: docs/RUNBOOK.md 'Fixed limits'.",
+                 "config.yaml or .env. Why each is fixed: docs/GUIDE.md "
+                 "\"Fixed limits, and the ceilings of tunable settings\".",
         )
     except Exception:  # noqa: BLE001 — diagnostics must never block startup
         pass

@@ -553,7 +553,7 @@ def _scan_foreign_bot_pids() -> list[int] | None:
     fail-closed and costs a session. A whole-argv token is not enough either:
     in `grep -r ait.main src/` the token is its own element (a W16 test caught
     exactly that). The real bot is spawned at master.py:585 as
-    [sys.executable, "-m", "ait.main", "--paper"], so `-m` adjacency is exact.
+    [sys.executable, "-m", "ait.main", ...] (``--paper`` is appended unless live is fully enabled), so `-m` adjacency is exact.
 
     W34 (R26 foreign-bot-scan-unreadable-process-table-permits-a-second-bot):
     this failed OPEN — an unreadable process table returned [] ("no foreign
@@ -985,7 +985,28 @@ class BotManager:
                     self._last_gateway_alert = now
             return
 
-        _log("info", "bot_starting")
+        # Paper or live is decided here, not hardcoded: live needs config.yaml AND .env to say live, the AIT_ALLOW_LIVE=1
+        # interlock, and a live-account IB endpoint; paper must not be pointed at a live-account endpoint
+        # (ait/config/launch_mode.py). A refusal alerts and starts nothing; it is retried on the next health cycle.
+        try:
+            from ait.config.launch_mode import decide
+            from ait.config.settings import load_settings
+            _decision = decide(load_settings().trading.mode, os.environ.get("TRADING_MODE"),
+                               os.environ.get("AIT_ALLOW_LIVE") == "1", gw_port, os.environ.get("IBKR_ACCOUNT"))
+        except Exception as e:  # noqa: BLE001 - an unreadable config must not start a bot of unknown mode
+            _log("critical", "bot_start_refused_mode_undecidable", error=str(e))
+            if _alert_gate("launch_mode_refusal", 1800):
+                _alert(f"REFUSING to start the trading bot: could not decide paper or live ({type(e).__name__}: {e}).")
+            return
+        if _decision.note:
+            _log("warning", "launch_mode_settings_disagree", note=_decision.note)
+        if _decision.error:
+            _log("critical", "bot_start_refused_launch_mode", reason=_decision.error, port=gw_port)
+            if _alert_gate("launch_mode_refusal", 1800):
+                _alert(_decision.error)
+            return
+
+        _log("info", "bot_starting", mode=_decision.mode)
         # Size-capped rotation for the bot's stdout sink. This file grew to
         # 2 GB unbounded (audit 2026-07-07 item 1.3): raw append, never
         # rotated, and mtime-based cleanup can never touch a continuously
@@ -1007,7 +1028,7 @@ class BotManager:
         self._rotate_stdout_log()
         self._log_handle = open(LOGS_DIR / "bot_stdout.log", "a")
         self._proc = subprocess.Popen(
-            [sys.executable, "-m", "ait.main", "--paper"],
+            [sys.executable, "-m", "ait.main"] + (["--paper"] if _decision.mode == "paper" else []),
             cwd=str(ROOT),
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
@@ -2197,7 +2218,7 @@ def weekly_scorecard():
         body += [exec_line, f"by exit reason: {attrib}"]
         if fill_line:
             body.append(fill_line)
-        body.append("see docs/GAP_AUDIT_R7.md for gate definitions")
+        body.append("see docs/GUIDE.md (go-live scorecard) for gate definitions")
         _alert(chr(10).join(body))
     except Exception as e:  # noqa: BLE001
         _log("warning", "weekly_scorecard_failed", error=str(e))

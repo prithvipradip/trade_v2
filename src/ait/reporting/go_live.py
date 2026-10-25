@@ -303,7 +303,7 @@ def _fetch_closed_rows(con: sqlite3.Connection, select_cols: str) -> list[dict]:
     row. ONE place compute_go_live_verdict and real_close_count both call
     for the raw fetch, so they can never silently drift apart on what "the
     real close population" means before either applies fold_roll_chains
-    (CLAUDE.md's own duplication-causes-divergence theme, applied here).
+    (docs/TECHNICAL_GUIDE.md "Layout and ownership": duplication causes divergence).
     Deliberately returns the UNFOLDED rows, not a folded view -- some
     callers (drawdown/capital-at-risk tracking) need each leg's own real
     exposure window, not a chain-summed one; see fold_roll_chains' and

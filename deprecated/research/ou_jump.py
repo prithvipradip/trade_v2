@@ -15,7 +15,7 @@ Two outputs:
   - P(in range):  via characteristic function inversion (FFT), for RangePredictor ensemble
   - Direction:    κ_T·(μ_T - X_T) from AEKF final state, BULLISH/BEARISH + confidence
 
-See docs/OU_KOU_GARCH_METHODOLOGY.md for full mathematical derivation and references.
+See docs/archive/OU_KOU_GARCH_METHODOLOGY.md for full mathematical derivation and references.
 """
 
 from __future__ import annotations

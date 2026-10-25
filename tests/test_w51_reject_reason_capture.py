@@ -2,7 +2,7 @@
 half): entries rejected by the broker (a real margin reject, code 201; a
 read-only-account reject, 321; no-security-definition, 200) used to collapse
 into the same generic CANCELLED status as a routine timeout — indistinguishable
-in the trades table. `docs/GAP_AUDIT_R7.md:514` named this "SOON" six weeks
+in the trades table. `docs/archive/GAP_AUDIT_R7.md:514` named this "SOON" six weeks
 before this wave; the R23 register's `model-vs-reality-margin-model-unimplemented`
 finding named it again.
 

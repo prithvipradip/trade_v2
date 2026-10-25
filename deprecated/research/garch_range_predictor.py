@@ -8,7 +8,7 @@ P(stays in ±threshold% over horizon) analytically from the forecasted volatilit
 Variant selection: GARCH(1,1), GJR-GARCH, EGARCH(1,1), ARCH(1) — best BIC wins.
 Distribution selection: Normal, Student-t, Skewed-t, GED (arch-native), CTS (custom).
 
-See docs/GARCH_METHODOLOGY.md for full mathematical derivation and references.
+See docs/archive/GARCH_METHODOLOGY.md for full mathematical derivation and references.
 """
 
 from __future__ import annotations

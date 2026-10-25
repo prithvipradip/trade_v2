@@ -5,7 +5,7 @@
 # ------------------------------------------------------------
 # FIXED LIMITS  (comment only: NOT keys, NOT configurable here)
 # Deliberately fixed in code, in one module: src/ait/config/invariants.py
-# (one-line reason for each: docs/RUNBOOK.md "Fixed limits"; logged at every start
+# (one-line reason for each: docs/GUIDE.md "Fixed limits, and the ceilings of tunable settings"; logged at every start
 # as `fixed_limits_in_effect`). Editing this comment changes nothing; a test keeps
 # it equal to the module.
 #   ORDER_RATE_LIMIT_MAX = 8
@@ -22,7 +22,7 @@
 # ------------------------------------------------------------
 
 trading:
-  mode: paper                          # paper | live
+  mode: paper                          # paper | live. Live also needs .env TRADING_MODE=live, AIT_ALLOW_LIVE=1 and a live IB port (docs/RUNBOOK.md "Go-live day checklist")
   # Universe pared down based on 4-year + 1-year backtests:
   # KEPT: SPY/QQQ/IWM/DIA (indices), NVDA/AMZN/AMD (range-bound mature)
   # DROPPED 4yr: MSFT, SOFI, AAPL, META, TSLA (catastrophic losses)
@@ -66,7 +66,7 @@ account:
                                        # $250 per trade (a $3-wide condor) and the breaker is 4.5% = $225, which
                                        # the startup cap-grid check accepts. (The earlier 1.33% / 2% pair
                                        # funded $66 and built nothing.) Ceilings and the links between the
-                                       # per-trade knobs: settings.py (W86) and docs/RUNBOOK.md.
+                                       # per-trade knobs: settings.py (W86) and docs/GUIDE.md "Fixed limits, and the ceilings of tunable settings".
   simulate_live_capital: true          # false at go-live. Per-box override: .env
                                        # AIT_SIMULATED_CAPITAL=<n> (or 0 = off) beats this.
   # W69: capital-tier boundaries (were literals in risk/capital_tiers.py). The
@@ -87,7 +87,7 @@ positions:
   # W70: the rest of the ENTRY order timeline (were literals in execution/executor.py).
   # Every age below is checked on the 30s fast-monitor tick, so a value under 30 takes
   # effect at the next tick. Each must stay below entry_order_timeout_seconds (startup
-  # refuses otherwise). Full timeline and the evidence behind the floors: docs/RUNBOOK.md.
+  # refuses otherwise). Full timeline and the evidence behind the floors: docs/GUIDE.md "Order lifecycle timeline".
   #
   # How often an unfilled entry's limit steps toward marketable (0.25 / 0.60 / 1.00 of the offset).
   # Floor: 30s (the tick; below it steps are skipped, not honored) | Ceiling: 300s
@@ -396,7 +396,7 @@ ml:
   observe_mode_neutral_confidence: 0.60  # direction-neutral structures skip the DIRECTIONAL min_confidence gate
   # W69: were literals in bot/orchestrator.py and ml/drift.py.
   regime_override_confidence: 0.80     # HIGH_VOLATILITY regime at or above this -> direction NEUTRAL (keep <= regime.high_vol_confidence_floor)
-  # --- Drift detection: is the direction model's live record getting worse? (explained in docs/RESEARCH_GUIDE.md, "Drift detection") ---
+  # --- Drift detection: is the direction model's live record getting worse? (explained in docs/MODELS.md "The drift detector") ---
   # It compares the model's recent calls with what happened and, if it is clearly degrading, asks for an EARLY retrain instead of
   # waiting for the weekly one. OFF by default: outcomes are only recorded for directional strategies, so an iron-condor-only book
   # never feeds it. Turn it on only if directional strategies trade.
@@ -409,7 +409,7 @@ ml:
   drift_min_high_confidence_samples: 5 # the calibration test needs this many resolved high-confidence predictions, else only accuracy counts
   drift_check_interval: 10             # the full check runs at most once per this many newly recorded predictions (1 = every call)
   # Saved direction-model versions kept on disk (older ones deleted on each save); also how far back a rollback can go.
-  # (explained in docs/RESEARCH_GUIDE.md, "Saved model versions and the meta-labeler")
+  # (explained in docs/MODELS.md "Saved models")
   model_versions_kept: 5               # how many saved versions to keep (older ones deleted on each save; also the rollback depth)
   # W88c: tree hyperparameters (were literals in ml/ensemble.py, range_predictor.py, vol_magnitude_predictor.py and
   # meta_label.py). SHARED by live and research: the values below are what the code used before, so listing them
@@ -447,7 +447,7 @@ ml:
   # (studies/_template.yaml) or the overlay, never here: `fractal: {use: {hurst_psd_divergence: false}}` writes one line. A switch
   # is keyed by its role (rsi_long, not rsi_14) so a window change never renames it; an unknown key is a startup error. To add a
   # NEW feature: compute it in ml/features.py and add its name to CATALOGUE in config/feature_names.py (off by default).
-  # How-to: docs/RESEARCH_GUIDE.md "Choosing the model's features".
+  # How-to: docs/MODELS.md "Switches".
   features:
     momentum:
       rsi_long: 14
@@ -501,7 +501,7 @@ ml:
         px_vs_mid: true  # price_vs_sma_20
         px_vs_slow: true  # price_vs_sma_50
         cross: true  # sma_10_20_cross
-    # W97 (explained in docs/RESEARCH_GUIDE.md, "The remaining feature windows"): the windows of the market-structure, cross-asset, macro,
+    # W97 (explained in docs/MODELS.md "Windows"): the windows of the market-structure, cross-asset, macro,
     # fractal and intraday groups (were literals in ml/features.py). Same rules as above, with one difference that matters: these five
     # groups enter the saved-model hash ONLY when a value differs from the default listed here, so listing them changes nothing and no
     # saved model is refused or retrained; change one and every saved model is refused (retrained) like any other window.
@@ -682,7 +682,7 @@ regime:
   low_vol_realized: 0.12
   low_vol_trend_breakout: 0.30
   strong_trend: 0.35
-  # --- How the trend strength is measured and how sure each class sounds (explained in docs/RESEARCH_GUIDE.md, "The regime classifier").
+  # --- How the trend strength is measured and how sure each class sounds (explained in docs/MODELS.md "The regime classifier").
   # Live-only: research does not use the RegimeDetector. The trend strength (-1 .. +1) is the average of three kinds of terms, each
   # clamped to [-1, 1]: moving-average slopes, distance of the price from moving averages, and recent return.
   trend_sma_periods: [10, 20, 50]      # moving-average lengths (days) whose slope is scored
@@ -703,7 +703,7 @@ regime:
   low_vol_confidence: 0.70             # LOW_VOLATILITY reports this (reported only)
   trend_confidence_cap: 0.95           # TRENDING_UP / DOWN report min(cap, |trend strength|)
   range_confidence_floor: 0.50         # RANGE_BOUND reports max(floor, 1 - 2 x |trend strength|)
-  # W95 (explained in docs/RESEARCH_GUIDE.md, "The regime classifier"): how much history the classifier needs
+  # W95 (explained in docs/MODELS.md "The regime classifier"): how much history the classifier needs
   min_history_rows: 60                 # fewer daily bars than this: no call (RANGE_BOUND, confidence 0). Must cover the trend measure's look-back (55 at the defaults)
   iv_rank_min_rows: 60                 # the IV-rank proxy needs this many 20-day-vol values (each needs 20 bars), else it reports 0.5: about 80 bars at the default
   iv_rank_window_rows: 252             # ... compared with the highest and lowest 20-day vol over the last this many values (a price-only proxy, not ait.data.iv_rank)
@@ -714,7 +714,7 @@ meta_label:
   retrain_with_primary: true           # Retrain when primary model retrains
   min_feature_coverage: 15             # of the 20 inputs, this many must carry real data before a new model is armed (W90c)
   max_artifact_age_days: 45            # a saved model older than this is stale and refused at load (W90c)
-  # W92 (explained in docs/RESEARCH_GUIDE.md, "Saved model versions and the meta-labeler"): the meta-labeler is disabled, these only make its numbers visible
+  # W92 (explained in docs/MODELS.md "The models one by one"): the meta-labeler is disabled, these only make its numbers visible
   min_trades_for_training: 30          # it is not trained on fewer closed trades than this (min_closes_to_enable below is when its output is TRUSTED)
   min_class_trades: 5                  # ... and needs at least this many profitable AND this many unprofitable trades
   cv_max_splits: 5                     # training cross-validation uses at most this many folds ...
@@ -838,7 +838,7 @@ exit:
   # W70: the rest of the EXIT order timeline (were literals in execution/executor.py).
   # Together with exit_stop_pending_rest_seconds (120s) and exit_pending_rest_seconds
   # (300s) above. Checked on the 30s fast-monitor tick. Full timeline and the evidence
-  # behind each floor: docs/RUNBOOK.md "Order lifecycle timeline".
+  # behind each floor: docs/GUIDE.md "Order lifecycle timeline".
   #
   # A freshly placed EXIT order is ignored by the fill checker for this long so it has
   # time to appear in IBKR's trade list.
@@ -896,7 +896,7 @@ learning:
     direction_poor_accuracy: 0.45
 
 sentiment:
-  enabled: true
+  enabled: false                        # false because nothing reads this section: the sentiment stack was retired (kept as a stub in settings.py)
   weight: 0.20                         # Sentiment contributes 20% to final signal
   cache_ttl_seconds: 300               # 5 min cache
   sources:
@@ -949,7 +949,7 @@ sizing_probe:
 # W76: supervisor-run 0-6 DTE friction collection (research data only; never touches orders).
 # Everything below is the MODEL DEFAULT (collection OFF). To enable: uncomment the block, set
 # short_dte_enabled: true, and restart the SUPERVISOR (a process runs on the settings it started
-# with). First prove it manually: docs/RUNBOOK.md "Short-DTE friction collection".
+# with). First prove it manually: docs/RESEARCH_GUIDE.md "Short-DTE friction collection".
 # data_collection:
 #   short_dte_enabled: false        # run the collector from the supervisor, Mon-Fri
 #   short_dte_time_et: "15:30"      # BEFORE the close: IB drops the expiring contract after it (DTE 0)
@@ -958,7 +958,7 @@ sizing_probe:
 #   lifecycle: false                # W82: capture each contract's LIFE (stage A at expiry + stage B
 #                                   # far tail) instead of every contract <= short_dte_max_dte daily:
 #                                   # ~20-35 min/day vs 72-108, and ~2 downloads per contract instead
-#                                   # of 5-11 (docs/RUNBOOK.md "Lifecycle capture"). Ignores short_dte_max_dte.
+#                                   # of 5-11 (docs/RESEARCH_GUIDE.md "Lifecycle capture"). Ignores short_dte_max_dte.
 #   lifecycle_duration: "30 D"      # what IB serves for hourly BID/ASK bars of a listed option
 #   lifecycle_expiring_days: 1      # stage A: expiries today..+N (1 = a missed day is recoverable)
 #   lifecycle_thin_every: 5         # strikes from every Nth session of the path (5 = ~55 contracts/expiry)

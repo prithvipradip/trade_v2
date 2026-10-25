@@ -11,7 +11,7 @@ mean-reversion regimes (post-shock recoveries), causing rank-inversion of
 P(in range) predictions. MS-GARCH assigns high probability to the calm regime
 after a shock dissipates, correctly predicting lower future vol.
 
-See docs/GARCH_METHODOLOGY.md §6 for full mathematical derivation and references.
+See docs/archive/GARCH_METHODOLOGY.md §6 for full mathematical derivation and references.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """W88a: fixed research limits, the origin of every setting, and the run record that carries both.
 
   * ``config/invariants_research.py`` is the one home of the research engine's correctness constants; the engine,
-    the optimizer's hard bounds and the log / run record read it, and a RUNBOOK drift test keeps the table honest
+    the optimizer's hard bounds and the log / run record read it, and a RESEARCH_GUIDE drift test keeps the table honest
   * ``research.settings_origin`` says which layer decides each value (study > overlay > config.yaml > default)
   * ``scripts/show_research_config.py`` prints that view
 """
@@ -25,7 +25,7 @@ from ait.config import invariants_research as ri
 from ait.config.settings import load_settings
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
+RESEARCH_GUIDE = ROOT / "docs" / "RESEARCH_GUIDE.md"          # the research fixed-limits table lives there (generated)
 
 
 def _engine(**kw):
@@ -47,10 +47,11 @@ class TestResearchInvariants:
         for i in ri.RESEARCH_INVARIANTS:
             assert i.what and i.why_fixed and i.enforced_in and len(i.why_fixed) > 20, i.name
 
-    def test_the_runbook_table_is_the_registry(self):
-        text = RUNBOOK.read_text()
-        start = text.index("## Research fixed limits")
-        sec = text[start: text.find("\n## ", start + 5)]
+    def test_the_guide_table_is_the_registry(self):
+        m = re.search(r"<!-- BEGIN GENERATED: research_fixed_limits -->\n(.*?)<!-- END GENERATED: research_fixed_limits -->",
+                      RESEARCH_GUIDE.read_text(), re.S)
+        assert m, "docs/RESEARCH_GUIDE.md has no generated block 'research_fixed_limits'"
+        sec = m.group(1)
         rows = re.findall(r"^\|\s*`([A-Z0-9_]+)`\s*\|\s*([0-9.]+)\s*\|", sec, re.M)
         by_name = {i.name: i.value for i in ri.RESEARCH_INVARIANTS}
         assert {n for n, _ in rows} == set(by_name)

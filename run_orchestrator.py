@@ -77,7 +77,7 @@ def _fetch_news() -> None:
     """
     print("--fetch-news is retired (R12 Tier-C, 2026-07-13): the sentiment/IB-news")
     print("pipeline moved to deprecated/src/ and no live component reads its output.")
-    print("See docs/AUDIT_R12.md Tier C item 3.")
+    print("See docs/archive/AUDIT_R12.md Tier C item 3.")
     raise SystemExit(1)
 
 

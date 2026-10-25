@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "tests" / "data"))
 from _w92_regime_inputs import replay  # noqa: E402
 
 CONFIG_TEXT = (ROOT / "config.yaml").read_text()
-GUIDE_TEXT = (ROOT / "docs" / "RESEARCH_GUIDE.md").read_text()
+GUIDE_TEXT = (ROOT / "docs" / "MODELS.md").read_text()
 
 OLD = {
     "ml": {"drift_detection_enabled": False, "drift_window_size": 50, "drift_accuracy_threshold": 0.40, "drift_high_confidence": 0.80,
@@ -49,7 +49,7 @@ class TestDefaultsAndDocs:
         assert (MLConfig().drift_detection_enabled, MetaLabelConfig().min_class_trades, RegimeConfig().trend_slope_scale) == (False, 5, 100.0)
 
     def test_every_new_setting_is_in_config_yaml_with_a_comment_and_in_the_guide(self):
-        """Each setting is explained in config.yaml (a comment on its line or the line above) AND named in RESEARCH_GUIDE.md."""
+        """Each setting is explained in config.yaml (a comment on its line or the line above) AND named in docs/MODELS.md."""
         lines = CONFIG_TEXT.splitlines()
         for section, fields in OLD.items():
             start = next(i for i, l in enumerate(lines) if l.startswith(f"{section}:"))
@@ -61,11 +61,11 @@ class TestDefaultsAndDocs:
                 documented = "#" in block[idx].split(":", 1)[1] or block[idx - 1].lstrip().startswith("#")
                 assert documented, f"{section}.{name} has no comment in config.yaml"
                 assert f"`{name}`" in GUIDE_TEXT or f"`{section}.{name}`" in GUIDE_TEXT, (
-                    f"{section}.{name} is not explained in docs/RESEARCH_GUIDE.md")
+                    f"{section}.{name} is not explained in docs/MODELS.md")
 
     def test_the_config_blocks_point_at_the_guide(self):
-        assert CONFIG_TEXT.count('docs/RESEARCH_GUIDE.md, "Drift detection"') >= 1
-        assert CONFIG_TEXT.count('docs/RESEARCH_GUIDE.md, "The regime classifier"') >= 1
+        assert CONFIG_TEXT.count('docs/MODELS.md "The drift detector"') >= 1
+        assert CONFIG_TEXT.count('docs/MODELS.md "The regime classifier"') >= 1
 
     def test_the_drift_numbers_must_be_consistent(self):
         with pytest.raises(ValueError, match="drift_min_samples"):

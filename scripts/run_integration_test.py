@@ -614,7 +614,7 @@ async def _section_e_walkforward(
         optimize_n_jobs=_n_jobs,
         optimize_seed=args.optuna_seed,
         optimize_val_split=_val_split,
-        initial_capital=_bc.initial_capital,
+        initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
         wing_k=_bc.wing_k,
@@ -689,7 +689,7 @@ async def _section_f_ablation(
         optimize_per_window=False,
         optimize_min_trades=_min_trades,
         optimize_n_jobs=_n_jobs,
-        initial_capital=_bc.initial_capital,
+        initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
         position_size_pct=_bc.position_size_pct,
         wing_floor_dollars=_bc.wing_floor_dollars,
         wing_k=_bc.wing_k,
@@ -1232,8 +1232,9 @@ async def _main(args: argparse.Namespace) -> int:
         ablation = await _section_f_ablation(args, out, shared_daily_data)
 
         # Capture WalkForwardConfig fields for archival
-        from ait.config.settings import load_settings
-        _bc = load_settings(args.config).backtest
+        from ait.config.settings import load_settings, resolve_account_capital
+        _cfg = load_settings(args.config)
+        _bc = _cfg.backtest
         _n_trials = args.wf_trials if args.wf_trials is not None else _bc.optimize_n_trials
         wf_cfg_fields = {
             "train_days": args.train_days,
@@ -1242,7 +1243,7 @@ async def _main(args: argparse.Namespace) -> int:
             "gap_days":   args.gap_days,
             "optimize_n_trials": _n_trials,
             "optuna_seed": args.optuna_seed,
-            "initial_capital": _bc.initial_capital,
+            "initial_capital": resolve_account_capital(None, _cfg),   # what the archive records: account.capital of --config
             "position_size_pct": _bc.position_size_pct,
         }
     else:

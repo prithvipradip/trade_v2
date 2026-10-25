@@ -51,7 +51,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 class TestLiveProfileVolumeFloorMatchesTheRunbook:
 
     def test_a_volume_floor_of_nine_still_refuses_live_mode(self, tmp_path, monkeypatch):
-        """docs/RUNBOOK.md:153 documents AIT_LIQ_MIN_VOLUME >= 10. Before the
+        """docs/RUNBOOK.md "Go-live day checklist" documents AIT_LIQ_MIN_VOLUME >= 10. Before the
         fix, 1-9 passed the startup assertion — only 0 was caught."""
         from ait.bot.orchestrator import TradingOrchestrator
         from ait.config.settings import load_settings

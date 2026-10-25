@@ -31,7 +31,7 @@ source before writing any code:
     from get_open_trades(), which includes PENDING) on a SECOND sighting.
     seed_roll_opening_trade writes B's PENDING row (with B's real legs)
     BEFORE any roll order would be placed -- the same "DB row before
-    placeOrder" ordering CLAUDE.md already documents for entries
+    placeOrder" ordering docs/TECHNICAL_GUIDE.md "Changes that need the operator's confirmation" lists for entries
     (executor.py:execute_signal) -- so this never trips.
   - go_live.py already excludes CLOSING/PENDING rows from the verdict sample
     (counted only toward the drawdown base) -- an intermediate state during

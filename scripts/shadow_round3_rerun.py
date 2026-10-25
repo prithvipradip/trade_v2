@@ -43,7 +43,7 @@ async def run_k(strat, bc, data):
         # look-ahead leak structurally impossible. The original run
         # scored OOS windows with the live future-trained ensemble.
         train_days=126, test_days=63, step_days=42, gap_days=5,
-        initial_capital=bc.initial_capital,
+        initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
         position_size_pct=bc.position_size_pct,
         wing_floor_dollars=bc.wing_floor_dollars,
         iv_floor=bc.iv_floor,

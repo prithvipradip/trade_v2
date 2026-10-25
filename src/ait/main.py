@@ -99,8 +99,18 @@ async def run_bot(args: argparse.Namespace) -> None:
     # Load and validate configuration
     settings = load_settings(args.config)
 
-    if args.paper:
-        settings.trading.mode = "paper"
+    # Paper or live is decided once, here and in the supervisor, by ait/config/launch_mode.py: live needs config.yaml AND
+    # .env TRADING_MODE to say live, AIT_ALLOW_LIVE=1 and a live-account IB endpoint; paper must not point at a live
+    # endpoint. `--paper` forces paper but the endpoint check still applies.
+    import os
+    from ait.config.launch_mode import decide
+    decision = decide("paper" if args.paper else settings.trading.mode, os.environ.get("TRADING_MODE"),
+                      os.environ.get("AIT_ALLOW_LIVE") == "1",
+                      int(settings.ibkr.ibkr_port), settings.ibkr.ibkr_account)
+    if decision.error:
+        print(f"\n{decision.error}\n", file=sys.stderr)
+        sys.exit(1)
+    settings.trading.mode = decision.mode
 
     # W35: this process runs on THIS configuration until it exits — runtime
     # load_settings() calls get a copy of it instead of re-reading a
