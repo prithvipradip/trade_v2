@@ -5,6 +5,7 @@ Generated blocks and the two settings references are checked by ``tests/test_doc
 """
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -159,6 +160,13 @@ def test_user_documents_carry_no_round_or_wave_ids(path):
     assert not hits, f"{name}: audit-round / fix-wave IDs belong in code, PLAN.md, TECHNICAL_GUIDE and STUDIES_FINDINGS, not here: {hits}"
 
 
+@functools.lru_cache(maxsize=1)
+def _code_text() -> str:
+    roots = [ROOT / "src" / "ait", ROOT / "scripts"]
+    files = [p for r in roots for p in r.rglob("*.py")] + list(ROOT.glob("*.py"))
+    return "\n".join(p.read_text(errors="ignore") for p in files)
+
+
 NAMED_PATH = re.compile(r"`((?:src/ait|scripts|tests|docs|studies|config|ml|data|risk|execution|broker|bot|strategies|backtesting)/[\w./\-]+\.(?:py|yaml|md|json|js|jsx))`")
 
 
@@ -166,7 +174,10 @@ NAMED_PATH = re.compile(r"`((?:src/ait|scripts|tests|docs|studies|config|ml|data
 def test_files_named_in_documents_exist(name):
     text = _path(name).read_text()
     # `config/settings.py` is written relative to the package (src/ait); everything else relative to the repository
-    exists = lambda p: (ROOT / p).exists() or (ROOT / "src" / "ait" / p).exists()  # noqa: E731
+    # data/ is git-ignored runtime state: a file the system writes does not exist in a fresh checkout (or in CI), so for data/
+    # the check is that the code names the file, not that this machine happens to have it
+    exists = lambda p: ((ROOT / p).exists() or (ROOT / "src" / "ait" / p).exists()  # noqa: E731
+                        or (p.startswith("data/") and Path(p).name in _code_text()))
     missing = sorted({p for p in NAMED_PATH.findall(text) if not exists(p) and "<" not in p and "*" not in p})
     assert not missing, f"{name} names files that do not exist: {missing}"
 
