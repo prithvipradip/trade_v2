@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Methodology of the GARCH range-predictor ensemble member, retired in July 2026 (code in deprecated/research/). Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # GARCH Volatility Models — Range Predictor Ensemble Member
 
 ## Overview

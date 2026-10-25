@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Methodology of the OU-Kou-GARCH model, retired in July 2026 (code in deprecated/research/). Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # OU-Kou-GARCH + Adaptive EKF — Methodology Reference
 
 ## Overview

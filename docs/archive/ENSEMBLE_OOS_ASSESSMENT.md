@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Out-of-sample assessment of the ensemble that included the GARCH-family members, which were retired in July 2026 (code in deprecated/research/). Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # Ensemble Model OOS Assessment
 
 **Related files:** `src/ait/backtesting/walkforward.py` (`_evaluate_range_model_oos`),

@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Round 9 benchmarks (2026-07-11). Numbers describe the system on that date. Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # R9 Benchmarks — first measured latency/accuracy/performance numbers (2026-07-11)
 
 ## Latency

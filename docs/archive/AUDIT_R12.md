@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Round 12 audit (2026-07-13). A point-in-time snapshot; decisions it records are tracked in PLAN.md. Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # Round 12 — Sophistication & Maturity Audit (2026-07-13)
 
 Six lenses no prior round used: concurrency/state-machine, trade-lifecycle craft,

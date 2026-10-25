@@ -1,3 +1,5 @@
+> **Archived: not maintained.** Round 7 gap audit (2026-07-09). Priorities and findings are as of that date; PLAN.md is the action tracker. Kept for history; do not rely on it for the current system. Current documentation: start at the repository [README](../../README.md).
+
 # Round 7 Gap Audit — component-by-component: what's missing to make money (2026-07-09)
 
 13 agents, full line coverage per component. Lens: not 'what's broken' but 'what's missing for the money goal'.
