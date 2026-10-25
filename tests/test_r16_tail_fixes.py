@@ -204,7 +204,7 @@ class TestPatchedCreditBuilders:
         # 100k capital, 5% budget = $5,000; jade_lizard's strangle-margin
         # convention on a $450 underlying is $9,000/contract, so it can NEVER
         # size at index-ETF prices — the arm reports n=0 for a sizing reason.
-        bt = _bt(initial_capital=100_000.0)
+        bt = _bt(initial_capital=100_000.0, position_size_pct=0.05)   # W100: pinned, not the shipped 0.20
         with structlog_events() as events:
             pos = bt._build_credit_position(
                 "jade_lizard", S=450.0, iv=0.18, t=21 / 365.0, r=0.05, dte=21,

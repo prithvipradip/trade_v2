@@ -104,7 +104,7 @@ class TestTheShippedFiles:
         for s in (live, res):
             assert (s.account.capital, s.risk.max_position_risk_pct,
                     s.risk.max_daily_loss_pct, s.risk.breaker_to_max_loss_ratio) == (
-                5000.0, 0.05, 0.045, 1.0)
+                5000.0, 0.20, 0.20, 1.0)
 
     def test_overlay_holds_only_real_differences(self):
         """No redundant keys: a key present in both files must hold a different value (else

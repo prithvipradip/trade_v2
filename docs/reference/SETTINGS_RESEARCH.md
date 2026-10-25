@@ -10,7 +10,7 @@ Every setting under `backtest` and `parity`: the research engine, learner, optim
 
 | Setting | Type | Allowed range | Default | Shipped | Listed in | Meaning |
 |---|---|---|---|---|---|---|
-| `backtest.position_size_pct` | `float \| None` | 0.01 - 0.25 | null | 0.05 | config.yaml | Fraction of capital risked per trade (max-loss basis). |
+| `backtest.position_size_pct` | `float \| None` | 0.01 - 0.25 | null | 0.2 | config.yaml | Fraction of capital risked per trade (max-loss basis). |
 | `backtest.history_start_date` | `datetime.date \| None` | - | null | 2024-01-01 | config_research.yaml | First date of the research history. |
 | `backtest.history_days` | `int` | 400 - 6000 | 1826 | 1826 | config_research.yaml | Calendar days of history a research run requests when no history_start_date is set (legacy fallback). |
 | `backtest.research_table_prefix` | `str` | - |  |  | neither (schema default) | Table prefix of the history tables research reads in historical.db. |

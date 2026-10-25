@@ -22,7 +22,7 @@ class TestValidConfig:
         """Default Settings should validate without errors."""
         settings = Settings()
         assert settings.trading.mode == "paper"
-        assert settings.risk.max_daily_loss_pct == 0.045  # W64: was 0.02 (the $5k account's breaker)
+        assert settings.risk.max_daily_loss_pct == 0.20  # W100: 0.045 -> 0.20 (breaker = one max-loss condor at the 20% budget)
 
     def test_custom_valid_config(self) -> None:
         settings = Settings(
@@ -35,7 +35,7 @@ class TestValidConfig:
     def test_position_config_defaults(self) -> None:
         config = PositionConfig()
         assert config.max_open_positions == 5
-        assert config.max_position_pct == 0.05
+        assert config.max_position_pct == 0.20
 
     def test_risk_config_bounds(self) -> None:
         """Risk config should accept values at boundaries."""

@@ -39,7 +39,13 @@ from ait.risk.position_sizer import PositionSizer  # noqa: E402
 
 @pytest.fixture(scope="module")
 def settings():
-    return load_settings("config.yaml")
+    # These tests describe the 5% per-trade regime (a $2.1k account cannot hold a $120 condor).
+    # Pin it so they do not move with the shipped per-trade budget (W100: 0.20 in config.yaml).
+    s = load_settings("config.yaml").model_copy(deep=True)
+    s.positions.max_position_pct = 0.05
+    s.risk.max_position_risk_pct = 0.05
+    s.risk.max_daily_loss_pct = 0.045
+    return s
 
 
 def _manager(settings, nlv: float, open_positions: list[dict]) -> RiskManager:
