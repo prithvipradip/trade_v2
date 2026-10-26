@@ -474,7 +474,7 @@ scripts/probe_w101_combo_close.py:
   writes: "Orders on the paper account (SPY or QQQ, one lot, every orderRef starts W101PROBE, no combo limit above the wing width); state in reports/w101_probe/state.json and JSONL evidence under reports/w101_probe/<date>/; data/ait_state.db read-only. IB client id 96. `preflight` (the default), `quotes`, `status` and `report` place nothing, and `report` does not connect. A Ctrl-C or an error cancels the probe's working orders and never flattens."
   example: "python scripts/probe_w101_combo_close.py preflight"
   explained: "-"
-  stamp: "4f2ffd59134b"
+  stamp: "69d65a9d1138"
 
 scripts/validate_w55_synthetic_delta.py:
   group: IB paper probe

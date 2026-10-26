@@ -71,6 +71,7 @@ log = get_logger("scripts.probe_w101")
 PROBE_CLIENT_ID = 96            # 98 is validate_w55_synthetic_delta.py; the bot uses 1 and 101-105
 SYMBOL = "SPY"                  # the underlying of THIS run; `use_symbol` changes it (state / --symbol)
 PROBE_SYMBOLS = ("SPY", "QQQ")  # the only underlyings the probe will trade; also what its guards watch
+SPOT_HINT: float | None = None  # --spot-hint: a rough price of the underlying, the parity search's starting point
 QUANTITY = 1
 MAX_WIDTH = 3.0
 TAG = "W101PROBE"
@@ -1207,16 +1208,18 @@ async def poll_quote(ibkr, contract, rounds: int = 10, delay: float = 0.3) -> tu
 
 
 def _last_known_spot() -> float | None:
-    """The newest underlying price any earlier run recorded (a starting guess for the parity search)."""
+    """The newest price of THIS run's underlying that an earlier run recorded (a starting guess for the
+    parity search). Events without a symbol are SPY's (the probe's first underlying)."""
     for f in sorted(PROBE_DIR.glob("*/events.jsonl"), reverse=True):
         for line in reversed(f.read_text().splitlines()):
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
-            if e.get("event") == "legs_selected" and _finite(e.get("spot")) and e["spot"] > 0:
+            if (e.get("event") == "legs_selected" and _finite(e.get("spot")) and e["spot"] > 0
+                    and e.get("symbol", "SPY") == SYMBOL):
                 return float(e["spot"])
-    return None
+    return SPOT_HINT if _finite(SPOT_HINT) and SPOT_HINT and SPOT_HINT > 0 else None
 
 
 async def estimate_spot_from_options(ibkr, expirations: list[str], strikes: list[float],
@@ -1386,7 +1389,7 @@ async def cmd_preflight(args) -> dict:
                                                                             structure["width"], args.data_type))
                                              if nat is not None else None)}
             out["structures"][kind] = info
-            ev.emit("legs_selected", kind=kind, spot=spot, **info)
+            ev.emit("legs_selected", kind=kind, symbol=SYMBOL, spot=spot, **info)
         out["spot"] = spot
         return out
     finally:
@@ -1422,7 +1425,7 @@ async def cmd_open(args) -> dict:
         open_legs = [{k: v for k, v in l.items() if k != "_contract"} for l in legs]
         structure["legs"] = [{**l, "conId": legs[i]["conId"]} for i, l in enumerate(structure["legs"])]
         bag = bag_for(open_legs)
-        ev.emit("legs_selected", kind=args.kind, spot=spot, expiry=structure["expiry"], dte=structure["dte"],
+        ev.emit("legs_selected", kind=args.kind, symbol=SYMBOL, spot=spot, expiry=structure["expiry"], dte=structure["dte"],
                 width=structure["width"], legs=structure["legs"])
         sampler = QuoteSampler(ibkr, ev, {l["conId"]: l["_contract"] for l in legs}, stock, bag)
         sampler.start()
@@ -2028,6 +2031,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("preflight", "open"):
             sp.add_argument("--data-type", type=int, default=3, choices=(1, 2, 3, 4),
                             help="market-data type for this session (default 3 = the bot's)")
+            sp.add_argument("--spot-hint", type=float, default=None, metavar="PRICE",
+                            help="a rough price of the underlying: where the options-parity search starts when the "
+                                 "stock has no price and no earlier run recorded one")
             sp.add_argument("--symbol", default="SPY", choices=PROBE_SYMBOLS,
                             help="the underlying (default SPY); close/flatten/quotes read it from the trial")
         if name in ("open", "close", "flatten", "quotes"):
@@ -2063,6 +2069,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if getattr(args, "symbol", None):
             use_symbol(args.symbol)
+        if getattr(args, "spot_hint", None):
+            globals()["SPOT_HINT"] = float(args.spot_hint)
         result = asyncio.run(handler(args))
     except KeyboardInterrupt:
         print("INTERRUPTED", file=sys.stderr)
