@@ -28,6 +28,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from zoneinfo import ZoneInfo
 
+from ait.utils.cadence import SUPERVISOR_REAP_SECONDS, SUPERVISOR_STOP_WAIT_SECONDS  # stdlib-only leaf
 from ait.utils.process import scan_pids
 
 # W34 (R26 w23-module-scope-time-import): W23 added
@@ -1090,16 +1091,32 @@ class BotManager:
     def stop(self):
         if not self.is_running:
             return
-        _log("info", "bot_stopping", pid=self._proc.pid)
+        pid = self._proc.pid
+        _log("info", "bot_stopping", pid=pid)
         self._proc.terminate()
+        # W103: the wait covers everything the bot may spend on a graceful stop
+        # (its grace, its shutdown step and its cleanup: utils/cadence.py). It
+        # was 30 s, the bot's own grace, so the kill always came first.
+        escalated = False
         try:
-            self._proc.wait(timeout=30)
+            self._proc.wait(timeout=SUPERVISOR_STOP_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
+            escalated = True
+            _log("warning", "bot_stop_escalated_to_kill", pid=pid,
+                 waited_s=SUPERVISOR_STOP_WAIT_SECONDS)
             self._proc.kill()
+            # Reap it: without this poll() can still read None, and start()
+            # then refuses with bot_already_running and the bot stays down
+            # until the next health check.
+            try:
+                self._proc.wait(timeout=SUPERVISOR_REAP_SECONDS)
+            except subprocess.TimeoutExpired:
+                _log("warning", "bot_kill_not_reaped", pid=pid)
         if self._log_handle:
             self._log_handle.close()
             self._log_handle = None
-        _log("info", "bot_stopped")
+        _log("info", "bot_stopped", pid=pid, exit_code=self._proc.returncode,
+             escalated=escalated)
 
     def health_check(self):
         """Check if bot is alive, restart if crashed."""

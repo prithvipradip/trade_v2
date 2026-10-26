@@ -84,8 +84,14 @@ class MarketScheduler:
         else:
             return TradingPhase.OFF_HOURS
 
-    async def wait_for_phase(self, target: TradingPhase) -> None:
+    async def wait_for_phase(self, target: TradingPhase,
+                             stop_event: asyncio.Event | None = None) -> None:
         """Sleep until the target phase begins.
+
+        W103: with a ``stop_event``, the wait ends the moment it is set (the
+        sleep below used to run its full length, up to an hour, whatever was
+        asked of the bot meanwhile: every stop sat inside it until killed).
+        Without one the behaviour is unchanged.
 
         W24: every decision below shares ONE `now`, captured fresh at the top
         of each loop iteration, and the phase is re-checked against THAT now
@@ -113,6 +119,8 @@ class MarketScheduler:
         computed, logged, or slept on.
         """
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return
             now = now_et()
             if self.get_current_phase(now) == target:
                 return
@@ -148,7 +156,13 @@ class MarketScheduler:
                 wait_seconds=int(wait),
                 current_phase=self.get_current_phase(now).value,
             )
-            await asyncio.sleep(wait)
+            if stop_event is None:
+                await asyncio.sleep(wait)
+            else:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass                       # the wait ran out: look at the clock again
 
     def seconds_until_close(self) -> float:
         """Seconds until market close. Returns 0 if market is closed."""
