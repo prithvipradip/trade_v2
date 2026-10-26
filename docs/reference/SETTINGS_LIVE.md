@@ -4,7 +4,7 @@
 
 Every setting of the live bot and the supervisor, and the sections research shares (`ml`, `regime`, `meta_label`, `exit`, `options`, ...). Research-only settings (`backtest`, `parity`) are in [SETTINGS_RESEARCH.md](SETTINGS_RESEARCH.md). The *Shipped* column is what `config.yaml` sets; a key it does not list runs at the schema default. Explanations and the rules that link settings: [GUIDE.md](../GUIDE.md#13-configuration-system) and [MODELS.md](../MODELS.md). Secrets come only from `.env` and are never shown here.
 
-371 settings; 0 have no description in the schema yet (shown as `-`).
+374 settings; 0 have no description in the schema yet (shown as `-`).
 
 ## Trading universe, mode and cadence (`trading`)
 
@@ -370,8 +370,11 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | `exit.exit_unfilled_escalation_pct` | `float` | 0.0 - 0.25 | 0.05 | 0.05 | config.yaml | Each consecutive QUOTED exit placement that did not fill raises the next limit by this fraction of the marketable price (n-th retry: x(1 + pct*n)), under the same caps (wing width, mark-anchored ceiling, broker band). |
 | `exit.exit_reprice_step` | `float` | 0.01 - 1.0 | 0.1 | 0.1 | config.yaml | How far each consecutive NO-QUOTE exit placement steps above the last (anchor + cross + n*step, capped). re-placed the identical price every backoff. |
 | `exit.exit_pending_rest_seconds` | `float` | 30.0 - 1800.0 | 300.0 | 300 | config.yaml | How long a working, unfilled close order rests before check_fills cancels it so the monitor can re-trigger the exit. |
-| `exit.exit_stop_pending_rest_seconds` | `float` | 15.0 - 1800.0 | 120.0 | 120 | config.yaml | How long an unfilled stop exit (stop loss, short-strike touch, trailing stop, breakeven stop) rests before a cancel is requested; shorter than the rest for ordinary exits so a stop re-prices sooner. |
+| `exit.exit_stop_pending_rest_seconds` | `float` | 15.0 - 1800.0 | 120.0 | 120 | config.yaml | How long an unfilled stop exit (stop loss, short-strike touch, trailing stop, breakeven stop) or an exit that must get out (condor defense close, assignment risk, expiry at 0 or 1 days) rests before a cancel is requested; shorter than the rest for ordinary exits so it re-prices sooner. |
 | `exit.exit_blind_credit_multiple` | `float` | 1.0 - 5.0 | 2.0 | 2.0 | config.yaml | With no quote and no fresh mark, the most a credit buyback may pay is this multiple of the entry credit (and never more than the wing width). priced that state at the raw width — the structural max loss. |
+| `exit.exit_intrinsic_floor_enabled` | `bool` | - | true | true | config.yaml | A condor close is never offered for less than the structure is worth at the underlying: its intrinsic value plus `exit_cross_amount`, never above the wing width. |
+| `exit.exit_near_expiry_dte` | `int` | 0 - 5 | 1 | 1 | config.yaml | Days to expiry at or below which a credit close that must get out (a stop, the short-strike touch, assignment risk, condor defense, the expiry exit; not a take-profit) may be offered up to the wing width (the most it can ever cost) and the intrinsic floor allows for a delayed spot (`exit_intrinsic_delayed_band_pct`). |
+| `exit.exit_intrinsic_delayed_band_pct` | `float` | 0.0 - 0.02 | 0.0025 | 0.0025 | config.yaml | Near expiry on delayed market data, the intrinsic floor is the worst case over the spot plus or minus this fraction (delayed quotes are about 15 minutes old; 0.25% is about one standard deviation of that move at 20% implied volatility). 0 uses the spot as given. |
 | `exit.credit_touch_stop` | `bool` | - | true | true | config.yaml | Config home for AIT_CREDIT_TOUCH_STOP — close a credit structure when the underlying touches a short strike. |
 | `exit.trailing_stop_pct` | `float` | 0.1 - 0.5 | 0.25 | 0.25 | config.yaml | Trailing stop distance below the high-water mark, as a fraction of cost (debit structures; credit structures use the short-strike touch exit). |
 | `exit.breakeven_trigger_pct` | `float` | 0.1 - 0.8 | 0.3 | 0.3 | config.yaml | Profit, as a fraction of cost, at which the stop moves to breakeven (debit structures). |

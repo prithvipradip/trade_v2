@@ -222,7 +222,7 @@ def _rig(*, leg_quotes, bag=(NAN, NAN), entry=5.32, mark_cost=None,
     o._alert_gate = lambda *a, **k: True
     if prior_attempts:
         import time as _time
-        o._exit_noquote_attempts = {
+        o._exit_unfilled_attempts = {
             "T-1": {"n": prior_attempts, "at": _time.monotonic()}}
     trade = SimpleNamespace(trade_id="T-1", symbol="SPY",
                             strategy="iron_condor",
@@ -326,7 +326,7 @@ class TestTheNoQuoteFallbackStepsFromTheMark:
     def test_a_new_exit_episode_starts_from_the_anchor_again(self):
         o, ibkr, trade = _rig(leg_quotes=ONE_DEAD_BUY_LEG, mark_cost=3.19,
                               prior_attempts=5)
-        o._exit_noquote_attempts["T-1"]["at"] -= 2 * 3600
+        o._exit_unfilled_attempts["T-1"]["at"] -= 2 * 3600
         assert _placed(o, ibkr, trade) == pytest.approx(3.29)
 
     def test_stepping_never_passes_the_ceiling(self):

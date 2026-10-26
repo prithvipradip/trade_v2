@@ -2514,7 +2514,9 @@ class ExitConfig(_StrictModel):
                     "fill raises the next limit by this fraction of the "
                     "marketable price (n-th retry: x(1 + pct*n)), under the "
                     "same caps (wing width, mark-anchored ceiling, broker "
-                    "band). On delayed data every quote is ~15 minutes old, "
+                    "band). W101: An exit priced from the four legs (the combo "
+                    "never ticked) escalates too, by at least `exit_reprice_step` "
+                    "per retry. On delayed data every quote is ~15 minutes old, "
                     "so `ask + cross` chases a trending tape without ever "
                     "catching it (2026-09-21: 8.67 then 9.76, both unfilled). "
                     "0 disables.")
@@ -2529,7 +2531,9 @@ class ExitConfig(_StrictModel):
                     "hard-coded 300s, now the value for every non-stop exit.")
     exit_stop_pending_rest_seconds: float = Field(default=120.0, ge=15.0, le=1800.0,
         description="W52a: the same rest for STOP exits (stop_loss, "
-                    "short_strike_touch, trailing_stop, breakeven_stop). "
+                    "short_strike_touch, trailing_stop, breakeven_stop), W101: "
+                    "and for the exits that must get out (condor_defense_close, "
+                    "assignment_risk, expiry_approaching at 0 or 1 days). "
                     "2026-09-21 QQQ: the touch stop took 25 minutes to fill "
                     "because each unfilled placement rested the take-profit "
                     "300s on 15-minute-old quotes. A marketable limit that "
@@ -2540,6 +2544,25 @@ class ExitConfig(_StrictModel):
                     "may pay is this multiple of the entry credit (and never "
                     "more than the wing width). W7 priced that state at the "
                     "raw width — the structural max loss.")
+    exit_intrinsic_floor_enabled: bool = Field(default=True,
+        description="A condor close is never offered for less than the structure is "
+                    "worth at the underlying: its intrinsic value plus `exit_cross_amount`, "
+                    "never above the wing width. The floor overrides the mark-anchored "
+                    "ceiling and the blind cap, and near expiry (`exit_near_expiry_dte`) "
+                    "the cap is the wing width. Delayed quotes understate an in-the-money "
+                    "structure close to expiry, so a limit built from them can sit below "
+                    "what the market will take. false restores the old pricing.")
+    exit_near_expiry_dte: int = Field(default=1, ge=0, le=5,
+        description="Days to expiry at or below which a credit close that must get out (a "
+                    "stop, the short-strike touch, assignment risk, condor defense, the expiry "
+                    "exit; not a take-profit) may be offered up to the wing width (the most "
+                    "it can ever cost) and the intrinsic floor allows for a delayed spot "
+                    "(`exit_intrinsic_delayed_band_pct`).")
+    exit_intrinsic_delayed_band_pct: float = Field(default=0.0025, ge=0.0, le=0.02,
+        description="Near expiry on delayed market data, the intrinsic floor is the worst "
+                    "case over the spot plus or minus this fraction (delayed quotes are "
+                    "about 15 minutes old; 0.25% is about one standard deviation of that "
+                    "move at 20% implied volatility). 0 uses the spot as given.")
     credit_touch_stop: bool = Field(default=True,
         description="W36: config home for AIT_CREDIT_TOUCH_STOP — close a "
                     "credit structure when the underlying touches a short "

@@ -821,6 +821,17 @@ exit:
   # W33: with no quote and no fresh mark, pay at most this multiple of the
   # entry credit (never more than the wing width). Was: the raw wing width.
   exit_blind_credit_multiple: 2.0
+  # W101: never offer a condor close for less than the structure is worth at
+  # the underlying (intrinsic + exit_cross_amount, never above the wing
+  # width). Near expiry (exit_near_expiry_dte days or fewer), for the exits
+  # that must get out (stops, short-strike touch, assignment risk, condor
+  # defense, expiry; not a take-profit), the cap is the wing width and the
+  # spot is allowed to be exit_intrinsic_delayed_band_pct off (delayed data is
+  # ~15 minutes old). 2026-10-23: 26 of 63 closes sat below intrinsic. false
+  # restores the old pricing.
+  exit_intrinsic_floor_enabled: true
+  exit_near_expiry_dte: 1
+  exit_intrinsic_delayed_band_pct: 0.0025
   credit_touch_stop: true              # W36: home for AIT_CREDIT_TOUCH_STOP
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L

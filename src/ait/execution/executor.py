@@ -55,7 +55,14 @@ DEFAULT_ORDER_TIMEOUT = int(_contract_float_t("AIT_ENTRY_ORDER_TIMEOUT"))
 # W52a: exit_reason prefixes the portfolio uses for the exits that must get
 # out (portfolio.py _evaluate_position). These rest the shorter
 # exit.exit_stop_pending_rest_seconds before a re-price.
-_STOP_EXIT_PREFIXES = ("stop_loss", "short_strike_touch", "trailing_stop", "breakeven_stop")
+# W101: the exits whose cost of NOT filling is assignment or gamma risk, not a
+# lost profit target, rest the short time too: condor_defense_close, an ITM
+# short at DTE <= 1 (assignment_risk) and the expiry exits at DTE 0 / 1
+# (portfolio.py writes "expiry_approaching (DTE: n)" for n <= 5; the earlier
+# days keep the long rest).
+_STOP_EXIT_PREFIXES = ("stop_loss", "short_strike_touch", "trailing_stop", "breakeven_stop",
+                       "condor_defense_close", "assignment_risk",
+                       "expiry_approaching (DTE: 0)", "expiry_approaching (DTE: 1)")
 
 
 def _cfg_num(section, name: str, default: float) -> float:
@@ -1412,6 +1419,7 @@ class TradeExecutor:
                         order_id=order_id,
                         age_seconds=int(pending_exit.age_seconds),
                     )
+                    self._note_rest_cancel(pending_exit.trade_id)
                     try:
                         for t in open_trades:
                             if t.order.orderId == order_id:
@@ -3351,6 +3359,20 @@ class TradeExecutor:
             TradeStatus.CANCELLED,
         )
         return True
+
+    def _note_rest_cancel(self, trade_id: str) -> None:
+        """W101: remember that this trade's close was taken down by its own rest
+        timer (not rejected), so the exit backoff reads the next request as a
+        re-price. Monotonic seconds, in memory only."""
+        import time as _t
+        marks: dict = getattr(self, "_rest_cancelled", None)
+        if marks is None:
+            marks = self._rest_cancelled = {}
+        marks[trade_id] = _t.monotonic()
+
+    def rest_cancelled_at(self, trade_id: str) -> float | None:
+        """W101: monotonic time of the last rest cancel for this trade, or None."""
+        return (getattr(self, "_rest_cancelled", None) or {}).get(trade_id)
 
     def _exit_rest_seconds(self, pending_exit: PendingExitOrder) -> float:
         """W52a: how long this exit may sit unfilled before check_fills

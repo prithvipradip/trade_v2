@@ -22,7 +22,8 @@ from ait.broker.account import AccountManager
 from ait.broker.contracts import ContractBuilder
 from ait.broker.ibkr_client import IBKRClient
 from ait.broker.orders import OrderBuilder
-from ait.config.runtime_env import capital_base, capital_base_source, contract_flag, contract_float
+from ait.config.runtime_env import (
+    capital_base, capital_base_source, contract_flag, contract_float, contract_str)
 from ait.config.settings import Settings
 from ait.data.dividends import DividendCalendar
 from ait.data.earnings import EarningsCalendar
@@ -33,7 +34,7 @@ from ait.data.market_data import MarketDataService
 from ait.data.options_chain import OptionsChainService, solve_iv_from_price
 from ait.data.multi_timeframe import MultiTimeframeAnalyzer
 from ait.data.quality import DataQualityValidator
-from ait.execution.executor import BAG_CON_ID, TradeExecutor
+from ait.execution.executor import _STOP_EXIT_PREFIXES, BAG_CON_ID, TradeExecutor
 from ait.execution.portfolio import PortfolioManager, PositionAction, PositionStatus
 from ait.execution.reconciler import PositionReconciler
 from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, seed_roll_opening_trade
@@ -1225,8 +1226,7 @@ class TradingOrchestrator:
             # R14 #9: the exit completed — clear its reject-backoff record so a
             # future, unrelated exit on this trade_id starts with a clean slate.
             getattr(self, "_exit_attempts", {}).pop(trade_id, None)
-            getattr(self, "_exit_noquote_attempts", {}).pop(trade_id, None)
-            getattr(self, "_exit_quoted_attempts", {}).pop(trade_id, None)
+            getattr(self, "_exit_unfilled_attempts", {}).pop(trade_id, None)
 
             # Deep-audit SR-H1: the PDT guard was fully built but NOTHING
             # ever called record_day_trade — it always reported 0/3 used.
@@ -3936,7 +3936,10 @@ class TradingOrchestrator:
                 import json
                 legs = json.loads(trade.legs)
                 if legs:
-                    exit_trade = await self._close_multi_leg(trade, legs)
+                    exit_trade = await self._close_multi_leg(
+                        trade, legs, spot=(getattr(pos, "current_price", None) or None),
+                        dte=getattr(pos, "dte", None),
+                        reason=getattr(pos, "exit_reason", None))
                 else:
                     log.warning("no_legs_data_for_close", trade_id=pos.trade_id)
                     return
@@ -4979,6 +4982,102 @@ class TradingOrchestrator:
             ceiling = min(width, ceiling)
         return round(ceiling, 2)
 
+    def _exit_attempt_n(self, trade_id: str) -> int:
+        """W101: how many close placements this trade already had in the current
+        episode (0 on the first), recording this one.
+
+        ONE counter for all three pricing paths (quoted, priced from the legs,
+        no quote). 2026-10-22/23 the QQQ condor's closes alternated between the
+        leg-priced and the no-quote path; with a counter per path every switch
+        started over, and the leg-priced path had no counter at all, so 161 of
+        176 placements re-priced the same delayed quotes. An episode ends after
+        an hour without a placement, or when the exit is booked.
+        """
+        import time as _t
+        attempts: dict = getattr(self, "_exit_unfilled_attempts", None)
+        if attempts is None:
+            attempts = self._exit_unfilled_attempts = {}
+        rec = attempts.get(trade_id)
+        now = _t.monotonic()
+        n = rec["n"] if rec and (now - rec["at"]) < 3600.0 else 0
+        attempts[trade_id] = {"n": n + 1, "at": now}
+        return n
+
+    @staticmethod
+    def _must_get_out(reason) -> bool:
+        """W101: is this one of the exits whose cost of not filling is
+        assignment or gamma risk (stops, the short-strike touch, assignment
+        risk, condor defense, expiry at 0 or 1 days)? The same list that
+        rests them the short time (executor._STOP_EXIT_PREFIXES): one
+        definition. A take-profit is not one of them."""
+        return str(reason or "").startswith(_STOP_EXIT_PREFIXES)
+
+    def _near_expiry(self, dte) -> bool:
+        """W101: is the structure inside ``exit.exit_near_expiry_dte`` days of expiry?"""
+        if dte is None:
+            return False
+        try:
+            return int(dte) <= int(getattr(self._settings.exit, "exit_near_expiry_dte", 1))
+        except (TypeError, ValueError):
+            return False
+
+    def _exit_intrinsic_floor(self, trade: TradeRecord, legs: list[dict],
+                              spot, dte, width, reason=None) -> float | None:
+        """W101: the least a credit structure can cost to close, as a limit.
+
+        The structure's intrinsic value at the underlying (the one valuation
+        function, ``PositionReconciler._structure_intrinsic``) plus the exit
+        cross, never above the wing width (the structural max loss). Near
+        expiry on delayed market data, for the exits that must get out
+        (``_must_get_out``), the spot is ~15 minutes old, so the intrinsic is
+        the WORST CASE over a band around it (the cost is piecewise linear in
+        the spot, so the maximum lies on the band's ends or on a strike inside
+        it). Otherwise (far from expiry, or a take-profit) a vertical can
+        legitimately trade below its intrinsic (the long leg's time value), so
+        the point intrinsic is used, with no band. None when the structure is not a
+        credit structure with a known width, the spot is unknown, the floor is
+        switched off, or the structure is out of the money (nothing to floor).
+
+        2026-10-23 15:58 ET: QQQ condor (short 707P / long 704P), spot 704.4,
+        delayed leg quotes priced the close at 2.48 while the spread was worth
+        2.6-3.0; 26 of 63 retained placements sat below intrinsic.
+        """
+        ex = self._settings.exit
+        if not getattr(ex, "exit_intrinsic_floor_enabled", True):
+            return None
+        if trade.strategy not in CREDIT_STRATEGIES or not width:
+            return None
+        try:
+            s = float(spot)
+        except (TypeError, ValueError):
+            return None
+        if not (s > 0) or s != s:
+            return None
+        band = 0.0
+        if (self._near_expiry(dte) and self._must_get_out(reason)
+                and contract_str("AIT_MARKET_DATA_TYPE") in ("3", "4")):
+            band = float(getattr(ex, "exit_intrinsic_delayed_band_pct", 0.0025))
+        lo, hi = s * (1.0 - band), s * (1.0 + band)
+        cands = {s, lo, hi}
+        for leg in legs:
+            try:
+                k = float(leg["strike"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if lo <= k <= hi:
+                cands.add(k)
+        import json as _json
+        from types import SimpleNamespace as _NS
+        shim = _NS(strategy=trade.strategy, legs=_json.dumps(legs), strike=None)
+        vals = [PositionReconciler._structure_intrinsic(shim, c) for c in cands]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        intr = max(vals)
+        if intr <= 0:
+            return None
+        return round(min(float(width), intr + float(ex.exit_cross_amount)), 2)
+
     #: Combo (BAG) limit prices on US equity options are penny-incremented.
     _EXIT_TICK = 0.01
 
@@ -5023,8 +5122,17 @@ class TradingOrchestrator:
             return None
         return cost
 
-    async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict]):
-        """Close a multi-leg position by reversing the combo."""
+    async def _close_multi_leg(self, trade: TradeRecord, legs: list[dict], *,
+                               spot: float | None = None, dte: int | None = None,
+                               reason: str | None = None):
+        """Close a multi-leg position by reversing the combo.
+
+        W101: ``spot`` (the underlying as the monitor saw it this pass) and
+        ``dte`` let a credit close be floored at the structure's intrinsic
+        value; ``reason`` (the exit reason) decides whether the near-expiry
+        allowances apply (only to the exits that must get out). Without spot
+        the pricing is exactly as before.
+        """
         qualified_legs = []
         for leg in legs:
             contract = ContractBuilder.option(
@@ -5157,15 +5265,7 @@ class TradingOrchestrator:
                         # LIMIT, so it fills at the offer, not at our number.
                         if (limit_price is not None and limit_price > 0
                                 and trade.strategy in CREDIT_STRATEGIES):
-                            import time as _time_q
-                            _qa: dict = getattr(self, "_exit_quoted_attempts", None)
-                            if _qa is None:
-                                _qa = self._exit_quoted_attempts = {}
-                            _qrec = _qa.get(trade.trade_id)
-                            _qnow = _time_q.monotonic()
-                            _qn = (_qrec["n"] if _qrec
-                                   and (_qnow - _qrec["at"]) < 3600.0 else 0)
-                            _qa[trade.trade_id] = {"n": _qn + 1, "at": _qnow}
+                            _qn = self._exit_attempt_n(trade.trade_id)
                             if _qn:
                                 _pct = float(getattr(
                                     self._settings.exit,
@@ -5212,6 +5312,28 @@ class TradingOrchestrator:
                          trade_id=trade.trade_id, synthesized_cost=synth,
                          action=combo_action, limit_price=limit_price,
                          note="BAG never ticked; priced from the four legs")
+                # W101: this path had NO memory that the last placement did not
+                # fill (161 of 176 closes on 2026-10-22/23 re-priced the same
+                # delayed quotes + the cross). Each consecutive unfilled
+                # placement now concedes at least one reprice step (or the
+                # escalation percentage of the marketable price, whichever is
+                # larger), under the same caps. Credit buybacks only; 0 for
+                # exit_unfilled_escalation_pct disables it, as on the quoted path.
+                if trade.strategy in CREDIT_STRATEGIES and limit_price > 0:
+                    _bn = self._exit_attempt_n(trade.trade_id)
+                    _bpct = float(getattr(self._settings.exit,
+                                          "exit_unfilled_escalation_pct", 0.05))
+                    if _bn and _bpct > 0:
+                        _bstep = float(getattr(self._settings.exit,
+                                               "exit_reprice_step", 0.10))
+                        _bbase = limit_price
+                        limit_price = round(
+                            _bbase + _bn * max(_bpct * _bbase, _bstep), 2)
+                        log.warning(
+                            "combo_exit_limit_escalated",
+                            symbol=trade.symbol, trade_id=trade.trade_id,
+                            prior_unfilled_attempts=_bn, basis="legs",
+                            marketable=_bbase, escalated_to=limit_price)
                 # W12: the synthesized cost IS the market's marketable price
                 # here; no two-sided combo NBBO exists to measure a spread.
                 _mk = self._marked_cost_to_close(trade)
@@ -5234,6 +5356,14 @@ class TradingOrchestrator:
         # never covered this path.
         is_credit = trade.strategy in CREDIT_STRATEGIES
         width = self._defined_risk_width(legs)
+        # W101: the least this close can cost at the underlying (None when out
+        # of the money, no spot, not a credit structure, or switched off) and
+        # whether we are close enough to expiry that the stale mark must not
+        # cap it. Both are None/False unless the caller passed spot and dte.
+        _floor = (self._exit_intrinsic_floor(trade, legs, spot, dte, width, reason)
+                  if is_credit and spot is not None else None)
+        _near = (_floor is not None and self._near_expiry(dte)
+                 and self._must_get_out(reason))
 
         # A credit buyback (positive as-defined price = cost to close) can
         # never rationally exceed the wing width — that IS the max loss the
@@ -5260,7 +5390,15 @@ class TradingOrchestrator:
         # entry credit + 25% of the wings) unless the mark is stale/absent —
         # then the structural cap is all we have (unchanged behavior).
         mark_cost = self._marked_cost_to_close(trade)
-        if is_credit and width and limit_price is not None and mark_cost is not None:
+        if _near and mark_cost is not None:
+            # W101: near expiry the deep-ITM structure is worth ~the width and
+            # the mark is a 15-minute-old mid; capping at 1.5x of it is what
+            # would pull the floor back down. The width (max loss) still caps.
+            log.info("combo_exit_near_expiry_cap_width", symbol=trade.symbol,
+                     trade_id=trade.trade_id, dte=dte, mark_cost=round(mark_cost, 2),
+                     wing_width=width)
+        if (is_credit and width and limit_price is not None
+                and mark_cost is not None and not _near):
             anchor = self._exit_price_ceiling(mark_cost, width, EXIT_CROSS)
             if limit_price > anchor:
                 log.warning(
@@ -5270,6 +5408,20 @@ class TradingOrchestrator:
                     wing_width=width, capped_to=anchor,
                 )
                 limit_price = anchor
+
+        # W101: never offer less than the structure is worth at the underlying
+        # (see _exit_intrinsic_floor). Applied after the mark-anchored cap so a
+        # stale mark cannot hold the limit below it. The floor is itself capped
+        # at the wing width (the most this close can ever cost) and the width cap
+        # above already bounded the limit, so the order stays within the width;
+        # the broker band after this is the broker's own constraint and wins.
+        if _floor is not None and limit_price is not None and limit_price < _floor:
+            log.warning(
+                "combo_exit_limit_floored_at_intrinsic",
+                symbol=trade.symbol, trade_id=trade.trade_id,
+                quoted_limit=limit_price, floor=_floor, spot=spot, dte=dte,
+                wing_width=width)
+            limit_price = _floor
 
         # The mirror bound, which the credit-only cap above missed entirely:
         # closing a DEBIT structure SELLS what we own, so the as-defined quote
@@ -5309,6 +5461,11 @@ class TradingOrchestrator:
                     symbol=trade.symbol, trade_id=trade.trade_id,
                     requested=limit_price, band=_band, capped_to=_under,
                 )
+                if _floor is not None and _under < _floor:
+                    log.warning(
+                        "combo_exit_floor_above_broker_band",
+                        symbol=trade.symbol, trade_id=trade.trade_id,
+                        floor=_floor, band=_band, capped_to=_under)
                 limit_price = _under
 
         # NOTE: `is not None`, NOT truthiness. A computed limit of exactly
@@ -5318,7 +5475,7 @@ class TradingOrchestrator:
         # as "no quote" deferred a perfectly closeable position indefinitely.
         if limit_price is not None:
             log.info("combo_exit_limit", symbol=trade.symbol, action=combo_action,
-                     limit_price=limit_price)
+                     limit_price=limit_price, spot=spot, dte=dte, floor=_floor)
             order = OrderBuilder.combo_limit(
                 action=combo_action, quantity=trade.quantity, limit_price=limit_price
             )
@@ -5361,6 +5518,20 @@ class TradingOrchestrator:
                                _blind_cap or 0.0)
                 elif _blind_cap is not None:
                     _anchor, _basis, _cap = _credit, "entry_credit", _blind_cap
+            # W101: the intrinsic floor lifts every cap below it (the blind cap
+            # of 2x the entry credit was 1.84 against a 2.60 spread on
+            # 2026-10-23); near expiry the cap is the wing width. With no mark
+            # and no credit at all the floor itself is the anchor, instead of
+            # deferring a close the spot says is in the money.
+            if _floor is not None:
+                if _near:
+                    _cap = round(float(width), 2)
+                elif _cap is not None:
+                    _cap = max(_cap, _floor)
+                if _anchor is None:
+                    _anchor, _basis = _floor, "intrinsic"
+                    if _cap is None:
+                        _cap = _floor
             if _anchor is None or _cap is None:
                 log.critical(
                     "combo_exit_deferred_no_quote_no_anchor",
@@ -5377,16 +5548,13 @@ class TradingOrchestrator:
                     )
                 return None
 
-            import time as _time
-            _nq: dict = getattr(self, "_exit_noquote_attempts", None)
-            if _nq is None:
-                _nq = self._exit_noquote_attempts = {}
-            _rec = _nq.get(trade.trade_id)
-            _now_m = _time.monotonic()
-            _n = (_rec["n"] if _rec and (_now_m - _rec["at"]) < 3600.0 else 0)
-            _nq[trade.trade_id] = {"n": _n + 1, "at": _now_m}
+            _n = self._exit_attempt_n(trade.trade_id)
             _step = float(getattr(self._settings.exit, "exit_reprice_step", 0.10))
-            fallback = round(min(_cap, _anchor + EXIT_CROSS + _n * _step), 2)
+            # An intrinsic anchor already includes the cross.
+            _px0 = _anchor if _basis == "intrinsic" else _anchor + EXIT_CROSS
+            fallback = round(min(_cap, _px0 + _n * _step), 2)
+            if _floor is not None:
+                fallback = min(max(fallback, _floor), round(float(width), 2))
             _band_fb = self._exit_band_cap(trade, mark_cost)
             if _band_fb is not None:
                 fallback = min(fallback, self._under_band(_band_fb))
@@ -5398,6 +5566,7 @@ class TradingOrchestrator:
                 anchor=round(_anchor, 4),
                 mark_age_s=None if _age is None else int(_age),
                 attempt=_n + 1, cap=_cap, band=_band_fb, limit_price=fallback,
+                floor=_floor, spot=spot, dte=dte,
             )
             if self._alert_gate(f"exit_noquote:{trade.trade_id}"):
                 await self._send_notification(
@@ -6069,10 +6238,26 @@ class TradingOrchestrator:
         if rec is not None and now < rec["next_allowed_at"]:
             return False  # inside the backoff window — skip silently
 
-        if rec is not None and (now - rec["last_attempt_at"]) < self._EXIT_REJECT_RAPID_WINDOW_S:
+        # W101: the executor records when it takes an unfilled close down by its
+        # own rest timer. That order was not rejected, it rested; the next
+        # request is a re-price, whatever the rest was (a 120 s stop rest sits
+        # under RAPID_WINDOW, so by the clock alone every one of them looked like
+        # a reject: 90 of 176 closes on 2026-10-22/23 logged exit_retry_backoff).
+        rest_at = None
+        _ex = getattr(self, "_executor", None)
+        if _ex is not None and rec is not None:
+            try:
+                rest_at = _ex.rest_cancelled_at(trade_id)
+            except Exception:  # noqa: BLE001 — bookkeeping must never block an exit
+                rest_at = None
+        rest_reprice = (isinstance(rest_at, (int, float)) and not isinstance(rest_at, bool)
+                        and rec is not None and rest_at >= rec["last_attempt_at"])
+
+        if (rec is not None and not rest_reprice
+                and (now - rec["last_attempt_at"]) < self._EXIT_REJECT_RAPID_WINDOW_S):
             strikes = rec["strikes"] + 1  # fast re-request => prior exit rejected
         else:
-            strikes = 1  # first attempt, or the slow re-price cadence — reset
+            strikes = 1  # first attempt, a re-price after its rest, or the slow cadence — reset
 
         backoff = (min(self._EXIT_REJECT_CAP_S,
                        self._EXIT_REJECT_BASE_S * (2 ** (strikes - 2)))
