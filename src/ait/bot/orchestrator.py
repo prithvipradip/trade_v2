@@ -60,7 +60,7 @@ from ait.learning.counterfactual import CounterfactualTracker
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
 from ait.strategies.selector import StrategySelector
 from ait.strategies.thompson import ThompsonSampler
-from ait.utils.cadence import FAST_MONITOR_CADENCE_SECONDS
+from ait.utils.cadence import BOT_SHUTDOWN_STEP_SECONDS, FAST_MONITOR_CADENCE_SECONDS
 from ait.utils.logging import get_logger
 from ait.utils.time import next_market_open, today_et
 from ait.utils.time import now_et, parse_trade_ts
@@ -663,8 +663,23 @@ class TradingOrchestrator:
         self._training_task = asyncio.create_task(_train())
 
     async def run(self) -> None:
-        """Main loop — runs continuously, trading during market hours."""
+        """Main loop — runs continuously, trading during market hours.
+
+        W103: the shutdown step runs on EVERY way out, once: a normal stop, an
+        error, or the cancel the caller sends when the grace window runs out.
+        It used to run only when the loop ended by itself, so the cancel (the
+        only ending a stop ever had) skipped the shutdown page and the marks
+        snapshot.
+        """
+        try:
+            await self._run_main()
+        finally:
+            await self._shutdown_once()
+
+    async def _run_main(self) -> None:
         self._running = True
+        self._stop_event = asyncio.Event()
+        self._shutdown_done = False
         from datetime import datetime as _dt
         self._started_at = _dt.now()  # for the post-restart settling guard
         self._training_task: asyncio.Task | None = None
@@ -736,18 +751,21 @@ class TradingOrchestrator:
 
                 if phase == TradingPhase.PRE_MARKET:
                     await self._pre_market()
-                    await self._scheduler.wait_for_phase(TradingPhase.MARKET_OPEN)
+                    await self._scheduler.wait_for_phase(
+                        TradingPhase.MARKET_OPEN, self._stop_event)
 
                 elif phase == TradingPhase.MARKET_OPEN:
                     await self._trading_loop()
 
                 elif phase == TradingPhase.POST_MARKET:
                     await self._post_market()
-                    await self._scheduler.wait_for_phase(TradingPhase.PRE_MARKET)
+                    await self._scheduler.wait_for_phase(
+                        TradingPhase.PRE_MARKET, self._stop_event)
 
                 elif phase == TradingPhase.OFF_HOURS:
                     log.info("off_hours", next_open=str(next_market_open()))
-                    await self._scheduler.wait_for_phase(TradingPhase.PRE_MARKET)
+                    await self._scheduler.wait_for_phase(
+                        TradingPhase.PRE_MARKET, self._stop_event)
 
             except KeyboardInterrupt:
                 log.info("shutdown_requested")
@@ -757,13 +775,41 @@ class TradingOrchestrator:
                 await self._send_notification(f"ERROR: {str(e)}")
                 self._watchdog.record_error("trading_loop", str(e))
                 await self._watchdog.check_and_recover()
-                await asyncio.sleep(60)
-
-        await self._shutdown()
+                await self._sleep_unless_stopped(60)
 
     async def stop(self) -> None:
         """Gracefully stop the orchestrator."""
         self._running = False
+        # W103: wake whatever the loop is sleeping on (a phase wait of up to an
+        # hour, the 30 s scan tick, the error back-off) so the stop is acted on
+        # now instead of at the end of that sleep.
+        _ev = getattr(self, "_stop_event", None)
+        if _ev is not None:
+            _ev.set()
+
+    async def _sleep_unless_stopped(self, seconds: float) -> None:
+        """W103: ``asyncio.sleep`` that ends early when a stop is requested."""
+        _ev = getattr(self, "_stop_event", None)
+        if _ev is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(_ev.wait(), seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _shutdown_once(self) -> None:
+        """W103: run ``_shutdown`` at most once, never longer than its budget
+        (a hung snapshot or notification must not eat the supervisor's wait)."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        try:
+            await asyncio.wait_for(self._shutdown(), BOT_SHUTDOWN_STEP_SECONDS)
+        except asyncio.TimeoutError:
+            log.warning("shutdown_step_timed_out", budget_s=BOT_SHUTDOWN_STEP_SECONDS)
+        except Exception as e:  # noqa: BLE001 — a failing shutdown step must not mask the exit
+            log.warning("shutdown_step_failed", error=str(e))
 
     # --- Trading Phases ---
 
@@ -1622,7 +1668,9 @@ class TradingOrchestrator:
         """
         time_since_scan = 0.0
         while self._running and self._scheduler.get_current_phase() == TradingPhase.MARKET_OPEN:
-            await asyncio.sleep(FAST_MONITOR_CADENCE_SECONDS)
+            await self._sleep_unless_stopped(FAST_MONITOR_CADENCE_SECONDS)
+            if not self._running:       # W103: a stop ends the tick; no scan after it
+                break
             time_since_scan += FAST_MONITOR_CADENCE_SECONDS
             if time_since_scan < scan_interval:
                 continue

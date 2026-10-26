@@ -57,3 +57,30 @@ MARKS_MISSING_ALERT_SECONDS: float = 300.0
 #: enough that ordinary cadence jitter never falsely degrades a quote, tight
 #: enough to still catch a genuinely stuck feed.
 QUOTE_STALENESS_BUDGET_SECONDS: float = FAST_MONITOR_CADENCE_SECONDS * 6
+
+# --- Stopping the bot (W103) -------------------------------------------------
+# The supervisor stops the bot with SIGTERM and kills it if it has not exited.
+# The two sides used to hold their own 30 s: the bot's grace started only after
+# its handler ran and was followed by a shutdown step and the connection
+# cleanup, so the supervisor's kill always came first (every stop since July
+# ended in SIGKILL with no shutdown line). The supervisor's wait is now longer
+# than everything the bot may spend, and a test holds it so.
+
+#: How long the bot gives its trading loop to leave after a stop request before
+#: cancelling it (ait.main.GRACEFUL_SHUTDOWN_TIMEOUT).
+BOT_GRACEFUL_STOP_SECONDS: float = 30.0
+
+#: The most the orchestrator's own shutdown step (marks snapshot, shutdown page,
+#: notification drain) may take.
+BOT_SHUTDOWN_STEP_SECONDS: float = 15.0
+
+#: The most the cleanup after the loop (poller, background tasks, broker
+#: disconnect) may take.
+BOT_CLEANUP_SECONDS: float = 15.0
+
+#: How long the supervisor waits for the bot to exit after SIGTERM before it
+#: kills it. Must exceed the three bot budgets above.
+SUPERVISOR_STOP_WAIT_SECONDS: float = 75.0
+
+#: How long the supervisor waits for a killed bot to be reaped.
+SUPERVISOR_REAP_SECONDS: float = 5.0

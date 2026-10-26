@@ -53,13 +53,51 @@ from ait.broker.ibkr_client import IBKRClient
 from ait.config.settings import load_settings
 from ait.execution import manual_positions
 from ait.notifications.telegram import TelegramNotifier
+from ait.utils.cadence import BOT_CLEANUP_SECONDS, BOT_GRACEFUL_STOP_SECONDS
 from ait.utils.logging import get_logger, setup_logging
 
 log = get_logger("main")
 
 # R17: exceeds orchestrator._shutdown()'s own 15s notify-task drain, so a
 # graceful stop has room to actually send the "bot shutting down" message.
-GRACEFUL_SHUTDOWN_TIMEOUT = 30
+# W103: the value lives in ait.utils.cadence beside the supervisor's wait, which
+# must exceed this plus the shutdown step and the cleanup below.
+GRACEFUL_SHUTDOWN_TIMEOUT = BOT_GRACEFUL_STOP_SECONDS
+
+
+def _install_shutdown_signals(loop: asyncio.AbstractEventLoop,
+                              shutdown_event: asyncio.Event) -> None:
+    """SIGINT/SIGTERM set ``shutdown_event``.
+
+    W103: the handler runs between two bytecodes of the main thread and must
+    reach the event loop through ``call_soon_threadsafe``, which also wakes the
+    selector. A bare ``event.set()`` from the handler only queues the callback;
+    an idle loop (a long sleep, a long poll) does not run it until something
+    else wakes it. ``signal.signal`` rather than ``loop.add_signal_handler`` so
+    the same code works where the latter does not exist (Windows).
+    """
+    def handle_signal(sig, frame):
+        log.info("shutdown_signal_received", signal=sig)
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+
+async def _cleanup_after_stop(poller_task: asyncio.Task, orchestrator, ibkr) -> None:
+    """Poller, detached reconcile tasks, orchestrator, broker connection."""
+    poller_task.cancel()
+    try:
+        await poller_task
+    except asyncio.CancelledError:
+        pass
+    # W30 (R26 F3, finding #6): the poller is cancelled (no NEW answers
+    # can be recorded) but any reconcile_now() it already fired via
+    # _fire_and_forget is still running detached — wait for it before
+    # IBKR disconnects out from under it.
+    await manual_positions.drain_background_tasks()
+    await orchestrator.stop()
+    await ibkr.disconnect()
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,12 +214,7 @@ async def run_bot(args: argparse.Namespace) -> None:
     # Setup graceful shutdown
     shutdown_event = asyncio.Event()
 
-    def handle_signal(sig, frame):
-        log.info("shutdown_signal_received", signal=sig)
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    _install_shutdown_signals(asyncio.get_running_loop(), shutdown_event)
 
     # W22: inbound Telegram polling (button taps + reply-to corrections)
     # runs as its own task, decoupled from the trading loop's own run()/
@@ -220,19 +253,16 @@ async def run_bot(args: argparse.Namespace) -> None:
                 pass
 
     finally:
-        poller_task.cancel()
+        # W103: bounded, so the supervisor's wait (cadence.SUPERVISOR_STOP_WAIT_SECONDS)
+        # always covers it.
+        _timed_out = False
         try:
-            await poller_task
-        except asyncio.CancelledError:
-            pass
-        # W30 (R26 F3, finding #6): the poller is cancelled (no NEW answers
-        # can be recorded) but any reconcile_now() it already fired via
-        # _fire_and_forget is still running detached — wait for it before
-        # IBKR disconnects out from under it.
-        await manual_positions.drain_background_tasks()
-        await orchestrator.stop()
-        await ibkr.disconnect()
-        log.info("ait_shutdown_complete")
+            await asyncio.wait_for(
+                _cleanup_after_stop(poller_task, orchestrator, ibkr), BOT_CLEANUP_SECONDS)
+        except asyncio.TimeoutError:
+            _timed_out = True
+            log.warning("shutdown_cleanup_timed_out", budget_s=BOT_CLEANUP_SECONDS)
+        log.info("ait_shutdown_complete", cleanup_timed_out=_timed_out)
 
 
 def main() -> None:

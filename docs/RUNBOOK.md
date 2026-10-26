@@ -18,6 +18,8 @@ Limits, timers and ceilings these procedures refer to are generated tables in [G
 | Resume auto-relaunch | delete `data/KEEPER_PAUSE` |
 | Full stop | `data/KEEPER_PAUSE` FIRST (or the keeper relaunches within ~90s and undoes the stop), then `data/HALT`, then stop processes if truly needed |
 
+**What a clean bot stop looks like.** After SIGTERM (a supervisor restart, Ctrl-C, or the supervisor's own stop) the bot logs `shutdown_signal_received`, then `orchestrator_shutting_down`, sends the "Bot shutting down" page and logs `ait_shutdown_complete` within seconds. The supervisor logs `bot_stopped` with `escalated=false`. It waits up to 75 s (`SUPERVISOR_STOP_WAIT_SECONDS` in `utils/cadence.py`, which must exceed the bot's own 30 s grace + 15 s shutdown step + 15 s cleanup; a test holds that) and only then logs `bot_stop_escalated_to_kill` and kills the bot. If you see that line, or `graceful_shutdown_timed_out_cancelling`, `shutdown_step_timed_out` or `shutdown_cleanup_timed_out`, the stop was not clean: look at what the bot was doing (a scan in flight cannot be interrupted) and tell a developer session. Working exit orders are left at the broker and re-adopted at the next start.
+
 `data/HALT_UNTRACKED` is set by the bot itself (see "UNTRACKED OPTION POSITION" below); do not create it by hand. It clears itself at the next reconcile once every untracked position is declared or gone ([Resolving a books-versus-broker break](#resolving-a-books-versus-broker-break)).
 
 ## Alert → action
