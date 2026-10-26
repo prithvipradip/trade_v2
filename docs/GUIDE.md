@@ -433,7 +433,7 @@ and allowed ranges), and the startup log event `order_timeline_in_effect` prints
 | Age | What happens | Setting | Default | Allowed range |
 |---|---|---|---|---|
 | 0 to grace | Ignored by the fill checker so the order can appear in IBKR's trade list; a brand-new order would otherwise read as cancelled. | `exit.order_visibility_grace_seconds` | 10.0 | 5.0 - 60.0 |
-| rest | Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stop exits (stop loss, short-strike touch, trailing, breakeven) rest less than ordinary exits. | `exit.exit_stop_pending_rest_seconds` / `exit.exit_pending_rest_seconds` | 120.0 / 300.0 | 15.0 - 1800.0 / 30.0 - 1800.0 |
+| rest | Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stop exits (stop loss, short-strike touch, trailing, breakeven) and the exits that must get out (condor defense close, assignment risk, expiry at 0 or 1 days) rest less than ordinary exits. | `exit.exit_stop_pending_rest_seconds` / `exit.exit_pending_rest_seconds` | 120.0 / 300.0 | 15.0 - 1800.0 / 30.0 - 1800.0 |
 | band TTL | A broker "price band" reject caps later attempts for this long, then stops. | `exit.exit_band_ttl_seconds` | 300.0 | 30.0 - 3600.0 |
 | foreign | The order belongs to ANOTHER client id and cannot be cancelled from this session: the operator is paged instead of the cancel being retried. | `exit.foreign_exit_escalation_seconds` | 300.0 | 60.0 - 3600.0 |
 | zombie | Still unresolved: the broker is asked; only if it answers and does not list the order is CLOSING reverted to FILLED so a fresh exit can fire (otherwise the position is held CLOSING and the operator is paged). | `exit.zombie_exit_revert_seconds` | 900.0 | 120.0 - 7200.0 |
@@ -621,7 +621,7 @@ never logged, and are never copied into reports.
 | `dividends` | The same last-known-good and fail-closed policy for ex-dividend dates | 2 | `config.yaml` | [GUIDE.md](GUIDE.md#42-pre-execution-checks) |
 | `assignment_response` | Whether an at-risk short leg is closed or rolled to a later expiry (shipped as close only, rolls not executed) | 9 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits) |
 | `condor_defense` | The staged condor roll-and-defense feature (off by default) | 11 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits) |
-| `exit` | Exit rules: stops, the take-profit ladder, the touch stop, and the exit order's price and timers | 27 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits), [GUIDE.md](GUIDE.md#84-order-lifecycle-timeline) |
+| `exit` | Exit rules: stops, the take-profit ladder, the touch stop, and the exit order's price and timers | 30 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits), [GUIDE.md](GUIDE.md#84-order-lifecycle-timeline) |
 | `learning` | The bounded learning layer and paper-trading mode | 19 | `config.yaml` | [GUIDE.md](GUIDE.md#10-learning-and-adaptation) |
 | `sentiment` | Retired; nothing reads it | 1 | `config.yaml` | - |
 | `notifications` | The Telegram switch | 1 | `config.yaml` | [GUIDE.md](GUIDE.md#12-monitoring-and-operator-surfaces) |

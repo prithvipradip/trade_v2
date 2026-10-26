@@ -61,7 +61,7 @@ JOB_TEXT: dict[str, tuple[str, str]] = {
 ORDER_EXIT = [
     ("0 to grace", "Ignored by the fill checker so the order can appear in IBKR's trade list; a brand-new order would otherwise read as cancelled.",
      ["exit.order_visibility_grace_seconds"]),
-    ("rest", "Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stop exits (stop loss, short-strike touch, trailing, breakeven) rest less than ordinary exits.",
+    ("rest", "Still unfilled: a cancel is requested but the position stays CLOSING so the monitor can re-price. Stop exits (stop loss, short-strike touch, trailing, breakeven) and the exits that must get out (condor defense close, assignment risk, expiry at 0 or 1 days) rest less than ordinary exits.",
      ["exit.exit_stop_pending_rest_seconds", "exit.exit_pending_rest_seconds"]),
     ("band TTL", "A broker \"price band\" reject caps later attempts for this long, then stops.", ["exit.exit_band_ttl_seconds"]),
     ("foreign", "The order belongs to ANOTHER client id and cannot be cancelled from this session: the operator is paged instead of the cancel being retried.",
@@ -126,7 +126,7 @@ MEANING: dict[str, str] = {
     "risk.max_symbol_concentration_pct": "Maximum fraction of the account in one symbol (a risk-manager gate separate from the aggregate cap `positions.max_portfolio_risk_pct`).",
     "ml.binary_cv_min_gap_days": "Minimum purge gap in the binary models' validation; the gap used is the larger of this and the label horizon, so overlapping labels cannot leak into the validation score.",
     "exit.exit_cross_amount": "How far a combo exit limit crosses the spread so the close actually fills.",
-    "exit.exit_stop_pending_rest_seconds": "How long an unfilled stop exit (stop loss, short-strike touch, trailing stop, breakeven stop) rests before a cancel is requested; shorter than the rest for ordinary exits so a stop re-prices sooner.",
+    "exit.exit_stop_pending_rest_seconds": "How long an unfilled stop exit (stop loss, short-strike touch, trailing stop, breakeven stop) or an exit that must get out (condor defense close, assignment risk, expiry at 0 or 1 days) rests before a cancel is requested; shorter than the rest for ordinary exits so it re-prices sooner.",
     "exit.max_quote_jump_pct": "A move in the underlying quote, against the last confirmed price, above this marks the touch stop's input as degraded (it then waits for corroborating ticks).",
     "data_collection.short_dte_time_et": "ET wall-clock time of the daily run, HH:MM. It must fall inside the session: after the close IB no longer serves that day's expiring contracts, so a later run cannot capture 0 DTE.",
     "backtest.ic_min_credit_width": "Credit-to-width ratio floor for condor entries (the config home of `AIT_IC_MIN_CREDIT_WIDTH`).",

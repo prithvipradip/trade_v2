@@ -141,3 +141,30 @@ class TestCheckFillsHonoursTheRest:
         env.executor._pending_exit_orders[exit_oid].submitted_at -= 100
         await env.executor.check_fills()
         assert exit_oid not in env.ib.cancelled_order_ids
+
+
+class TestTheRestCancelIsRecorded:
+    """W101: the exit backoff must be able to tell an order taken down by its own
+    rest timer (a re-price) from one the broker rejected."""
+
+    async def test_the_rest_cancel_is_recorded_when_it_is_requested(self, env):
+        env.executor._settings = _settings(rest=300.0, stop_rest=120.0)
+        trade_id, exit_oid = await _working_exit(env, "expiry_approaching (DTE: 1)")
+        assert env.executor.rest_cancelled_at(trade_id) is None
+
+        env.executor._pending_exit_orders[exit_oid].submitted_at -= 100
+        await env.executor.check_fills()
+        assert env.executor.rest_cancelled_at(trade_id) is None   # still resting
+
+        env.executor._pending_exit_orders[exit_oid].submitted_at -= 30
+        await env.executor.check_fills()
+        assert exit_oid in env.ib.cancelled_order_ids
+        assert isinstance(env.executor.rest_cancelled_at(trade_id), float)
+
+    async def test_a_must_get_out_exit_rests_the_short_time(self, env):
+        env.executor._settings = _settings(rest=300.0, stop_rest=120.0)
+        _trade_id, exit_oid = await _working_exit(env, "condor_defense_close (tested_side=put)")
+        env.executor._pending_exit_orders[exit_oid].submitted_at -= 121
+        await env.executor.check_fills()
+        assert exit_oid in env.ib.cancelled_order_ids
+

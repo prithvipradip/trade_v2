@@ -75,7 +75,7 @@ class TestAQuotedExitRemembersItDidNotFill:
         o, ibkr, trade = _quoted((8.46, 8.57))
         _placed(o, ibkr, trade)
         _placed(o, ibkr, trade)
-        o._exit_quoted_attempts["T-1"]["at"] -= 2 * 3600
+        o._exit_unfilled_attempts["T-1"]["at"] -= 2 * 3600
         assert _placed(o, ibkr, trade) == pytest.approx(8.67)
 
     def test_a_debit_close_is_never_escalated_upward(self):

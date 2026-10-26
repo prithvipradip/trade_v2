@@ -524,7 +524,7 @@ scripts/gen_docs.py:
   writes: "the generated blocks and docs/reference/*.md (nothing with --check); --restamp edits the stamp lines of scripts/script_catalogue.yaml"
   example: "python scripts/gen_docs.py [--check]"
   explained: "[TECHNICAL_GUIDE.md](../TECHNICAL_GUIDE.md#8-maintaining-the-documentation)"
-  stamp: "5199796635df"
+  stamp: "15b778885110"
 
 scripts/literal_census.py:
   group: Developer
