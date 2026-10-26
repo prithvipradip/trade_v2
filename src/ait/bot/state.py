@@ -19,6 +19,15 @@ from ait.utils.time import now_et
 
 log = get_logger("bot.state")
 
+
+class PartialExitsCorruptError(ValueError):
+    """W104: ``open_positions.partial_exits`` is not a JSON list of slices."""
+
+    def __init__(self, trade_id: str, raw: str):
+        super().__init__(f"partial_exits unreadable for {trade_id}")
+        self.trade_id = trade_id
+        self.raw = raw
+
 DB_PATH = Path("data/ait_state.db")
 
 
@@ -769,7 +778,13 @@ class StateManager:
             pnl_level: The milestone P&L level that triggered this partial exit.
                        Stored so the same level is not re-triggered.
         """
-        raw = self.get_partial_exits(trade_id)
+        try:
+            raw = self.get_partial_exits(trade_id)
+        except PartialExitsCorruptError as e:
+            # Keep the unreadable history for a human instead of overwriting it
+            # without a trace; the slice P&L inside it cannot be recovered here.
+            self.set_state(f"partial_exits_corrupt_{trade_id}", e.raw[:2000])
+            raw = []
         entry: dict = {
             "quantity": quantity,
             "price": price,
@@ -786,7 +801,15 @@ class StateManager:
             )
 
     def get_partial_exits(self, trade_id: str) -> list[dict]:
-        """Get partial exit history for a trade."""
+        """Get partial exit history for a trade.
+
+        W104: raises ``PartialExitsCorruptError`` when the stored history cannot
+        be read as a list of slices. It used to return ``[]`` for bad JSON, which
+        told the partial-exit check that no level had been taken, so a level that
+        already sold contracts fired again; and it passed ``null``/``{}`` through,
+        which raised inside ``check_positions`` and cost the whole pass its exit
+        evaluation. An empty history is still ``[]``.
+        """
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
                 "SELECT partial_exits FROM open_positions WHERE trade_id = ?",
@@ -794,9 +817,14 @@ class StateManager:
             ).fetchone()
         if row and row[0]:
             try:
-                return json.loads(row[0])
+                val = json.loads(row[0])
             except json.JSONDecodeError:
-                return []
+                val = None
+            if not isinstance(val, list) or not all(isinstance(p, dict) for p in val):
+                log.error("partial_exits_corrupt", trade_id=trade_id,
+                          raw=str(row[0])[:200])
+                raise PartialExitsCorruptError(trade_id, str(row[0]))
+            return val
         return []
 
     def update_trade_entry_price(self, trade_id: str, entry_price: float) -> None:
@@ -1044,7 +1072,10 @@ class StateManager:
             stale = (now_et() - _td(seconds=self.CLAIM_STALE_SECONDS)).isoformat()
             rows = conn.execute(
                 "SELECT trade_id, realized_pnl, exit_reason, exit_time "
-                "FROM exit_outbox WHERE exit_time < ? "
+                "FROM exit_outbox WHERE (exit_time < ? "
+                # W104: a value that is not date-shaped sorts after every date
+                # ("N/A" > "2026"), so `exit_time < ?` alone never selected it.
+                "OR exit_time NOT GLOB '[0-9][0-9][0-9][0-9]-*') "
                 "AND (claimed_at IS NULL OR claimed_at < ?) ORDER BY exit_time",
                 (cutoff, stale)).fetchall()
             return [dict(r) for r in rows]

@@ -12,6 +12,7 @@ Setup instructions:
 
 from __future__ import annotations
 
+from ait.notifications import channel_state
 from ait.utils.logging import get_logger
 
 log = get_logger("notifications.telegram")
@@ -30,6 +31,8 @@ class TelegramNotifier:
         # nothing at all. Now it gates here, at the one construction site.
         self._enabled = configured and enabled
         self._bot = None
+        #: W104: why the last send failed (channel_state kinds), None after a success.
+        self.last_error_kind: str | None = None
 
         if not configured:
             log.warning(
@@ -64,6 +67,7 @@ class TelegramNotifier:
         """
         if not self._enabled:
             log.debug("telegram_disabled", message=message[:100])
+            self.last_error_kind = channel_state.NO_CREDS
             return False
 
         try:
@@ -82,13 +86,22 @@ class TelegramNotifier:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         log.debug("telegram_sent", chars=len(message))
+                        self.last_error_kind = None
+                        channel_state.record_success("bot")
                         return True
                     else:
                         body = await resp.text()
-                        log.warning("telegram_send_failed", status=resp.status, body=body[:200])
+                        # W104: 401/403 means the token (or chat) is no longer valid:
+                        # no retry can succeed, and it must not read as a blip.
+                        self.last_error_kind = channel_state.classify_status(resp.status)
+                        channel_state.record_failure("bot", self.last_error_kind)
+                        log.warning("telegram_send_failed", status=resp.status,
+                                    kind=self.last_error_kind, body=body[:200])
                         return False
 
         except Exception as e:
+            self.last_error_kind = channel_state.TRANSIENT
+            channel_state.record_failure("bot", channel_state.TRANSIENT)
             log.warning("telegram_error", error=__import__("re").sub(r"/bot[^/\s]+", "/bot***", str(e))[:300])
             return False
 

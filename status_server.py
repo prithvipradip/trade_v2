@@ -53,6 +53,7 @@ async function tick(){
   h+=row('Processes', s.procs);
   h+=row('Last heartbeat', s.last_heartbeat);
   h+=row('Last connect (UTC)', s.last_connect);
+  if(s.alert_channel){h+=row('ALERTS','NOT DELIVERED since '+s.alert_channel.failing_since+' ('+s.alert_channel.kind+')','bad');}
   h+=row('IB endpoint', s.ib_endpoint.mismatch ? s.ib_endpoint.mismatch : (s.ib_endpoint.record ? 'port '+s.ib_endpoint.record.using+' (matches .env)' : 'unknown'), s.ib_endpoint.mismatch ? 'warn' : '');
   h+=row('Native crashes', s.crashes, s.crashes>0?'warn':'ok');
   h+=row('Keeper relaunches', s.keeper_relaunches);

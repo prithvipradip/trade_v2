@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
 
-from ait.bot.state import StateManager, TradeRecord, TradeStatus
+from ait.bot.state import PartialExitsCorruptError, StateManager, TradeRecord, TradeStatus
 from ait.broker.ibkr_client import IBKRClient
 from ait.strategies.base import CREDIT_STRATEGIES
 from ait.config.settings import AssignmentResponseConfig, CondorDefenseConfig, ExitConfig
@@ -183,6 +183,9 @@ class PortfolioManager:
         self._notify_cb = None
         self._marks_missing_streak: dict[str, int] = {}
         self._pdt_alerted: set[str] = set()
+        # W104: trades whose MARKS MISSING / macro-check page actually went out.
+        self._marks_missing_paged: set[str] = set()
+        self._macro_check_alerted: set[str] = set()
         # R14: exit-input staleness gate. `DataQualityValidator` has existed
         # (and been instantiated in the orchestrator) since the beginning with
         # ZERO call sites — the exit path never checked a single quote.
@@ -544,19 +547,29 @@ class PortfolioManager:
             if streaks is not None:
                 streak = streaks.get(trade.trade_id, 0) + 1
                 streaks[trade.trade_id] = streak
-                if streak == self.MARKS_MISSING_ALERT_TICKS and notify:
+                # W104: was `streak == TICKS`, a single tick: a failed send was
+                # never repeated while protection stayed off. Now every tick at
+                # or past the threshold tries until one send goes through.
+                _paged = getattr(self, "_marks_missing_paged", None)
+                if (streak >= self.MARKS_MISSING_ALERT_TICKS and notify
+                        and _paged is not None and trade.trade_id not in _paged):
                     try:
                         await notify(
                             f"MARKS MISSING x{streak} ticks: {trade.symbol} "
                             f"{trade.strategy} — stop/take-profit protection is "
                             f"NOT running (data outage?). DTE safety exits only."
                         )
-                    except Exception:  # noqa: BLE001
-                        pass
+                        _paged.add(trade.trade_id)
+                    except Exception as _e:  # noqa: BLE001
+                        log.warning("marks_missing_page_failed", trade_id=trade.trade_id,
+                                    error=str(_e))
         else:
             streaks = getattr(self, "_marks_missing_streak", None)
             if streaks is not None:
                 streaks.pop(trade.trade_id, None)
+            _paged = getattr(self, "_marks_missing_paged", None)
+            if _paged is not None:
+                _paged.discard(trade.trade_id)
 
         cost_basis = abs(trade.entry_price) * trade.quantity * multiplier
         pnl_pct = unrealized_pnl / cost_basis if cost_basis > 0 else 0.0
@@ -863,8 +876,11 @@ class PortfolioManager:
                         if _assign_cfg is not None and _assign_cfg.policy != "close_only":
                             assignment_roll_side = "P" if itm_side == "put" else "C"
                             assignment_action_reason = f"assignment_risk_{_assign_cfg.policy}"
-            except Exception:
-                pass
+            except Exception as _e:  # noqa: BLE001
+                # W104: the exit below still fires (the right direction); what
+                # is lost is the ITM label and the roll hint, and that was silent.
+                log.warning("assignment_risk_diag_failed", trade_id=trade.trade_id,
+                            symbol=trade.symbol, error=str(_e))
             if not should_exit:
                 should_exit = True
                 exit_reason = f"expiry_approaching (DTE: {dte})"
@@ -963,8 +979,25 @@ class PortfolioManager:
                 if days_to_event is not None and days_to_event <= _evt_window:
                     should_exit = True
                     exit_reason = f"macro_event_flatten (days_to_event={days_to_event})"
-            except Exception:
-                pass
+            except Exception as _e:  # noqa: BLE001
+                # W104: stays fail-open (missing information never FORCES an exit;
+                # the W44/W51 precedent), but it was silent: a broken calendar
+                # read looked exactly like "no event ahead". Name it every pass
+                # and page once per process.
+                log.warning("macro_flatten_check_failed", trade_id=trade.trade_id,
+                            symbol=trade.symbol, error=str(_e))
+                _macro_seen = getattr(self, "_macro_check_alerted", None)
+                _macro_notify = getattr(self, "_notify_cb", None)
+                if _macro_seen is not None and not _macro_seen and persist and _macro_notify:
+                    try:
+                        await _macro_notify(
+                            f"MACRO FLATTEN CHECK FAILED ({trade.symbol} {trade.strategy}): "
+                            f"the economic-calendar read raised ({str(_e)[:120]}). "
+                            "The position will NOT be flattened ahead of a macro event "
+                            "until this is fixed.")
+                        _macro_seen.add("sent")
+                    except Exception:  # noqa: BLE001
+                        pass
 
         # 3e. Ex-dividend early-assignment risk — close a short call whose
         # extrinsic value is below the expected dividend, the day before
@@ -1126,7 +1159,6 @@ class PortfolioManager:
                     _pdt_seen = getattr(self, "_pdt_alerted", None) if persist else None
                     _notify = getattr(self, "_notify_cb", None)
                     if _pdt_seen is not None and trade.trade_id not in _pdt_seen and _notify:
-                        _pdt_seen.add(trade.trade_id)
                         try:
                             await _notify(
                                 f"PDT BLOCKED EXIT: {trade.symbol} {trade.strategy} "
@@ -1134,8 +1166,12 @@ class PortfolioManager:
                                 f"today would trip PDT. Position is riding "
                                 f"unprotected until tomorrow — review manually."
                             )
-                        except Exception:  # noqa: BLE001
-                            pass
+                            # W104: latched only after the send went through (it was
+                            # latched first, so a failed send never repeated).
+                            _pdt_seen.add(trade.trade_id)
+                        except Exception as _e:  # noqa: BLE001
+                            log.warning("pdt_blocked_exit_page_failed",
+                                        trade_id=trade.trade_id, error=str(_e))
 
         # W54b: merge condor_defense's and rule 3/3e's roll signals. The two
         # are never both set on the same tick -- rule 3/3e run FIRST and,
@@ -1276,7 +1312,13 @@ class PortfolioManager:
         if current_quantity <= 1:
             return 0
 
-        prior_partials = self._state.get_partial_exits(trade_id)
+        try:
+            prior_partials = self._state.get_partial_exits(trade_id)
+        except PartialExitsCorruptError:
+            # W104: which levels were taken is unknown. Profit-taking is optional,
+            # a repeat sell is not: take no partial exit, and never block a full one.
+            log.error("partial_exit_skipped_history_unreadable", trade_id=trade_id)
+            return 0
         completed_levels = {p.get("pnl_level") for p in prior_partials}
 
         for level in self._exit_config.partial_exit_levels:

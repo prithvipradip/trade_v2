@@ -284,9 +284,19 @@ class Watchdog:
                     try:
                         log.info("attempting_recovery", component=name)
                         if asyncio.iscoroutinefunction(cb):
-                            await cb()
+                            result = await cb()
                         else:
-                            cb()
+                            result = cb()
+                        # W104: a recovery that REPORTS failure (ensure_connected
+                        # returns False when the reconnect did not work, it does
+                        # not raise) is a failed recovery. Counting it as success
+                        # marked a still-down broker HEALTHY and sent no page.
+                        # Only an explicit False means failure: None/True and
+                        # callbacks that return nothing keep their old meaning.
+                        if result is False:
+                            log.error("recovery_failed", component=name,
+                                      error="recovery callback reported failure")
+                            continue
                         recovered.append(name)
                         comp.error_count = 0
                         comp.status = ComponentStatus.HEALTHY
@@ -301,8 +311,8 @@ class Watchdog:
                             f"ALERT: {name} is DOWN and recovery failed. "
                             f"Errors: {comp.error_count}, Last: {comp.last_error}"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("watchdog_alert_failed", component=name, error=str(e))
 
         if recovered:
             # A recovery flips components back to HEALTHY in memory; push that

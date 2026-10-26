@@ -142,7 +142,10 @@ class RiskManager:
                 else:
                     break  # Streak ended
             return losing_streak
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # W104: sizing keeps its direction (no streak assumed), but a store
+            # read that fails no longer switches drawdown sizing off unseen.
+            log.warning("losing_days_count_failed", error=str(e))
             return 0
 
     # --- Aggregate capital-at-risk (R16) ---

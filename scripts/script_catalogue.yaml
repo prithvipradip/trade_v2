@@ -48,13 +48,13 @@ run_optimizer.py:
 
 status.py:
   group: Entry point
-  what: "Prints a status snapshot: whether the bot is running, last heartbeat and IB connection, today's events, open positions, realized P&L and the go-live scorecard. Does not connect to IB."
+  what: "Prints a status snapshot: whether the bot is running, last heartbeat and IB connection, today's events, whether alerts are being delivered (a line appears only while they are not), open positions, realized P&L and the go-live scorecard. Does not connect to IB."
   when: "Any time, including while the bot runs."
   needs_ib: "no"
-  writes: "nothing. It only runs SELECT queries on data/ait_state.db (the connection is not opened read-only) and reads the logs and the heartbeat file."
+  writes: "nothing. It only runs SELECT queries on data/ait_state.db (the connection is not opened read-only) and reads the logs, the heartbeat file and data/alert_channel.json."
   example: "python status.py"
   explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
-  stamp: "9ad733625f78"
+  stamp: "4b85a13f8f81"
 
 status_server.py:
   group: Entry point
@@ -64,7 +64,7 @@ status_server.py:
   writes: "nothing (the same SELECT-only queries as status.py)"
   example: "python status_server.py"
   explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
-  stamp: "873fa566e690"
+  stamp: "57abd0fb090f"
 
 web_logs.py:
   group: Entry point
