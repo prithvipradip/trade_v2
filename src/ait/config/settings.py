@@ -2563,6 +2563,17 @@ class ExitConfig(_StrictModel):
                     "case over the spot plus or minus this fraction (delayed quotes are "
                     "about 15 minutes old; 0.25% is about one standard deviation of that "
                     "move at 20% implied volatility). 0 uses the spot as given.")
+    exit_leave_out_unbid_wings: bool = Field(default=True,
+        description="A condor close does not include a long wing that nobody bids for "
+                    "(IB quotes the bid as -1) and that is worth no more than "
+                    "`exit_unbid_wing_max_ask`: a combo holding a leg to sell with no bid "
+                    "has no market and never fills, however high the limit. The wing is "
+                    "left to expire, both shorts stay in the close, and the reconciler is "
+                    "told to expect the leftover leg. false puts every leg in the combo.")
+    exit_unbid_wing_max_ask: float = Field(default=0.05, ge=0.0, le=0.25,
+        description="The most a long wing with no bid may be asked at and still be left "
+                    "out of the closing combo (`exit_leave_out_unbid_wings`). A wing "
+                    "asked above this keeps its place in the combo.")
     credit_touch_stop: bool = Field(default=True,
         description="W36: config home for AIT_CREDIT_TOUCH_STOP — close a "
                     "credit structure when the underlying touches a short "

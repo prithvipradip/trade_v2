@@ -4,7 +4,7 @@
 
 Every setting of the live bot and the supervisor, and the sections research shares (`ml`, `regime`, `meta_label`, `exit`, `options`, ...). Research-only settings (`backtest`, `parity`) are in [SETTINGS_RESEARCH.md](SETTINGS_RESEARCH.md). The *Shipped* column is what `config.yaml` sets; a key it does not list runs at the schema default. Explanations and the rules that link settings: [GUIDE.md](../GUIDE.md#13-configuration-system) and [MODELS.md](../MODELS.md). Secrets come only from `.env` and are never shown here.
 
-374 settings; 0 have no description in the schema yet (shown as `-`).
+376 settings; 0 have no description in the schema yet (shown as `-`).
 
 ## Trading universe, mode and cadence (`trading`)
 
@@ -375,6 +375,8 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | `exit.exit_intrinsic_floor_enabled` | `bool` | - | true | true | config.yaml | A condor close is never offered for less than the structure is worth at the underlying: its intrinsic value plus `exit_cross_amount`, never above the wing width. |
 | `exit.exit_near_expiry_dte` | `int` | 0 - 5 | 1 | 1 | config.yaml | Days to expiry at or below which a credit close that must get out (a stop, the short-strike touch, assignment risk, condor defense, the expiry exit; not a take-profit) may be offered up to the wing width (the most it can ever cost) and the intrinsic floor allows for a delayed spot (`exit_intrinsic_delayed_band_pct`). |
 | `exit.exit_intrinsic_delayed_band_pct` | `float` | 0.0 - 0.02 | 0.0025 | 0.0025 | config.yaml | Near expiry on delayed market data, the intrinsic floor is the worst case over the spot plus or minus this fraction (delayed quotes are about 15 minutes old; 0.25% is about one standard deviation of that move at 20% implied volatility). 0 uses the spot as given. |
+| `exit.exit_leave_out_unbid_wings` | `bool` | - | true | true | config.yaml | A condor close does not include a long wing that nobody bids for (IB quotes the bid as -1) and that is worth no more than `exit_unbid_wing_max_ask`: a combo holding a leg to sell with no bid has no market and never fills, however high the limit. |
+| `exit.exit_unbid_wing_max_ask` | `float` | 0.0 - 0.25 | 0.05 | 0.05 | config.yaml | The most a long wing with no bid may be asked at and still be left out of the closing combo (`exit_leave_out_unbid_wings`). |
 | `exit.credit_touch_stop` | `bool` | - | true | true | config.yaml | Config home for AIT_CREDIT_TOUCH_STOP — close a credit structure when the underlying touches a short strike. |
 | `exit.trailing_stop_pct` | `float` | 0.1 - 0.5 | 0.25 | 0.25 | config.yaml | Trailing stop distance below the high-water mark, as a fraction of cost (debit structures; credit structures use the short-strike touch exit). |
 | `exit.breakeven_trigger_pct` | `float` | 0.1 - 0.8 | 0.3 | 0.3 | config.yaml | Profit, as a fraction of cost, at which the stop moves to breakeven (debit structures). |

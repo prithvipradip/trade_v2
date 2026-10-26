@@ -39,7 +39,7 @@ from ait.execution.portfolio import PortfolioManager, PositionAction, PositionSt
 from ait.execution.reconciler import PositionReconciler
 from ait.execution.roll_booking import cas_roll_closing_trade, roll_order_ref, seed_roll_opening_trade
 from ait.execution.roll_comparison import ev_should_roll, heuristic_should_roll
-from ait.execution.roll_executor import prepare_roll_combo
+from ait.execution.roll_executor import poll_leg_quotes, prepare_roll_combo
 from ait.execution.roll_selector import RollTarget, select_roll_target
 from ait.config.invariants import LIVE_MAX_SPREAD_PCT, LIVE_MIN_VOLUME
 from ait.learning.adaptor import AdaptationLimits
@@ -4637,6 +4637,7 @@ class TradingOrchestrator:
     def _forget_commission_estimate(self, trade_id: str) -> None:
         try:
             self._state.delete_state(f"commission_est_{trade_id}")
+            self._state.delete_state(f"exit_excluded_legs_{trade_id}")
         except Exception:  # noqa: BLE001
             pass
 
@@ -4707,7 +4708,18 @@ class TradingOrchestrator:
                 return legs_n
         except Exception:  # noqa: BLE001
             pass
-        return 2 * legs_n
+        # W101: a close that left an unbid wing out of its combo never fills
+        # that leg: one exit row fewer.
+        return 2 * legs_n - self._excluded_exit_legs(trade.trade_id)
+
+    def _excluded_exit_legs(self, trade_id: str) -> int:
+        """W101: how many legs the last exit attempt left out of its combo."""
+        try:
+            raw = self._state.get_state(f"exit_excluded_legs_{trade_id}", "")
+            # Only a stored STRING counts (a mocked store returns a MagicMock).
+            return max(0, int(raw)) if isinstance(raw, str) and raw else 0
+        except Exception:  # noqa: BLE001
+            return 0
 
     @staticmethod
     def _legs_count(trade) -> int:
@@ -5208,10 +5220,20 @@ class TradingOrchestrator:
                 "_contract": qualified,
             })
 
+        # W101: a long wing nobody bids for cannot be sold, and a combo that
+        # holds a leg to sell with no bid has no market: IB accepts it at any
+        # limit and it never fills (paper probe 2026-10-26; the QQQ 772C wing
+        # was quoted -1/0.01 on all 176 closes of 2026-10-22/23). Such a wing is
+        # worth nothing; leave it out and let it expire. The combo and its leg
+        # pricing use ``priced_legs``; the structure's width and intrinsic
+        # floor keep the FULL ``legs`` (a three-leg condor has no width).
+        left_out = await self._unbid_wings_to_leave_out(trade, qualified_legs)
+        priced_legs = [l for i, l in enumerate(qualified_legs) if i not in left_out]
+
         combo = ContractBuilder.combo(
             symbol=trade.symbol,
             legs=[{k: v for k, v in l.items() if not k.startswith("_")}
-                  for l in qualified_legs],
+                  for l in priced_legs],
         )
 
         # The legs above are ALREADY reversed, so the combo order must be
@@ -5352,7 +5374,7 @@ class TradingOrchestrator:
         # formula-priced order.
         if limit_price is None:
             synth = await self._synthesize_combo_cost(
-                qualified_legs,
+                priced_legs,
                 credit_buyback=trade.strategy in CREDIT_STRATEGIES)
             if synth is not None:
                 limit_price = round(
@@ -5659,7 +5681,77 @@ class TradingOrchestrator:
         order.orderRef = trade.trade_id
         if not self._cas_to_closing(trade):
             return None
+        # W101: written BEFORE the order can fill (and so before the leftover
+        # leg can be seen without a trade), and on every attempt, so a later
+        # four-leg attempt overwrites an earlier three-leg one.
+        self._record_left_out_wings(trade, legs, left_out)
         return await self._ibkr.place_order(combo, order)
+
+    async def _unbid_wings_to_leave_out(self, trade: TradeRecord,
+                                        qualified_legs: list[dict]) -> set[int]:
+        """W101: indexes (into the reversed leg list) of the long wings a credit
+        close leaves out of its combo: no bid (IB's -1, or 0) and an ask at or
+        below ``exit_unbid_wing_max_ask``.
+
+        Only a leg the close would SELL can qualify (never a short), a missing
+        quote is "unknown" and keeps the leg in, and nothing is left out when
+        fewer than two legs, or no buy-back leg, would remain. Polling the
+        quotes does not count as a placement.
+        """
+        ex = self._settings.exit
+        # ``is True``: a stub or mocked settings object must not switch this on.
+        if getattr(ex, "exit_leave_out_unbid_wings", False) is not True:
+            return set()
+        if trade.strategy not in CREDIT_STRATEGIES:
+            return set()
+        sells = [(i, l) for i, l in enumerate(qualified_legs) if l["action"] == "SELL"]
+        if not sells:
+            return set()
+        max_ask = float(getattr(ex, "exit_unbid_wing_max_ask", 0.05))
+        try:
+            quotes = await poll_leg_quotes(
+                self._ibkr, [l["_contract"] for _, l in sells], rounds=5)
+        except Exception as e:  # noqa: BLE001 — never block an exit on this
+            log.warning("unbid_wing_poll_failed", trade_id=trade.trade_id, error=str(e))
+            return set()
+        out: set[int] = set()
+        for i, l in sells:
+            bid, ask = quotes.get(l["conId"], (None, None))
+            if bid == 0.0 and ask is not None and ask <= max_ask:
+                out.add(i)
+        buys = sum(1 for l in qualified_legs if l["action"] == "BUY")
+        if out and (len(qualified_legs) - len(out) < 2 or buys < 1):
+            return set()
+        for i in sorted(out):
+            bid, ask = quotes[qualified_legs[i]["conId"]]
+            log.warning("exit_unbid_wing_left_out", symbol=trade.symbol,
+                        trade_id=trade.trade_id, con_id=qualified_legs[i]["conId"],
+                        bid=bid, ask=ask, max_ask=max_ask,
+                        note="no bid, worth nothing: left out of the closing "
+                             "combo, it expires")
+        return out
+
+    def _record_left_out_wings(self, trade: TradeRecord, legs: list[dict],
+                               left_out: set[int]) -> None:
+        """W101: tell the rest of the bot which legs this close leaves at the
+        broker. ``exit_excluded_legs_<id>`` (how many; "0" when none) lets the
+        commission true-up expect the right number of fills;
+        ``residual_leg_<key>`` lets the reconciler expect the leftover leg."""
+        from ait.execution.reconciler import note_residual_leg, residual_leg_key
+        try:
+            self._state.set_state(f"exit_excluded_legs_{trade.trade_id}",
+                                  str(len(left_out)))
+            for i in sorted(left_out):
+                leg = legs[i]
+                expiry = leg.get("expiry", trade.expiry)
+                note_residual_leg(
+                    self._state,
+                    residual_leg_key(trade.symbol, leg["strike"], leg["right"], expiry),
+                    trade.trade_id,
+                    float(trade.quantity) * float(leg.get("ratio", 1)),
+                    expiry)
+        except Exception as e:  # noqa: BLE001 — the exit goes ahead; the cost is a later freeze
+            log.error("residual_leg_record_failed", trade_id=trade.trade_id, error=str(e))
 
     async def _post_market(self) -> None:
         """Post-market reconciliation, learning, and reporting."""
@@ -5694,6 +5786,9 @@ class TradingOrchestrator:
                 self._state.pending_trueup_trade_ids())
             for _k in self._state.state_keys_like("commission_est_%"):
                 if _k[len("commission_est_"):] not in _keep:
+                    self._state.delete_state(_k)
+            for _k in self._state.state_keys_like("exit_excluded_legs_%"):
+                if _k[len("exit_excluded_legs_"):] not in _keep:
                     self._state.delete_state(_k)
         except Exception as _e:  # noqa: BLE001
             log.warning("commission_est_key_sweep_failed", error=str(_e))

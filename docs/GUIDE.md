@@ -621,7 +621,7 @@ never logged, and are never copied into reports.
 | `dividends` | The same last-known-good and fail-closed policy for ex-dividend dates | 2 | `config.yaml` | [GUIDE.md](GUIDE.md#42-pre-execution-checks) |
 | `assignment_response` | Whether an at-risk short leg is closed or rolled to a later expiry (shipped as close only, rolls not executed) | 9 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits) |
 | `condor_defense` | The staged condor roll-and-defense feature (off by default) | 11 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits) |
-| `exit` | Exit rules: stops, the take-profit ladder, the touch stop, and the exit order's price and timers | 30 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits), [GUIDE.md](GUIDE.md#84-order-lifecycle-timeline) |
+| `exit` | Exit rules: stops, the take-profit ladder, the touch stop, and the exit order's price and timers | 32 | `config.yaml` | [GUIDE.md](GUIDE.md#9-position-management-and-exits), [GUIDE.md](GUIDE.md#84-order-lifecycle-timeline) |
 | `learning` | The bounded learning layer and paper-trading mode | 19 | `config.yaml` | [GUIDE.md](GUIDE.md#10-learning-and-adaptation) |
 | `sentiment` | Retired; nothing reads it | 1 | `config.yaml` | - |
 | `notifications` | The Telegram switch | 1 | `config.yaml` | [GUIDE.md](GUIDE.md#12-monitoring-and-operator-surfaces) |

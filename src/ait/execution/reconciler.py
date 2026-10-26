@@ -95,6 +95,69 @@ def _expiry_date(expiry):
         return None
 
 
+# W101: a long wing the bot deliberately left out of a closing combo (nobody
+# bids for it, so a combo holding it never fills) stays at the broker until it
+# expires. The orchestrator records it here when it places the close; the
+# untracked-option check below treats exactly that leg, at exactly that
+# quantity, as expected instead of freezing entries over it. One bot_state row
+# per leg, value {"trade_id", "qty", "expiry"}.
+RESIDUAL_LEG_PREFIX = "residual_leg_"
+#: IB drops an expired contract from the book overnight; a residual is still
+#: expected for this many days after its expiry.
+RESIDUAL_LEG_GRACE_DAYS = 1
+
+
+def residual_leg_key(symbol: str, strike: float, right: str, expiry: str) -> str:
+    """The position key of a residual leg, built exactly as the reconciler
+    builds the broker's keys."""
+    # float(): a trade's legs JSON may carry 772, the broker reports 772.0.
+    return PositionReconciler._make_position_key(symbol, float(strike), right, expiry)
+
+
+def note_residual_leg(state, key: str, trade_id: str, qty: float, expiry: str) -> None:
+    """Record that ``key`` is left at the broker on purpose (signed ``qty``)."""
+    state.set_state(RESIDUAL_LEG_PREFIX + key, json.dumps(
+        {"trade_id": trade_id, "qty": float(qty), "expiry": str(expiry)}))
+
+
+def is_expected_residual(state, key: str, qty: float, today) -> bool:
+    """True when ``key`` was left out of a close on purpose, the broker holds
+    exactly the recorded signed quantity, and the leg has not been expired for
+    longer than the grace. Anything else (another quantity, no record, a
+    record that outlived its leg) is NOT expected and freezes as before."""
+    try:
+        raw = state.get_state(RESIDUAL_LEG_PREFIX + key, "")
+        if not isinstance(raw, str) or not raw:
+            return False
+        rec = json.loads(raw)
+        if float(rec["qty"]) != float(qty):
+            return False
+        exp = _expiry_date(rec.get("expiry"))
+        if exp is None:
+            return False
+        return (today - exp).days <= RESIDUAL_LEG_GRACE_DAYS
+    except Exception:  # noqa: BLE001 — an unreadable record is simply not expected
+        return False
+
+
+def purge_residual_legs(state, broker_keys, today) -> int:
+    """Forget residual records whose leg is gone from the broker, or whose
+    expiry is past the grace. Returns how many were removed."""
+    removed = 0
+    for row in state.state_keys_like(RESIDUAL_LEG_PREFIX + "%"):
+        key = row[len(RESIDUAL_LEG_PREFIX):]
+        try:
+            rec = json.loads(state.get_state(row, "") or "{}")
+            exp = _expiry_date(rec.get("expiry"))
+        except Exception:  # noqa: BLE001
+            exp = None
+        stale = exp is None or (today - exp).days > RESIDUAL_LEG_GRACE_DAYS
+        if stale or key not in broker_keys:
+            state.delete_state(row)
+            removed += 1
+    return removed
+
+
 class PositionReconciler:
     """Reconciles local trade state with IBKR live positions."""
 
@@ -1649,6 +1712,16 @@ class PositionReconciler:
                                  qty=ibkr_pos["quantity"])
                         continue
 
+                    # W101: a wing the bot left out of its closing combo on
+                    # purpose (no bid, worth nothing) waits at the broker for
+                    # its expiry. Exactly that leg at exactly that quantity is
+                    # expected: no sighting, no discrepancy, no freeze.
+                    if is_expected_residual(
+                            self._state, key, ibkr_pos["quantity"], today_et()):
+                        log.info("expected_residual_leg_seen", position=key,
+                                 qty=ibkr_pos["quantity"])
+                        continue
+
                     # INST-3: a live OPTION at the broker with no local record
                     # = the mid-placement crash window. It has no stop, no TP,
                     # no expiry handling. Freeze new entries until a human
@@ -1830,6 +1903,21 @@ class PositionReconciler:
                          reason="all previously-frozen keys now declared or gone")
         except Exception as e:  # noqa: BLE001
             log.warning("halt_untracked_write_failed", error=str(e))
+
+        # W101: forget residual-leg records whose leg is gone or expired. Same
+        # authority as the declared-position cleanup below: an empty position
+        # cache that could not be confirmed flat proves nothing, so skip.
+        if positions_confirmed_flat:
+            try:
+                _gone = purge_residual_legs(
+                    self._state,
+                    fresh_declared_keys if fresh_declared_keys is not None
+                    else set(ibkr_map.keys()),
+                    today_et())
+                if _gone:
+                    log.info("residual_leg_records_purged", count=_gone)
+            except Exception as e:  # noqa: BLE001
+                log.warning("residual_leg_purge_failed", error=str(e))
 
         # W22: confirm + clean up any DECLARED position the operator has
         # since closed at the broker — the "confirms when it disappears"

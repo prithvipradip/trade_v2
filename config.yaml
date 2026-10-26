@@ -832,7 +832,12 @@ exit:
   exit_intrinsic_floor_enabled: true
   exit_near_expiry_dte: 1
   exit_intrinsic_delayed_band_pct: 0.0025
-  credit_touch_stop: true              # W36: home for AIT_CREDIT_TOUCH_STOP
+  # A long wing nobody bids for (bid -1) and asked at this or less is left out
+  # of the closing combo and expires; a combo that holds it never fills (paper
+  # probe 2026-10-26). false puts every leg in the combo.
+  exit_leave_out_unbid_wings: true
+  exit_unbid_wing_max_ask: 0.05
+  credit_touch_stop: true             # W36: home for AIT_CREDIT_TOUCH_STOP
   trailing_stop_pct: 0.25             # Trail 25% below high water mark
   breakeven_trigger_pct: 0.30         # Move stop to breakeven at +30% P&L
   initial_stop_loss_pct: 0.50         # Fixed stop before breakeven activates
