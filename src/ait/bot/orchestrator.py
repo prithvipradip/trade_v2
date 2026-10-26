@@ -484,7 +484,12 @@ class TradingOrchestrator:
             # R16: cooldown keyed PER COMPONENT — one global timestamp meant a
             # NEW, different critical arriving inside another component's hour
             # was silently swallowed. Key = first token of the message.
-            _component = (msg.split() or ["unknown"])[0]
+            # W104: the message is "ALERT: <component> is DOWN ...", so the first
+            # token was always "ALERT:" and the cooldown was one global hour
+            # after all. Key on the component name.
+            _parts = msg.split()
+            _component = (_parts[1] if len(_parts) > 1 and _parts[0] == "ALERT:"
+                          else (_parts or ["unknown"])[0])
             if self._alert_gate(f"watchdog:{_component}", interval_s=3600):
                 await self._send_notification(f"WATCHDOG {msg}")
         self._watchdog.set_alert_callback(_wd_alert)
@@ -959,17 +964,29 @@ class TradingOrchestrator:
         # refused fill overwrote the first and only the last was ever paged.
         # The executor now writes alert_fill_after_close_<trade_id>; drain
         # every such key (and the pre-W32 bare key, if one is still stored).
+        # W104: page BEFORE deleting the flag (a crash between the two re-pages
+        # instead of losing the page), log instead of swallowing, and also page
+        # the flags the executor could not write (kept in its memory).
         try:
             for _k in list(self._state.state_keys_like("alert_fill_after_close%")):
                 _fac = self._state.get_state(_k, "")
-                self._state.delete_state(_k)
                 if _fac:
                     await self._send_notification(
                         f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
                         "A REAL position may be live at the broker with no "
                         "managing row — check TWS and the untracked-option freeze.")
-        except Exception:  # noqa: BLE001
-            pass
+                self._state.delete_state(_k)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("fill_after_close_drain_failed", error=str(_e))
+        try:
+            for _fac in self._executor.take_unflagged_fill_alerts():
+                await self._send_notification(
+                    f"CRITICAL: fill landed on a TERMINAL trade row ({_fac}). "
+                    "A REAL position may be live at the broker with no "
+                    "managing row — check TWS and the untracked-option freeze. "
+                    "(The database flag for this could not be written.)")
+        except Exception as _e:  # noqa: BLE001
+            log.warning("fill_after_close_unflagged_drain_failed", error=str(_e))
 
         try:
             pending = self._state.pending_exit_bookings(older_than_seconds=120.0)
@@ -1008,12 +1025,19 @@ class TradingOrchestrator:
                 except Exception:  # noqa: BLE001
                     exit_d = None
                 if exit_d is None:
-                    # No usable exit_time: there is no day to credit. Claimed
-                    # (never resurfaces), logged for the human ledger.
-                    self._state.complete_exit_booking(trade_id)
-                    log.warning("stale_exit_booking_skipped", trade_id=trade_id,
-                                exit_time=row["exit_time"], pnl=pnl)
-                    continue
+                    # W104: there is no day to credit, but dropping the row (as this
+                    # did) kept the P&L out of daily stats, the breaker, PDT and
+                    # Thompson with a single warning. A close that really happened
+                    # is booked as TODAY's session: a wrong attribution day is the
+                    # smaller error. Named at error level and paged.
+                    exit_d = today
+                    log.error("exit_outbox_exit_time_unparseable", trade_id=trade_id,
+                              exit_time=str(row["exit_time"])[:60], pnl=pnl,
+                              note="booked as today's session")
+                    await self._send_notification(
+                        f"EXIT BOOKING: {trade_id} has an unreadable exit time "
+                        f"({str(row['exit_time'])[:40]!r}); its P&L ${pnl:.2f} is booked "
+                        f"as today's session. Check the trades table.")
                 if exit_d != today:
                     # W37 (register time-calendar-03): stats and the breaker
                     # are DAILY quantities, so a prior-day close must not enter
@@ -1642,8 +1666,8 @@ class TradingOrchestrator:
                 if wd_tick % 10 == 0:
                     try:
                         await self._watchdog.check_and_recover()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("watchdog_check_failed", error=str(e))
             except Exception as e:
                 log.error("trading_cycle_error", error=str(e))
                 await self._note_loop_error("trading_cycle_error", str(e))
@@ -1694,6 +1718,38 @@ class TradingOrchestrator:
                 self._circuit_breaker.record_api_failure()
                 self._watchdog.record_error("trading_loop", str(e))
 
+    async def _check_breaker_store(self) -> None:
+        """W104: page when the circuit breaker's state cannot be written.
+
+        A trip whose write failed lives only in this process: a crash before the
+        next successful write forgets it and the bot resumes trading through a
+        tripped breaker. The failure was recorded (``store_write_healthy``, W42)
+        but nothing read it. Retry the write once per cycle; if the store is
+        still unhealthy, log critical and page (at most every 30 minutes).
+        """
+        try:
+            cb = self._circuit_breaker
+            healthy = bool(cb.get_status().store_write_healthy)
+            if not healthy:
+                healthy = bool(cb.retry_persist())
+            was_unhealthy = getattr(self, "_cb_store_unhealthy", False)
+            if healthy:
+                if was_unhealthy:
+                    self._cb_store_unhealthy = False
+                    log.info("circuit_breaker_store_recovered")
+                return
+            self._cb_store_unhealthy = True
+            log.critical("circuit_breaker_store_unhealthy",
+                         note="breaker state is not on disk; a crash now forgets it")
+            if self._alert_gate("cb_store", interval_s=1800):
+                await self._send_notification(
+                    "CIRCUIT BREAKER STATE NOT SAVED: the breaker's counters and any "
+                    "trip are not being written to the database. A crash now would "
+                    "forget them and the bot would resume trading. Check data/ait_state.db "
+                    "(locked? disk full?).")
+        except Exception as e:  # noqa: BLE001 — a monitoring check must not stop the cycle
+            log.warning("circuit_breaker_store_check_failed", error=str(e))
+
     async def _trading_cycle(self) -> None:
         """Single trading cycle: scan all symbols, check positions, execute signals."""
         # R13 (human-factors): make the entry-freeze state OBSERVABLE. The
@@ -1709,6 +1765,8 @@ class TradingOrchestrator:
                 log.warning("entries_frozen", halt_files=_halts)
         except Exception:  # noqa: BLE001
             pass
+
+        await self._check_breaker_store()
 
         # 1. Check circuit breaker
         if self._circuit_breaker.is_tripped:
@@ -6514,6 +6572,7 @@ class TradingOrchestrator:
             # 3-attempt logic was unreachable and a dead Telegram channel was
             # invisible. False now retries; 5 consecutive definitive failures
             # write data/TELEGRAM_DEAD (surfaced by the supervisor digest).
+            _auth = False
             for attempt in range(3):
                 try:
                     ok = await self._notify(msg)
@@ -6522,19 +6581,35 @@ class TradingOrchestrator:
                         return
                     log.warning("notification_attempt_returned_false",
                                 attempt=attempt + 1)
+                    # W104: a revoked token (HTTP 401/403) cannot be fixed by
+                    # retrying; stop after the first attempt and say so.
+                    if getattr(getattr(self, "_telegram", None),
+                               "last_error_kind", None) == "auth":
+                        _auth = True
+                        break
                 except Exception as e:  # noqa: BLE001
                     log.warning("notification_attempt_failed",
                                 attempt=attempt + 1, error=str(e)[:200])
                 await asyncio.sleep(2 * (attempt + 1))
             log.error("notification_dropped_after_retries", preview=msg[:80])
             self._tg_fail_streak = getattr(self, "_tg_fail_streak", 0) + 1
-            if self._tg_fail_streak >= 5:
+            if _auth:
+                log.critical("telegram_unauthorized",
+                             note="Telegram rejected the token or chat id (401/403): "
+                                  "alerts are NOT reaching you. Rotate/fix TELEGRAM_BOT_TOKEN "
+                                  "in .env and restart the bot.")
+            if _auth or self._tg_fail_streak >= 5:
                 try:
-                    from pathlib import Path as _PTD
-                    _PTD("data/TELEGRAM_DEAD").write_text(
-                        f"{self._tg_fail_streak} consecutive dropped alerts")
+                    # W104: absolute (the bot's cwd is not guaranteed), and it
+                    # says WHY, so the supervisor's page is not a guess.
+                    from ait.notifications.channel_state import marker_path as _mp_dead
+                    _marker = _mp_dead()
+                    _marker.write_text(
+                        ("unauthorized (HTTP 401/403): token or chat id rejected"
+                         if _auth else
+                         f"{self._tg_fail_streak} consecutive dropped alerts"))
                     log.critical("telegram_channel_dead",
-                                 streak=self._tg_fail_streak)
+                                 streak=self._tg_fail_streak, unauthorized=_auth)
                 except Exception:  # noqa: BLE001
                     pass
 

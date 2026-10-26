@@ -391,6 +391,8 @@ class TradeExecutor:
             _exit_cfg_w70, "zombie_exit_revert_seconds", cls._zombie_revert_s)
         self._pending_orders: dict[int, PendingOrder] = {}  # order_id → PendingOrder
         self._pending_exit_orders: dict[int, PendingExitOrder] = {}  # order_id → PendingExitOrder
+        # W104: "fill landed on a terminal row" pages whose database flag could not be written.
+        self._unflagged_fill_alerts: list[str] = []
         # W61: a roll's single 4-leg fill books TWO trades (closing + opening)
         # -- deliberately isolated from the two dicts above, never touched by
         # the entry/exit loops or _cancel_stale_orders (both iterate their own
@@ -3002,6 +3004,24 @@ class TradeExecutor:
 
         return round(pnl, 2)
 
+    def _flag_fill_after_close(self, trade_id: str, text: str) -> None:
+        """W104: record that a fill was refused by a terminal row, so the
+        orchestrator's drain pages it. The flag is the ONLY way this reaches a
+        human; a failed write used to vanish (``except: pass``) together with the
+        page for a possibly unmanaged live position. A failed write now logs
+        critical and keeps the text in memory for the drain."""
+        try:
+            self._state.set_state(f"alert_fill_after_close_{trade_id}", text)
+        except Exception as e:  # noqa: BLE001
+            self._unflagged_fill_alerts.append(text)
+            log.critical("fill_after_close_flag_write_failed", trade_id=trade_id,
+                         detail=text, error=str(e))
+
+    def take_unflagged_fill_alerts(self) -> list[str]:
+        """The texts whose flag write failed, handed over once for paging."""
+        out, self._unflagged_fill_alerts = self._unflagged_fill_alerts, []
+        return out
+
     @staticmethod
     def commission_estimate(trade) -> float:
         """Round-trip commission ESTIMATE, all-in per contract-leg.
@@ -3160,14 +3180,11 @@ class TradeExecutor:
                     note="row already closed/cancelled — a REAL position may "
                          "be live at the broker with no managing trade row",
                 )
-                try:
-                    # W32: keyed per trade — the single key was overwritten by
-                    # the next refusal and only the last was ever paged.
-                    self._state.set_state(
-                        f"alert_fill_after_close_{pending.trade_id}",
-                        f"{pending.trade_id}|{signal.symbol}|{actual_price}")
-                except Exception:  # noqa: BLE001
-                    pass
+                # W32: keyed per trade — the single key was overwritten by
+                # the next refusal and only the last was ever paged.
+                self._flag_fill_after_close(
+                    pending.trade_id,
+                    f"{pending.trade_id}|{signal.symbol}|{actual_price}")
                 return
 
         # Book the REAL fill into trades.entry_price (audit R2/C1): it was
@@ -3254,12 +3271,9 @@ class TradeExecutor:
                     trade_id=pending.trade_id, symbol=signal.symbol,
                     filled_qty=filled_qty, current_status=_cur,
                 )
-                try:
-                    self._state.set_state(
-                        f"alert_fill_after_close_{pending.trade_id}",
-                        f"{pending.trade_id}|{signal.symbol}|partial:{filled_qty}")
-                except Exception:  # noqa: BLE001
-                    pass
+                self._flag_fill_after_close(
+                    pending.trade_id,
+                    f"{pending.trade_id}|{signal.symbol}|partial:{filled_qty}")
                 return
             log.warning(
                 "partial_fill_cas_refused_row_already_filled",

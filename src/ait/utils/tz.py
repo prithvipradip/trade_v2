@@ -56,3 +56,30 @@ def parse_trade_ts(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=ET)
     return parsed.astimezone(ET)
+
+
+def assume_market_open_on_clock(now: datetime | None = None) -> bool:
+    """Calendar-FREE conservative answer to "is the market open?".
+
+    Used only when the NYSE calendar is unavailable. A weekday 09:30-16:00 ET
+    is treated as "may be open". Resolves ET through stdlib ``zoneinfo``, not
+    ``ait.utils.time`` — the latter imports ``pandas_market_calendars`` at
+    module scope, so in the very scenario that calls this it may be the thing
+    that is broken.
+
+    W20d — on the DIRECTION of this heuristic, because it looks like the one
+    W15 deleted: W15 removed ``weekday() < 5`` from the pre-event blackout
+    because counting a holiday as a session made that gate fail OPEN. Here the
+    same heuristic errs the other way. Every caller asks "is it open?" in order
+    to be MORE cautious when the answer is yes, so a holiday wrongly counted as
+    a session only defers a restart or keeps hang-detection armed. Never
+    reuse it anywhere the true branch is the permissive one.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _et = _ZI("US/Eastern")
+    n = now or datetime.now(_et)
+    n = n.replace(tzinfo=_et) if n.tzinfo is None else n.astimezone(_et)
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)

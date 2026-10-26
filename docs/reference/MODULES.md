@@ -164,6 +164,7 @@ Monitoring package.
 
 | Module | What it is |
 |---|---|
+| `channel_state.py` | Is the alert channel delivering? One small file both processes write . |
 | `telegram.py` | Telegram notifications for trade alerts and daily summaries. |
 
 ## `optimization/`

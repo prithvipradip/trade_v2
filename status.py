@@ -89,6 +89,13 @@ def _ib_endpoint() -> dict:
     return {"record": rec, "mismatch": endpoint_mismatch_text(rec)}
 
 
+def _alert_channel() -> dict | None:
+    """W104: None while alerts are being delivered; else {failing_since, kind, count, source}
+    (data/alert_channel.json, written by whichever process last failed to send)."""
+    from ait.notifications.channel_state import read
+    return read()
+
+
 def _last_connect() -> str:
     for ln in reversed(_tail_lines(LOGS / "ait.log", 3000)):
         if "ibkr_connected" in ln:
@@ -153,6 +160,7 @@ def get_status() -> dict:
         "last_heartbeat": _last_heartbeat(),
         "last_connect": _last_connect(),
         "ib_endpoint": _ib_endpoint(),
+        "alert_channel": _alert_channel(),
         "crashes": _crash_count(),
         "keeper_relaunches": _keeper_relaunches(),
         "readonly": _readonly_recent(),
@@ -228,6 +236,10 @@ def main() -> None:
     print(f"  last IBKR connect: {s['last_connect']}")
     if s["ib_endpoint"]["mismatch"]:
         print(f"  IB endpoint      : {s['ib_endpoint']['mismatch']}")
+    if s.get("alert_channel"):
+        ac = s["alert_channel"]
+        print(f"  ALERTS NOT DELIVERED: failing since {ac.get('failing_since')} "
+              f"({ac.get('kind')}, {ac.get('count')} failures, first seen by {ac.get('source')})")
     print(f"  native crashes   : {s['crashes']}")
     print(f"  keeper relaunches: {s['keeper_relaunches']}")
     print(f"  read-only recent : {'YES — orders may be rejected!' if s['readonly'] else 'no'}")

@@ -607,13 +607,28 @@ class LivenessVerdict:
         return self.ok
 
 
-def _default_market_open() -> tuple[bool, int | None]:
-    """(market_open, minutes_since_open) - never raises."""
+def _default_market_open() -> tuple[bool, int | None, bool]:
+    """(market_open, minutes_since_open, calendar_ok) - never raises.
+
+    W104: when the NYSE calendar cannot be consulted, answer from the host clock
+    (a weekday 09:30-16:00 ET counts as "may be open") instead of "closed". The
+    old answer made ``bot_liveness`` report ``not_rth`` / ok in the middle of a
+    session, so the dashboard panel and the dead-man ping read a dead bot as
+    healthy for exactly as long as the calendar was broken. The clock answer errs
+    toward checking: on a holiday it asks for a heartbeat that is legitimately
+    absent, which is a false alarm, not a missed one.
+    """
     try:
         from ait.utils.time import is_market_open, minutes_since_open
-        return bool(is_market_open()), minutes_since_open()
+        return bool(is_market_open()), minutes_since_open(), True
     except Exception:  # noqa: BLE001 - a calendar import must not gate alerting
-        return False, None
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        from ait.utils.tz import assume_market_open_on_clock
+        now_et = _dt.now(_ZI("US/Eastern"))
+        is_open = assume_market_open_on_clock(now_et)
+        mins = (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30) if is_open else None
+        return is_open, mins, False
 
 
 def bot_liveness(
@@ -629,14 +644,22 @@ def bot_liveness(
 
     ``market_open``/``minutes_since_open`` are injectable so callers (and
     tests) do not pay for the NYSE calendar; when omitted they come from
-    ``ait.utils.time``.  A calendar failure degrades to "not RTH" - that
-    preserves today's behaviour instead of inventing a new page.
+    ``ait.utils.time``.  W104: a calendar failure is judged on the host clock
+    (see ``_default_market_open``) and the verdict's detail says so; it used to
+    degrade to "not RTH", which read a dead bot as healthy during a session.
     """
     now = now or datetime.now()
+    calendar_note = ""
     if market_open is None:
-        market_open, cal_minutes = _default_market_open()
+        market_open, cal_minutes, _cal_ok = _default_market_open()
         if minutes_since_open is None:
             minutes_since_open = cal_minutes
+        if not _cal_ok:
+            calendar_note = " [calendar_fault: market hours judged on the host clock]"
+
+    def _verdict(**kw) -> "LivenessVerdict":
+        kw["detail"] = kw["detail"] + calendar_note
+        return LivenessVerdict(**kw)
 
     hb = Path(heartbeat_path)
     age: float | None = None
@@ -646,7 +669,7 @@ def bot_liveness(
         age = None
 
     if not market_open:
-        return LivenessVerdict(
+        return _verdict(
             ok=True,
             state="not_rth",
             detail=("market closed - the trading loop legitimately stops "
@@ -656,7 +679,7 @@ def bot_liveness(
         )
 
     if minutes_since_open is not None and minutes_since_open * 60.0 < warmup_s:
-        return LivenessVerdict(
+        return _verdict(
             ok=True,
             state="warmup",
             detail=(f"within the first {warmup_s / 60:.0f} min of RTH - a keeper "
@@ -666,7 +689,7 @@ def bot_liveness(
         )
 
     if age is None:
-        return LivenessVerdict(
+        return _verdict(
             ok=False,
             state="heartbeat_missing",
             detail=(f"{hb} missing during RTH - no evidence the trading loop "
@@ -676,7 +699,7 @@ def bot_liveness(
         )
 
     if age > max_age_s:
-        return LivenessVerdict(
+        return _verdict(
             ok=False,
             state="heartbeat_stale",
             detail=(f"trading-loop heartbeat {age / 60:.0f} min stale during RTH "
@@ -686,7 +709,7 @@ def bot_liveness(
             rth=True,
         )
 
-    return LivenessVerdict(
+    return _verdict(
         ok=True,
         state="heartbeat_fresh",
         detail=f"trading-loop heartbeat {age:.0f}s old during RTH",

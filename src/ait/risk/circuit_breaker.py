@@ -197,6 +197,18 @@ class CircuitBreaker:
             self._persist_write_failed = True
             log.error("circuit_breaker_state_persist_failed", error=str(e))
 
+    def retry_persist(self) -> bool:
+        """W104: write the state again and report whether the store is healthy.
+
+        ``_persist`` only runs when a state-changing method calls it, so after a
+        failed write the flag stayed up (and a trip stayed off the disk) until
+        the next trade result. The orchestrator calls this each cycle while the
+        store is unhealthy, so a transient lock heals itself and a persistent
+        failure keeps paging.
+        """
+        self._persist()
+        return not getattr(self, "_persist_write_failed", False)
+
     def _blob(self) -> str:
         return json.dumps({
             "date": self._last_reset_date.isoformat(),

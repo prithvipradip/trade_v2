@@ -28,6 +28,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from zoneinfo import ZoneInfo
 
+from ait.notifications import channel_state  # stdlib-only leaf
 from ait.utils.cadence import SUPERVISOR_REAP_SECONDS, SUPERVISOR_STOP_WAIT_SECONDS  # stdlib-only leaf
 from ait.utils.process import scan_pids
 
@@ -132,8 +133,10 @@ def _alert(message: str) -> bool:
             # one transient settings failure. Leave None so the next alert
             # retries the load.
             _TG_CREDS = None
+            _channel_failed(channel_state.TRANSIENT)
             return False
     if not _TG_CREDS or not _TG_CREDS[0] or not _TG_CREDS[1]:
+        _channel_failed(channel_state.NO_CREDS)
         return False
     token, chat_id = _TG_CREDS
     try:
@@ -147,12 +150,51 @@ def _alert(message: str) -> bool:
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage", data=data)
         urllib.request.urlopen(req, timeout=10)
+        channel_state.record_success("supervisor")
         return True
     except Exception as e:  # noqa: BLE001
         import re as _re
-        _log("warn", "alert_send_failed",
+        # W104: say WHAT failed. A 401/403 is a revoked or wrong token: drop the
+        # cached credentials so the next attempt re-reads .env (a rotated token
+        # then works without restarting the supervisor).
+        _code = getattr(e, "code", None)
+        kind = channel_state.classify_status(_code if isinstance(_code, int) else None)
+        if kind == channel_state.AUTH:
+            _TG_CREDS = None
+        _log("warn", "alert_send_failed", kind=kind,
+             status=_code if isinstance(_code, int) else None,
              error=_re.sub(r"/bot[^/\s]+", "/bot***", str(e))[:300])  # never leak the token via exception URLs
+        _channel_failed(kind)
         return False
+
+
+def _channel_failed(kind: str) -> None:
+    """W104: note a failed supervisor send in data/alert_channel.json (what the
+    status page shows) and, once the channel has clearly stopped delivering, raise
+    a LOCAL notification: the Telegram channel cannot report its own death."""
+    channel_state.record_failure("supervisor", kind)
+    rec = channel_state.read()
+    if rec and (rec.get("kind") == channel_state.AUTH or int(rec.get("count", 0)) >= 3):
+        if _durable_alert_gate("alert_channel_local", 3600):
+            _local_notify("Telegram alerts are NOT being delivered "
+                          f"({rec.get('kind')}, since {rec.get('failing_since')}). "
+                          "Check TELEGRAM_BOT_TOKEN in .env.")
+
+
+def _local_notify(text: str) -> None:
+    """Last-resort on-screen notification. macOS only (the operator's machine);
+    the Windows box has no equivalent yet. Best-effort, never raises."""
+    if sys.platform != "darwin":
+        return
+    try:
+        safe = text.replace("\\", " ").replace('"', "'")[:200]
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe}" with title "AIT: alerts not delivered"'],
+            timeout=10, check=False, capture_output=True)
+        _log("warn", "alert_channel_local_notification")
+    except Exception as e:  # noqa: BLE001
+        _log("warn", "alert_channel_local_notification_failed", error=str(e))
 
 
 # R16 #54: per-key alert cooldowns. A single shared timestamp for a class of
@@ -196,6 +238,14 @@ def _durable_alert_gate(key: str, interval_s: float) -> bool:
         except OSError:
             continue
     return True
+
+
+def _alert_gate_release(key: str) -> None:
+    """W104: forget a recorded attempt, for a page that did NOT go out. The gate
+    records the attempt before the send (so a dead channel is probed once per
+    interval); for a page that matters, a failed send must not silence the key
+    for the whole window."""
+    _ALERT_GATE_LAST.pop(key, None)
 
 
 def _alert_gate(key: str, interval_s: float, _now: float | None = None) -> bool:
@@ -662,31 +712,15 @@ def _clear_dashboard_port(port: int) -> bool:
     return False
 
 
+# W104: the function now lives in ait.utils.tz (stdlib-only) so the liveness probe can
+# use it too; the name stays here because the supervisor and its tests use it.
+from ait.utils.tz import assume_market_open_on_clock as _assume_market_open_on_clock_at  # noqa: E402
+
+
 def _assume_market_open_on_clock(now: datetime | None = None) -> bool:
-    """Calendar-FREE conservative answer to "is the market open?".
-
-    Used only when the NYSE calendar is unavailable. A weekday 09:30-16:00 ET
-    is treated as "may be open". Resolves ET through stdlib ``zoneinfo``, not
-    ``ait.utils.time`` — the latter imports ``pandas_market_calendars`` at
-    module scope, so in the very scenario that calls this it may be the thing
-    that is broken.
-
-    W20d — on the DIRECTION of this heuristic, because it looks like the one
-    W15 deleted: W15 removed ``weekday() < 5`` from the pre-event blackout
-    because counting a holiday as a session made that gate fail OPEN. Here the
-    same heuristic errs the other way. Every caller asks "is it open?" in order
-    to be MORE cautious when the answer is yes, so a holiday wrongly counted as
-    a session only defers a restart or keeps hang-detection armed. Never
-    reuse it anywhere the true branch is the permissive one.
-    """
-    from zoneinfo import ZoneInfo as _ZI
-    _et = _ZI("US/Eastern")
-    n = now or datetime.now(_et)
-    n = n.replace(tzinfo=_et) if n.tzinfo is None else n.astimezone(_et)
-    if n.weekday() >= 5:
-        return False
-    mins = n.hour * 60 + n.minute
-    return (9 * 60 + 30) <= mins < (16 * 60)
+    """Calendar-free "may the market be open?" (rule and rationale: ait.utils.tz).
+    The clock is read here, through this module's ``datetime``, as it always was."""
+    return _assume_market_open_on_clock_at(now or datetime.now(ZoneInfo("US/Eastern")))
 
 
 def _in_post_market_window(now: datetime | None = None,
@@ -1172,9 +1206,10 @@ class BotManager:
                         _log("error", "bot_hung_heartbeat_stale",
                              age_min=round(_age_min))
                         if _alert_gate("bot_hung_heartbeat_stale", 1800.0):
-                            _alert(f"BOT HUNG: trading-loop heartbeat {_age_min:.0f} "
-                                   f"min stale during market hours — restarting the "
-                                   f"bot. Positions were unmanaged for that window.")
+                            if not _alert(f"BOT HUNG: trading-loop heartbeat {_age_min:.0f} "
+                                          f"min stale during market hours — restarting the "
+                                          f"bot. Positions were unmanaged for that window."):
+                                _alert_gate_release("bot_hung_heartbeat_stale")
                         # W46: spend the SAME restart budget every other
                         # recovery path in this file uses, instead of
                         # bypassing it via the `return` below -- a genuine
