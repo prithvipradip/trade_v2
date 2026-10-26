@@ -435,8 +435,16 @@ class StateManager:
         commission: float = 0.0,
         exit_reason_detailed: str = "",
         from_statuses: tuple[TradeStatus, ...] | None = None,
+        exit_time: str | None = None,
     ) -> bool:
         """Mark a trade as closed with exit details and journaling data.
+
+        W101: ``exit_time`` (ISO, timezone-aware) books the close to the
+        session it belongs to instead of now: the reconciler passes the expiry
+        date for a structure it finds expired, so the loss is credited to that
+        day's stats and not to today's circuit breaker (the exit outbox row
+        carries the same time, and the drain decides prior-session booking
+        from it). Default: now.
 
         R12 Tier-A #1: the close is a compare-and-swap from an OPEN status
         (PENDING/FILLED/PARTIAL/CLOSING) only. A trade that is already CLOSED
@@ -460,7 +468,7 @@ class StateManager:
         behaviour silently discarded every partial slice's P&L when the
         DELETE below ran.
         """
-        now = now_et().isoformat()
+        now = exit_time or now_et().isoformat()
 
         # Compute journaling fields
         peak_pnl_pct = self.get_high_water_mark(trade_id)

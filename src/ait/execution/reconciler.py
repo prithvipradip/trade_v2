@@ -13,7 +13,8 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as _dtime
+from zoneinfo import ZoneInfo
 
 from ait.broker.ibkr_client import IBKRClient
 from ait.bot.state import StateManager, TradeStatus
@@ -81,6 +82,19 @@ class ReconciliationResult:
     closing_roll_orders: dict[str, int] = field(default_factory=dict)
 
 
+def _expiry_date(expiry):
+    """The date of an option expiry string ("2026-10-23" or "20261023"), or None.
+    An expiry is a DATE, not a trade timestamp: it has no offset to lose, which
+    is why this parse lives outside the functions that handle trade timestamps
+    (the W21 class guard holds those to ``parse_trade_ts``)."""
+    if not expiry:
+        return None
+    try:
+        return datetime.fromisoformat(str(expiry)).date()
+    except ValueError:
+        return None
+
+
 class PositionReconciler:
     """Reconciles local trade state with IBKR live positions."""
 
@@ -100,6 +114,30 @@ class PositionReconciler:
         `PositionReconciler(ibkr, state)` call sites (tests included) don't
         need to change."""
         self._telegram = telegram
+
+    def set_settlement_source(self, fn) -> None:
+        """W101: wire in ``fn(symbol, date) -> official close | None``, the
+        underlying's close on a PAST date (the expiry session). Without it an
+        expired structure is valued from a live snapshot of the underlying,
+        which is today's price, not the settlement. A setter for the same
+        reason as set_telegram: ``PositionReconciler(ibkr, state)`` call sites
+        (tests included) stay valid."""
+        self._settlement_close = fn
+
+    def _settlement_price(self, symbol: str, expiry_d) -> float | None:
+        """W101: the underlying's official close on its expiry date, or None
+        (no source wired, no row, or a value that is not a finite positive
+        number)."""
+        fn = getattr(self, "_settlement_close", None)
+        if fn is None:
+            return None
+        try:
+            px = float(fn(symbol, expiry_d))
+        except Exception as e:  # noqa: BLE001 — a bad source must never block booking
+            log.warning("settlement_source_failed", symbol=symbol,
+                        expiry=str(expiry_d), error=str(e))
+            return None
+        return px if math.isfinite(px) and px > 0 else None
 
     @staticmethod
     def _normalize_expiry(expiry: str | None) -> str:
@@ -484,24 +522,53 @@ class PositionReconciler:
                          note="a leg's broker P&L is not finite — NOT booked as "
                               "broker-derived; using the review path instead")
 
+        # W101: the expiry session. A structure that expired is valued at the
+        # underlying's OFFICIAL close on its expiry date and booked to that
+        # session, not valued at a live snapshot of today's price and dated
+        # today (2026-10-23 QQQ condor, closing 704.40: booked at whatever QQQ
+        # trades at when the bot next starts, with the loss landing on that
+        # day's circuit breaker). The broker's per-leg realizedPNL, when it is
+        # usable, is still used first (operator decision); when it differs from
+        # the settlement value the difference is logged, because after an
+        # assignment IB can fold the put premium into the stock's cost basis.
+        expiry_d = _expiry_date(trade.expiry)
+        _today = today_et()
+        settle_due = expiry_d is not None and (
+            expiry_d < _today
+            or (expiry_d == _today and now_et().time() >= _dtime(16, 15)))
+        settlement_px = (self._settlement_price(trade.symbol, expiry_d)
+                         if settle_due else None)
+        if settlement_px is not None and found_ibkr_pnl:
+            _si = self._structure_intrinsic(trade, settlement_px)
+            if _si is not None and trade.entry_price > 0:
+                _mult = 100 if trade.contract_type != "stock" else 1
+                _spnl = ((trade.entry_price - _si) if trade.strategy in CREDIT_STRATEGIES
+                         else (_si - trade.entry_price)) * _mult * trade.quantity
+                if abs(_spnl - realized_pnl) >= 1.0:
+                    log.warning("reconcile_expired_broker_pnl_differs_from_settlement",
+                                trade_id=trade.trade_id,
+                                broker_realized_sum=round(realized_pnl, 2),
+                                settlement_value=round(_spnl, 2), settle_px=settlement_px,
+                                note="booked at the broker's figure; check it against "
+                                     "the settlement value")
+        # The session the close belongs to (None = now, as before).
+        booked_at = (datetime.combine(expiry_d, _dtime(16, 0),
+                                      tzinfo=ZoneInfo("America/New_York")).isoformat()
+                     if expiry_d is not None and expiry_d < _today else None)
+
         if not found_ibkr_pnl and trade.entry_price > 0:
             # No IBKR data. Only assume "expired worthless" when the
             # position has actually reached expiry; a position that
             # vanished mid-life was closed at an unknown price and
             # recording a full win/loss would be fiction.
-            expired = False
-            if trade.expiry:
-                try:
-                    # W73: the ET date, not the host's. `datetime.now().date()`
-                    # is tomorrow's date from 18:00 ET on a CEST host, so a
-                    # position that vanished the evening BEFORE its expiry was
-                    # booked "expired" at intrinsic (a fabricated P&L) instead
-                    # of flagged for review. Same class as W28; this site was
-                    # missed because that guard looks for `.today()`, not
-                    # `.now().date()`. Semantics (<=) are unchanged.
-                    expired = datetime.fromisoformat(trade.expiry).date() <= today_et()
-                except ValueError:
-                    pass
+            # W73: the ET date, not the host's. `datetime.now().date()`
+            # is tomorrow's date from 18:00 ET on a CEST host, so a
+            # position that vanished the evening BEFORE its expiry was
+            # booked "expired" at intrinsic (a fabricated P&L) instead
+            # of flagged for review. Same class as W28; this site was
+            # missed because that guard looks for `.today()`, not
+            # `.now().date()`. Semantics (<=) are unchanged.
+            expired = expiry_d is not None and expiry_d <= today_et()
 
             multiplier = 100 if trade.contract_type != "stock" else 1
             if expired:
@@ -513,7 +580,27 @@ class PositionReconciler:
                 # expiry from intrinsic using the underlying's price; if
                 # the underlying price can't be fetched, refuse to invent
                 # a number and fall through to the review path.
-                settle_px = await self._underlying_last(trade.symbol)
+                if settlement_px is not None:
+                    settle_px, price_src = settlement_px, "settlement_close"
+                else:
+                    settle_px = await self._underlying_last(trade.symbol)
+                    price_src = "live_snapshot_fallback"
+                    if settle_due:
+                        # The close should be in the store and is not: this
+                        # P&L is valued at today's price, not the settlement.
+                        log.critical(
+                            "reconcile_expired_settlement_missing",
+                            trade_id=trade.trade_id, symbol=trade.symbol,
+                            expiry=str(expiry_d), live_price=settle_px,
+                            note="no official close for the expiry date; the "
+                                 "expired structure is valued at a live snapshot "
+                                 "- check this P&L by hand")
+                        try:
+                            self._state.set_state(
+                                f"expiry_settle_unverified_{trade.trade_id}",
+                                _today.isoformat())
+                        except Exception:  # noqa: BLE001
+                            pass
                 intrinsic = self._structure_intrinsic(trade, settle_px) if settle_px else None
                 if intrinsic is not None:
                     if trade.strategy in CREDIT_STRATEGIES:
@@ -525,8 +612,17 @@ class PositionReconciler:
                     exit_reason = "reconciler_expired_intrinsic"
                     log.info("reconcile_expired_intrinsic",
                              trade_id=trade.trade_id, settle_px=settle_px,
+                             price_source=price_src,
                              intrinsic=round(intrinsic, 2),
                              realized_pnl=round(realized_pnl, 2))
+                    # No commission was subtracted from this P&L: say so, so
+                    # the commission true-up books the ledger's figure rather
+                    # than correcting from a formula estimate nobody applied.
+                    try:
+                        self._state.set_state(f"commission_est_{trade.trade_id}", "0.0")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._note_assignment_link(trade, settle_px)
                 else:
                     realized_pnl = 0.0
                     exit_reason = UNKNOWN_EXPIRED_EXIT_REASON
@@ -567,12 +663,54 @@ class PositionReconciler:
                  exit_price=exit_price, realized_pnl=realized_pnl,
                  exit_reason=exit_reason)
 
+        _kw = {"exit_time": booked_at} if booked_at else {}
         self._state.close_trade(
             trade_id=trade.trade_id,
             exit_price=exit_price,
             realized_pnl=realized_pnl,
             exit_reason_detailed=exit_reason,
+            **_kw,
         )
+
+    def _note_assignment_link(self, trade, settle_px) -> None:
+        """W101: annotate - do not account - a probable assignment.
+
+        A short put or call that expired in the money turns into 100 shares per
+        contract; the stock arrives as an untracked ``SYMBOL:STK`` position
+        that nothing ties to the option trade it came from. When both are
+        there, record the pairing (state key ``assignment_link_<trade_id>``)
+        and say so loudly. The untracked-stock freeze and its prompt are
+        unchanged: the operator answers those, and should declare the shares
+        at the SETTLEMENT price, not the strike, or the loss is counted twice.
+        """
+        try:
+            legs = json.loads(trade.legs) if trade.legs else []
+            itm = []
+            for leg in legs:
+                if str(leg.get("action", "")).upper() != "SELL":
+                    continue
+                k = float(leg["strike"])
+                right = str(leg["right"]).upper()
+                if (right == "P" and k > settle_px) or (right == "C" and k < settle_px):
+                    itm.append({"strike": k, "right": right})
+            if not itm:
+                return
+            live = self._live_ibkr_leg_keys() or {}
+            stock_qty = live.get(f"{trade.symbol}:STK")
+            if not stock_qty or int(stock_qty) != 100 * int(trade.quantity):
+                return
+            info = {"stock_key": f"{trade.symbol}:STK", "shares": int(stock_qty),
+                    "short_legs_itm": itm, "expiry": str(trade.expiry),
+                    "settle_px": settle_px}
+            self._state.set_state(f"assignment_link_{trade.trade_id}", json.dumps(info))
+            log.critical(
+                "reconcile_assignment_linked_to_expired_trade",
+                trade_id=trade.trade_id, **info,
+                note="the untracked stock is the assignment of this expired "
+                     "structure; declare the shares at the settlement price, not "
+                     "the strike (the loss is already booked on the option trade)")
+        except Exception as e:  # noqa: BLE001 — an annotation must never block booking
+            log.warning("assignment_link_failed", trade_id=trade.trade_id, error=str(e))
 
     async def book_vanished_trade(self, trade) -> bool:
         """R14 (the strand hole): CLOSE a trade whose position is confirmed

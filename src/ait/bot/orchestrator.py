@@ -449,6 +449,9 @@ class TradingOrchestrator:
         # Scheduling
         self._scheduler = MarketScheduler(settings)
         self._reconciler = PositionReconciler(ibkr_client, self._state)
+        # W101: an expired structure is valued at the underlying's close on its
+        # expiry date (the daily price store), not at today's live price.
+        self._reconciler.set_settlement_source(self._read_settlement_close)
 
         # Self-learning
         self._learning = LearningEngine(
@@ -4661,6 +4664,52 @@ class TradingOrchestrator:
             return 0.0
 
     @staticmethod
+    def _read_settlement_close(symbol: str, day) -> float | None:
+        """W101: the underlying's official close on ``day`` from the daily price
+        store, or None. Opened READ-ONLY (``HistoricalDataStore()`` creates
+        directories and tables on construction). Only a row for exactly that
+        date counts, and only a finite positive close."""
+        import math as _m
+        import sqlite3 as _sq
+        from ait.data.historical import DB_PATH as _DB
+        try:
+            con = _sq.connect(f"file:{_DB}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT close FROM daily_prices WHERE symbol = ? AND date = ?",
+                    (symbol, day.isoformat())).fetchone()
+            finally:
+                con.close()
+        except Exception as e:  # noqa: BLE001 — the store may be locked, absent or stale
+            log.warning("settlement_read_failed", symbol=symbol, day=str(day), error=str(e))
+            return None
+        if not row or row[0] is None:
+            return None
+        px = float(row[0])
+        return px if _m.isfinite(px) and px > 0 else None
+
+    def _expected_commission_rows(self, trade) -> int:
+        """W101: how many leg rows with a known commission make the ledger
+        COMPLETE for the commission true-up.
+
+        A trade that closed by its own exit order has entry AND exit rows
+        (``2 * legs_n``). A structure the reconciler booked at expiry
+        (``reconciler_expired*``, with the "no commission subtracted" marker the
+        reconciler stored) never gets exit fills: its complete ledger is the
+        entry rows, ``legs_n``. Without this the true-up waited forever for exit
+        rows that cannot arrive, and the entry commission never reached the P&L.
+        """
+        legs_n = self._legs_count(trade)
+        try:
+            reason = str(getattr(trade, "exit_reason_detailed", "") or "")
+            marker = self._state.get_state(f"commission_est_{trade.trade_id}", "")
+            if reason.startswith("reconciler_expired") and isinstance(marker, str) and marker:
+                return legs_n
+        except Exception:  # noqa: BLE001
+            pass
+        return 2 * legs_n
+
+    @staticmethod
     def _legs_count(trade) -> int:
         """W48: expected leg count for a trade's completeness math (the
         commission true-up needs `2 * legs_n` execution rows — entry + exit
@@ -4728,10 +4777,11 @@ class TradingOrchestrator:
                 _legs_n = self._legs_count(_t)
                 _exec_n = self._state.count_executions_with_commission(
                     _tid, exclude_con_id=BAG_CON_ID)
-                if _exec_n < 2 * _legs_n:
+                _expected_n = self._expected_commission_rows(_t)
+                if _exec_n < _expected_n:
                     log.info("commission_trueup_deferred_partial_ledger_post_market",
                              trade_id=_tid, executions=_exec_n,
-                             expected=2 * _legs_n)
+                             expected=_expected_n)
                     continue
                 _real = self._state.total_commission(_tid)
                 if _real > 0 and _t.realized_pnl is not None:
@@ -4798,7 +4848,7 @@ class TradingOrchestrator:
             legs_n = self._legs_count(trade)
             exec_n = self._state.count_executions_with_commission(
                 trade_id, exclude_con_id=BAG_CON_ID)
-            if real > 0 and trade and exec_n >= 2 * legs_n:
+            if real > 0 and trade and exec_n >= self._expected_commission_rows(trade):
                 delta = round(self._booked_commission_estimate(trade) - real, 2)
                 self._forget_commission_estimate(trade_id)
                 if abs(delta) >= 0.01:
@@ -4818,7 +4868,7 @@ class TradingOrchestrator:
                                       today_et().isoformat())
                 log.info("commission_trueup_deferred_partial_ledger",
                          trade_id=trade_id, executions=exec_n,
-                         expected=2 * legs_n)
+                         expected=self._expected_commission_rows(trade))
         except Exception as e:  # noqa: BLE001 — booking must never die here
             log.warning("commission_trueup_failed",
                         trade_id=trade_id, error=str(e))
