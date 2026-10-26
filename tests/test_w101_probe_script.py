@@ -1974,6 +1974,21 @@ class TestSpotFromOptions:
             FakeIBKR(world), ["20261027"], _grid(), None, datetime(2026, 10, 27).date()))
         assert out == pytest.approx(601.0)
 
+    def test_the_guess_is_for_the_same_underlying(self, monkeypatch):
+        """A SPY price (765) is a nonsense starting point for QQQ (707): events are matched by symbol,
+        and events recorded before the symbol was stored count as SPY's."""
+        _write([{"ts": _t(0), "run_id": "p", "cmd": "preflight", "trial": None, "event": "legs_selected", "spot": 765.0}])
+        _write([{"ts": _t(1), "run_id": "q", "cmd": "open", "trial": "Q", "event": "legs_selected", "spot": 707.0,
+                 "symbol": "QQQ"}])
+        monkeypatch.setattr(probe, "SYMBOL", "SPY")
+        assert probe._last_known_spot() == 765.0
+        monkeypatch.setattr(probe, "SYMBOL", "QQQ")
+        assert probe._last_known_spot() == 707.0
+        monkeypatch.setattr(probe, "SYMBOL", "SPY")
+        _write([{"ts": _t(2), "run_id": "r", "cmd": "open", "trial": "S", "event": "legs_selected", "spot": 766.0,
+                 "symbol": "SPY"}])
+        assert probe._last_known_spot() == 766.0
+
     def test_the_last_recorded_spot_is_the_guess(self):
         assert probe._last_known_spot() is None
         _write([{"ts": _t(0), "run_id": "p", "cmd": "preflight", "trial": None, "event": "legs_selected", "spot": 762.95}])
@@ -2354,3 +2369,30 @@ class TestHeadline:
     def test_otherwise_it_is_the_verdict(self):
         _write([_open_event()] + _run(fill_k=0))
         assert _report()["headline"] == "BOT_LADDER_SUFFICIENT"
+
+
+class TestSpotHint:
+    def test_the_hint_is_the_fallback_when_nothing_was_recorded(self, monkeypatch):
+        monkeypatch.setattr(probe, "SPOT_HINT", None)
+        assert probe._last_known_spot() is None
+        monkeypatch.setattr(probe, "SPOT_HINT", 707.0)
+        assert probe._last_known_spot() == 707.0
+
+    def test_a_recorded_price_beats_the_hint(self, monkeypatch):
+        monkeypatch.setattr(probe, "SPOT_HINT", 707.0)
+        _write([{"ts": _t(0), "run_id": "p", "cmd": "open", "trial": "S", "event": "legs_selected", "spot": 765.0,
+                 "symbol": "SPY"}])
+        monkeypatch.setattr(probe, "SYMBOL", "SPY")
+        assert probe._last_known_spot() == 765.0
+
+    def test_main_sets_it_from_the_flag(self, monkeypatch):
+        monkeypatch.setattr(probe, "SPOT_HINT", None)
+        seen = []
+
+        async def handler(args):
+            seen.append(probe.SPOT_HINT)
+            return {}
+
+        monkeypatch.setitem(probe._HANDLERS, "preflight", handler)
+        assert probe.main(["preflight", "--spot-hint", "707"]) == 0 and seen == [707.0]
+        assert probe.build_parser().parse_args(["open", "--trial", "Q", "--kind", "pin"]).spot_hint is None
