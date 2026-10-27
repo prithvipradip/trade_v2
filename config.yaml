@@ -80,8 +80,7 @@ positions:
                                        # rejections were THIS cap, not the credit cap —
                                        # +2 slots absorb defined-risk structures without
                                        # adding short-premium exposure (credit cap stays 6)
-  max_position_pct: 0.20               # 20% of portfolio per position (W100: >= risk.max_position_risk_pct, which Settings enforces)
-  max_contracts_per_trade: 1           # Learning mode: 1 contract/trade = min cost = max # of trades
+  max_contracts_per_trade: 1          # Learning mode: 1 contract/trade = min cost = max # of trades
   entry_ladder_start: 0.25             # W36: home for AIT_ENTRY_LADDER_START
   entry_order_timeout_seconds: 240     # W36: home for AIT_ENTRY_ORDER_TIMEOUT
   # W70: the rest of the ENTRY order timeline (were literals in execution/executor.py).
@@ -137,11 +136,15 @@ position_sizing:
     short_strangle: 0.8
     calendar_spread: 0.7
     event_straddle: 0.7
+  scaled_strategies: []                # W108 (2026-10-27, operator): strategies whose lot COUNT the six multipliers above
+                                       # throttle. Empty = every strategy is sized by the budget alone
+                                       # (risk.max_position_risk_pct x NLV / one lot's max loss; ait.risk.lot_sizing, the same
+                                       # rule research uses). A listed strategy still needs only ONE lot to fit the unscaled budget.
 
 risk:
-  max_daily_loss_pct: 0.20             # W100 (2026-10-25, operator): 0.045 -> 0.20 (the schema ceiling) at the $5k account.
-                                       # Breaker = $1,000 = one max-loss condor at the 20% budget (max_position_risk_pct),
-                                       # so breaker >= 1.0x breaker_to_max_loss_ratio.
+  max_daily_loss_pct: 0.045            # W108 (2026-10-27, operator): 0.20 -> 0.045 with the 5% budget ($225 vs the largest condor
+                                       # the builder emits at $250: a $3-wide, max loss $201-212), so breaker >= 1.0x
+                                       # breaker_to_max_loss_ratio. (W100 had raised it to 0.20 with the 20% budget.)
                                        # W64 (2026-10-08): 0.02 -> 0.045: $225 vs the largest condor at the 5%
                                        # budget (real IWM/SPY chains: $3-wide, max loss $201-212).
                                        # Trips on realised AND mark-to-market daily loss; blocks ENTRIES only.
@@ -152,7 +155,10 @@ risk:
   pause_minutes_after_losses: 30       # Cool-down period
   max_api_failures: 5                  # Halt after 5 API failures in 10 min
   min_confidence: 0.50                 # At learning floor — capture more marginal signals to learn from (was 0.55)
-  max_position_risk_pct: 0.20          # W100 (2026-10-25, operator): 0.05 -> 0.20 at the $5k account (budget $1,000).
+  max_position_risk_pct: 0.05          # THE per-trade budget (gate 6b, the condor builder, the sizer, research). W108 (2026-10-27,
+                                       # operator): 0.20 -> 0.05. The budget is a CEILING the builder fills through the wing width
+                                       # (budget/90): at 20% ($1,000) a condor is built 11-wide and risks $750-$900 of the $5k
+                                       # account; W100's 20% rested on reading it as a loss limit.
                                        # W64 (2026-10-08): 0.0133 -> 0.05 at the $5k account (budget $250).
                                        # MEASURED on live TWS chains (IWM/SPY, 22 DTE, delayed, the real
                                        # builder): budget $66 and $150 build NOTHING at the $0.70 credit
@@ -165,7 +171,7 @@ risk:
                                        # so one max-loss condor could not exceed the old 2% breaker; W64
                                        # moves the breaker with the budget instead. Per-trade max_loss cap
                                        # vs NLV, also the budget the builder is handed. Must stay <=
-                                       # positions.max_position_pct, positions.max_portfolio_risk_pct and
+                                       # positions.max_portfolio_risk_pct and
                                        # risk.max_symbol_concentration_pct (Settings validates: equal is OK).
   max_correlation: 0.75                # Correlation above which symbols count as the same bet
   max_correlated_positions: 2          # Positions per correlated cluster (was code default)
@@ -244,9 +250,6 @@ options:
     #                     accepts entry AFTER 8:30am releases, buying straight into IV crush.
 
 backtest:
-  position_size_pct: 0.20             # W100 (2026-10-25, operator): 0.05 -> 0.20 = risk.max_position_risk_pct, so research sizes like live (max-loss basis)
-                                       # Schema ceiling 0.25 (= risk.max_position_risk_pct's, W86). Normally left
-                                       # null in config_research.yaml so research sizes like live.
   default_symbols: [QQQ]               # W87a: RESEARCH ONLY. Symbols run_backtest.py / run_optimizer.py use when
                                        # --symbols is omitted. QQQ: the symbol with historical option prices (an IV
                                        # surface can be built). Live's universe is trading.universe, never read by research.

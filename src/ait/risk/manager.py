@@ -643,9 +643,9 @@ class RiskManager:
         # a refusal. Guarding the branch keeps the floor of 1 meaningful for real
         # sizes and leaves a 0 verdict untouched for the refusal below.
         # Reachable today only when request.max_loss is falsy (gate 6b at :512 masks
-        # every defined-risk path because max_position_risk_pct <=
-        # positions.max_position_pct, enforced at startup since W64 / W86); that masking is incidental, not a design,
-        # and is registered separately.
+        # every defined-risk path: the sizer is funded with the SAME budget,
+        # risk.max_position_risk_pct, since W108 retired positions.max_position_pct);
+        # that masking is incidental, not a design, and is registered separately.
         final_contracts = self._haircut_contracts(final_contracts, correlated_count)
 
         if final_contracts <= 0:

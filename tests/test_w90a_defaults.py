@@ -67,10 +67,9 @@ class TestBacktesterDefaults:
         assert self._bt(settings=_moved(account={"capital": 7777.0}))._initial_capital == 7777.0
         assert self._bt(settings=_moved(account={"capital": 7777.0}), initial_capital=2500.0)._initial_capital == 2500.0
 
-    def test_position_size_resolves_backtest_then_risk_and_explicit_wins(self):
-        bt_set = _moved(backtest={"position_size_pct": 0.07})
-        assert self._bt(settings=bt_set)._position_size_pct == 0.07
-        risk_set = _moved(backtest={"position_size_pct": None}, risk={"max_position_risk_pct": 0.09})
+    def test_position_size_resolves_the_risk_budget_and_explicit_wins(self):
+        """W108: backtest.position_size_pct is retired; the loaded risk budget is the default."""
+        risk_set = _moved(risk={"max_position_risk_pct": 0.09})
         assert self._bt(settings=risk_set)._position_size_pct == 0.09
         assert self._bt(settings=risk_set, position_size_pct=0.02)._position_size_pct == 0.02
 
@@ -172,13 +171,20 @@ class TestWalkForwardConfigDefaults:
         from ait.config.settings import PositionConfig
         bt = WalkForwardBacktester(symbols=["QQQ"], strategies=["iron_condor"], config=WalkForwardConfig(train_window_models=False))
         s = load_settings()
+        book = {"max_symbol_concentration_pct": s.risk.max_symbol_concentration_pct,    # W108: live's book-level gates
+                "max_positions_per_expiry": s.risk.max_positions_per_expiry,
+                "max_correlated_positions": s.risk.max_correlated_positions}
         assert bt._pool_limits() == {"max_portfolio_risk_pct": s.positions.max_portfolio_risk_pct,
-                                     "max_open_positions": s.positions.max_open_positions}
+                                     "max_open_positions": s.positions.max_open_positions, **book}
         bt._settings = _moved(positions={"max_portfolio_risk_pct": 0.33, "max_open_positions": 7})
-        assert bt._pool_limits() == {"max_portfolio_risk_pct": 0.33, "max_open_positions": 7}
+        assert bt._pool_limits() == {"max_portfolio_risk_pct": 0.33, "max_open_positions": 7, **book}
         bt._settings = None                                  # D4: the schema defaults, not 0.20 / 10 literals
+        from ait.config.settings import RiskConfig
         assert bt._pool_limits() == {"max_portfolio_risk_pct": PositionConfig().max_portfolio_risk_pct,
-                                     "max_open_positions": PositionConfig().max_open_positions}
+                                     "max_open_positions": PositionConfig().max_open_positions,
+                                     "max_symbol_concentration_pct": RiskConfig().max_symbol_concentration_pct,
+                                     "max_positions_per_expiry": RiskConfig().max_positions_per_expiry,
+                                     "max_correlated_positions": RiskConfig().max_correlated_positions}
 
 
 class TestReplayAndManifestDefaults:

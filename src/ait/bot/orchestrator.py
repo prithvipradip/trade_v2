@@ -3022,18 +3022,10 @@ class TradingOrchestrator:
             # W31 (R26 F4 w25-coherence-probe-uses-a-budget-the-live-builder-
             # never-receives): probe with the budget the builder is ACTUALLY
             # handed — `nlv * risk.max_position_risk_pct`, the same expression
-            # the live scan uses. W25 used min(gate, sizer), reasoning that a
-            # trade must clear both caps. True, but they bind at DIFFERENT
-            # layers: gate 6b (manager.py) rejects on max_position_risk_pct
-            # before the sizer (position_sizer.py) ever returns its 0-contract
-            # verdict on max_position_pct. Pre-shrinking the builder's budget
-            # to the min models a NARROWER wing than the builder will build
-            # whenever the gate cap is the looser of the two — so the check
-            # passed while the real structure blew the sizer's cap and every
-            # entry was refused. The sizer cap is not ignored: it is now tested
-            # against the RESULT, in A3.
+            # the live scan uses. W108: that is also the sizer's budget (the
+            # sizer's former second cap, positions.max_position_pct, is retired),
+            # so there is one number and the two-knob skew arm (A3) is gone.
             budget_gate = nlv * self._settings.risk.max_position_risk_pct
-            budget_sizer = nlv * self._settings.positions.max_position_pct
             budget = budget_gate
             min_credit = contract_float("AIT_IC_MIN_CREDIT")
             breaker_usd = nlv * self._settings.risk.max_daily_loss_pct
@@ -3098,27 +3090,12 @@ class TradingOrchestrator:
                     f"trade the breaker cannot absorb; they need to be set "
                     f"together.")
 
-            # A3 — THE TWO-KNOB CAP GRID (the W25 ADDENDUM, registered then and
-            # still not linked). gate 6b and the sizer enforce the same
-            # quantity at different layers with nothing tying them: raising
-            # risk.max_position_risk_pct above positions.max_position_pct lets
-            # the builder construct a structure gate 6b passes and the sizer
-            # then refuses, one 0-contract verdict at a time, logged as routine.
-            # DETECTION ONLY — linking the knobs moves live sizing and wants a
-            # backtest, so it stays registered rather than fixed here.
-            if worst > 0 and worst > budget_sizer:
-                problems.append(
-                    f"cap-grid SKEW: the builder is funded ${budget:.0f} by "
-                    f"risk.max_position_risk_pct and emits a structure risking "
-                    f"${worst:.0f}, but positions.max_position_pct caps a "
-                    f"position at ${budget_sizer:.0f} — gate 6b passes it and "
-                    f"the position sizer then returns 0 contracts, so entries "
-                    f"brick silently. Lower risk.max_position_risk_pct or raise "
-                    f"positions.max_position_pct.")
+            # (W108: A3, the two-knob cap-grid skew arm, is retired with the
+            # knob it guarded: gate 6b and the sizer now share one budget.)
 
             log.info("launch_size_coherence",
                      nlv=round(nlv), budget=round(budget),
-                     budget_gate=round(budget_gate), budget_sizer=round(budget_sizer),
+                     budget_gate=round(budget_gate),
                      breaker=round(breaker_usd),
                      worst_max_loss=round(worst),
                      probes=probes,

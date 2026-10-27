@@ -51,6 +51,7 @@ from ait.utils.logging import get_logger
 from ait.utils.time import ET, get_market_close, time_to_expiry_years  # W74: real session clock
 from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
+from ait.risk.lot_sizing import lots_for_budget  # W108: the ONE lot rule, shared with live's PositionSizer and the pool
 
 log = get_logger("backtesting.engine")
 
@@ -511,7 +512,7 @@ class Backtester:
         # credit has been charged too much friction. AIT_BT_CALIBRATED_SPREADS=0
         # restores the config formula for A/B runs.
         self._calibrated_spreads = None
-        # W90a: None -> backtest.position_size_pct > risk.max_position_risk_pct (what live funds the builder with)
+        # W90a: None -> risk.max_position_risk_pct (what live funds the builder with; W108 retired backtest.position_size_pct)
         self._position_size_pct = resolve_position_size_pct(position_size_pct, _settings)
         self._budget_aware_wings = bool(budget_aware_wings)
         self._condor_any_direction = bool(condor_any_direction)
@@ -2465,12 +2466,9 @@ class Backtester:
             if cost_per_contract <= 0 or capital < cost_per_contract:
                 return None
 
-            contracts = int(capital * self._position_size_pct / cost_per_contract)
+            contracts = self._lots(cost_per_contract, capital)
             if contracts < 1:
-                if cost_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
-                    contracts = 1
-                else:
-                    return None
+                return None
 
             return {
                 "symbol": "SIM", "strategy": "long_strangle",
@@ -2492,7 +2490,7 @@ class Backtester:
         cost_per_contract = price * 100
         if cost_per_contract <= 0 or capital < cost_per_contract:
             return None
-        contracts = int(capital * self._position_size_pct / cost_per_contract)
+        contracts = self._lots(cost_per_contract, capital)
         if contracts < 1:
             return None
 
@@ -2512,6 +2510,17 @@ class Backtester:
             "expiry_date": str(today_date + timedelta(days=dte)),
             "high_water_mark": 0.0,
         }
+
+    def _lots(self, risk_per_contract: float, capital: float) -> int:
+        """W108: lots the per-trade budget carries, from the ONE shared rule (ait.risk.lot_sizing).
+
+        Same arithmetic live's PositionSizer and the walk-forward pool call: the UNSCALED budget
+        (capital x ``self._position_size_pct``, which resolves to ``risk.max_position_risk_pct``)
+        decides viability, 0 means one lot does not fit (the caller refuses the structure). There
+        is no "open one lot anyway" fallback any more. The live per-trade contract cap is applied
+        by ``_build_position`` after the builder returns.
+        """
+        return lots_for_budget(risk_per_contract, capital, self._position_size_pct)
 
     def _log_unaffordable(self, strategy: str, risk_per_contract: float,
                           capital: float) -> None:
@@ -2694,7 +2703,7 @@ class Backtester:
             if self._max_loss_cap is not None and max_loss_per_contract > self._max_loss_cap:
                 self._reject("builder:research_max_loss_cap")  # detail of the loop's builder_none
                 return None
-            contracts = int(capital * self._position_size_pct / _gate_per_contract)
+            contracts = self._lots(_gate_per_contract, capital)
             if contracts < 1:
                 self._log_unaffordable(strategy, _gate_per_contract, capital)
                 self._reject("builder:unaffordable_contracts")  # detail of the loop's builder_none
@@ -2783,7 +2792,7 @@ class Backtester:
             if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
                     or capital < max_loss_per_contract):
                 return None
-            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            contracts = self._lots(max_loss_per_contract, capital)
             if contracts < 1:
                 self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
@@ -2846,7 +2855,7 @@ class Backtester:
             if (max_loss_per_contract <= 0 or math.isnan(max_loss_per_contract)
                     or capital < max_loss_per_contract):
                 return None
-            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            contracts = self._lots(max_loss_per_contract, capital)
             if contracts < 1:
                 self._log_unaffordable(strategy, max_loss_per_contract, capital)
                 return None
@@ -2898,14 +2907,10 @@ class Backtester:
             if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
                 return None
 
-            # Position sizing
-            size_pct = self._position_size_pct
-            contracts = int(capital * size_pct / max_loss_per_contract)
+            # Position sizing (W108: the shared lot rule; no "one lot anyway" fallback)
+            contracts = self._lots(max_loss_per_contract, capital)
             if contracts < 1:
-                if max_loss_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
-                    contracts = 1
-                else:
-                    return None
+                return None
 
             return {
                 "symbol": "SIM",
@@ -2950,12 +2955,9 @@ class Backtester:
             max_loss_per_contract = max_loss_per_share * 100
             if max_loss_per_contract <= 0 or capital < max_loss_per_contract:
                 return None
-            contracts = int(capital * self._position_size_pct / max_loss_per_contract)
+            contracts = self._lots(max_loss_per_contract, capital)
             if contracts < 1:
-                if max_loss_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
-                    contracts = 1
-                else:
-                    return None
+                return None
             return {
                 "symbol": "SIM", "strategy": "call_credit_spread",
                 "direction": SignalDirection.BEARISH.value, "trade_type": "credit",
@@ -2997,7 +2999,7 @@ class Backtester:
             margin_per_contract = S * self._legacy.naked_margin_fraction * 100
             if capital < margin_per_contract:
                 return None
-            contracts = int(capital * self._position_size_pct / margin_per_contract)
+            contracts = self._lots(margin_per_contract, capital)
             if contracts < 1:
                 self._log_unaffordable(strategy, margin_per_contract, capital)
                 return None
@@ -3044,7 +3046,7 @@ class Backtester:
 
             # Margin approx: 20% of underlying per strangle (standard naked-option requirement)
             margin_per_contract = S * self._legacy.naked_margin_fraction * 100
-            contracts = int(capital * self._position_size_pct / margin_per_contract)
+            contracts = self._lots(margin_per_contract, capital)
             if contracts < 1:
                 return None
 
@@ -3073,14 +3075,9 @@ class Backtester:
         cost_per_contract = net_cost * 100
         if cost_per_contract <= 0 or capital < cost_per_contract:
             return None
-        size_pct = self._position_size_pct
-        contracts = int(capital * size_pct / cost_per_contract)
+        contracts = self._lots(cost_per_contract, capital)
         if contracts < 1:
-            # Allow 1 contract only if affordable within 25% of capital
-            if cost_per_contract <= capital * self._spr.max_cost_fraction_of_capital:      # W90f: was 0.25
-                contracts = 1
-            else:
-                return None
+            return None
 
         direction = SignalDirection.BULLISH if "bull" in strategy else SignalDirection.BEARISH
 

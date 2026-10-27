@@ -39,7 +39,6 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | Setting | Type | Allowed range | Default | Shipped | Listed in | Meaning |
 |---|---|---|---|---|---|---|
 | `positions.max_open_positions` | `int` | 1 - 20 | 5 | 10 | config.yaml | Maximum number of positions open at once (the risk manager's position-count gate; the research pool applies the same cap). |
-| `positions.max_position_pct` | `float` | 0.01 - 0.3 | 0.2 | 0.2 | config.yaml | The position sizer's hard per-position cap, fraction of NLV (a defined-risk structure's max loss per contract must fit). |
 | `positions.max_portfolio_delta` | `float` | 0.05 - 1.0 | 0.3 | 0.3 | config.yaml | Net portfolio delta limit as a fraction of account value. |
 | `positions.max_portfolio_risk_pct` | `float` | 0.005 - 0.5 | 0.2 | 0.2 | config.yaml | Aggregate capital at risk across all open positions, as a fraction of net liquidation. |
 | `positions.entry_ladder_start` | `float` | 0.0 - 1.0 | 0.25 | 0.25 | config.yaml | Config home for AIT_ENTRY_LADDER_START — the fraction of the way from mid to the marketable price at which a combo entry ladder starts. |
@@ -62,19 +61,20 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | `position_sizing.drawdown_tiers` | `list[list[float]]` | - | [[3, 0.5], [5, 0.25]] | [[3, 0.5], [5, 0.25]] | config.yaml | [consecutive_losing_days, size_factor] pairs, ascending by days; the highest threshold met wins (0 losing days or below the first row = 1.0). |
 | `position_sizing.vix_size_tiers` | `list[list[float]]` | - | [[25, 0.75], [30, 0.5]] | [[25, 0.75], [30, 0.5]] | config.yaml | [vix_at_or_above, size_factor] pairs, ascending by VIX; the highest threshold met wins (below the first row = 1.0). |
 | `position_sizing.strategy_risk` | `dict[str, float]` | - | {long_call: 1.0, long_put: 1.0, covered_call: 0.5, cash_secured_put: 0.5, bull_call_spread: 0.6, bear_put_spread: 0.6, iron_condor: 0.4, long_straddle: 1.2, short_strangle: 0.8, calendar_spread: 0.7, event_straddle: 0.7} | {long_call: 1.0, long_put: 1.0, covered_call: 0.5, cash_secured_put: 0.5, bull_call_spread: 0.6, bear_put_spread: 0.6, iron_condor: 0.4, long_straddle: 1.2, short_strangle: 0.8, calendar_spread: 0.7, event_straddle: 0.7} | config.yaml | Per-strategy fraction of the position budget. |
+| `position_sizing.scaled_strategies` | `list[str]` | - | [] | [] | config.yaml | The strategies whose lot COUNT is throttled by the six multipliers above (confidence, volatility, strategy_risk, IV rank, drawdown, VIX). |
 
 ## Risk limits (`risk`)
 
 | Setting | Type | Allowed range | Default | Shipped | Listed in | Meaning |
 |---|---|---|---|---|---|---|
-| `risk.max_daily_loss_pct` | `float` | 0.005 - 0.2 | 0.2 | 0.2 | config.yaml | Daily loss breaker, fraction of NLV (realised AND mark-to-market trips; entries only, exits keep running). 0.02 -> 0.045 at the $5k account (breaker $225 vs the $3-wide condor's $201-212 max loss on real chains); the startup self-test's rule is breaker >= breaker_to_max_loss_ratio x the largest max loss the builder emits. |
+| `risk.max_daily_loss_pct` | `float` | 0.005 - 0.2 | 0.045 | 0.045 | config.yaml | Daily loss breaker, as a fraction of net liquidation (realised and mark-to-market); it blocks new entries only, exits keep running. The startup self-test expects it to be at least `risk.breaker_to_max_loss_ratio` times the largest max loss the builder emits. |
 | `risk.breaker_to_max_loss_ratio` | `float` | 0.5 - 3.0 | 1.0 | 1.0 | config.yaml | The startup coherence check (orchestrator A2) alerts when the daily-loss breaker is below this multiple of the LARGEST single max loss the real condor builder emits. |
 | `risk.max_consecutive_losses` | `int` | 1 - 10 | 3 | 3 | config.yaml | Consecutive losing closes that trip the circuit breaker. |
 | `risk.pause_minutes_after_losses` | `int` | 5 - 120 | 30 | 30 | config.yaml | Minutes new entries stay paused after the consecutive-losses trip. |
 | `risk.max_api_failures` | `int` | 2 - 20 | 5 | 5 | config.yaml | Broker API failures within 10 minutes that trip the circuit breaker (10-minute pause). |
 | `risk.min_confidence` | `float` | 0.5 - 0.95 | 0.65 | 0.5 | config.yaml | Minimum model confidence for an entry. |
 | `risk.pre_event_blackout_days` | `int` | 0 - 7 | 1 | 1 | config.yaml | Block NEW credit entries within N calendar days of a macro event (NFP/CPI/PCE). |
-| `risk.max_position_risk_pct` | `float` | 0.005 - 0.25 | 0.2 | 0.2 | config.yaml | Maximum loss of one trade as a fraction of net liquidation, and the budget the condor builder is handed to size the wings. |
+| `risk.max_position_risk_pct` | `float` | 0.005 - 0.25 | 0.05 | 0.05 | config.yaml | Maximum loss of one trade as a fraction of net liquidation, and THE budget: the condor builder sizes the wings from it, the position sizer counts lots from it, and the research engine and pool use the same number. |
 | `risk.max_correlation` | `float` | 0.3 - 0.99 | 0.75 | 0.75 | config.yaml | Correlation above which two symbols count as the same bet. |
 | `risk.max_correlated_positions` | `int` | 1 - 8 | 2 | 2 | config.yaml | Max simultaneous positions within one correlated cluster (SPY/QQQ/IWM/DIA correlate ~0.95). |
 | `risk.post_stop_cluster_cooldown_minutes` | `int` | 0 - 1440 | 120 | 120 | config.yaml | Post-stop re-entry cooldown for CLUSTER SIBLINGS of a stopped-out symbol. |

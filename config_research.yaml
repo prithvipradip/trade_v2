@@ -24,9 +24,7 @@
 # backtest.initial_capital (the field no longer exists: capital lives at account.capital).
 
 backtest:
-  position_size_pct: null              # W64: null -> risk.max_position_risk_pct (what live funds the
-                                       # builder with), so research cannot drift from live. main has 0.05.
-  budget_aware_wings: true             # W64: research condor builder caps the wing to the budget like live
+  budget_aware_wings: true            # W64: research condor builder caps the wing to the budget like live
                                        # (IronCondor.affordable_width, $1 floor when capped) and rejects a
                                        # structure whose max loss exceeds the budget.
 
@@ -233,7 +231,6 @@ backtest:
   # --- W90f: sizing of the single-structure builders (credit spreads, iron butterfly, jade lizard, debit structures); the
   # iron-condor builder does not read these ---
   spread_tuning:
-    max_cost_fraction_of_capital: 0.25 # max loss / cost per contract may not exceed this share of capital
     wing_expected_move_fraction: 0.5   # wing = wing_k x expected move x this (iron butterfly, credit spreads, jade lizard)
 
   # --- walk-forward / optimizer constants ---

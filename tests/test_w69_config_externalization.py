@@ -351,12 +351,15 @@ class TestChildPortResolution:
 
 def _sizer(**sizing):
     from ait.risk.position_sizer import PositionSizer
-    pc = PositionConfig(max_position_pct=0.01, max_contracts_per_trade=100)
-    rc = RiskConfig(min_confidence=0.5)
+    pc = PositionConfig(max_contracts_per_trade=100)
+    rc = RiskConfig(min_confidence=0.5, max_position_risk_pct=0.01)
+    # W108: the curves act only on strategies in scaled_strategies (empty by default), so these
+    # tests that exercise the curves list the two strategies they size.
+    sizing.setdefault("scaled_strategies", ["long_call", "long_put"])
     return PositionSizer(pc, rc, PositionSizingConfig(**sizing))
 
 
-# Uncapped regime: $1M account (scale cap 100, hard cap 100), a $10,000 budget
+# Uncapped regime: $1M account (hard cap 100), a $10,000 budget
 # (1%), a $200 contract, neutral IV / IV-rank, confidence 1.0 -> the base is
 # 10,000 / 200 = 50 contracts, and each test multiplies in ONE factor.
 def _size(sizer, **kw):

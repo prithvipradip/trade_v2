@@ -97,14 +97,14 @@ class TestTheShippedFiles:
         assert live.backtest.gates_mode == "observe" and res.backtest.gates_mode == "enforce"
         assert live.backtest.iv_rank_gate is False and res.backtest.iv_rank_gate is True
         assert res.backtest.iv_floor == 0.05 and live.backtest.iv_floor == 0.20
-        assert res.backtest.position_size_pct is None
+        assert not hasattr(res.backtest, "position_size_pct")      # W108: retired, one per-trade budget
         assert res.backtest.condor_any_direction is False           # 2026-10-10 decision
         assert res.backtest.friction_model == "per_leg_usd"
-        # the five live retune values are in config.yaml, so BOTH views carry them
+        # the five live retune values are in config.yaml, so BOTH views carry them (W108: 5% / 4.5%)
         for s in (live, res):
             assert (s.account.capital, s.risk.max_position_risk_pct,
                     s.risk.max_daily_loss_pct, s.risk.breaker_to_max_loss_ratio) == (
-                5000.0, 0.20, 0.20, 1.0)
+                5000.0, 0.05, 0.045, 1.0)
 
     def test_overlay_holds_only_real_differences(self):
         """No redundant keys: a key present in both files must hold a different value (else

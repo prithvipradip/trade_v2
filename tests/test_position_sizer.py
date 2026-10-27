@@ -272,12 +272,13 @@ class TestStrategyRiskMultipliers:
 
 
 class TestFloorAndCap:
-    """Test floor of 1 contract, cap scales with account size."""
+    """Viability by the unscaled budget, floor of 1 once viable, the hard per-trade cap (W108: the
+    per-account-size scale cap and max_contracts_for_budget were retired)."""
 
     def test_unaffordable_contract_returns_zero(self, sizer: PositionSizer) -> None:
         """Deep-audit SR-M4: a $5,000 contract on a $1,000 account must NOT
         be forced to 1 contract (500% of account) — the old floor silently
-        blew max_position_pct. Zero is the correct answer."""
+        blew the per-trade budget (risk.max_position_risk_pct). Zero is the correct answer."""
         result = sizer.calculate(
             account_value=1_000,
             option_price=50.0,  # $5000/contract > account
@@ -289,8 +290,8 @@ class TestFloorAndCap:
         assert result.contracts == 0
         assert "exceeds" in result.reason
 
-    def test_cap_scales_with_account(self, sizer: PositionSizer) -> None:
-        """Cap should scale with account size (1 per $10k)."""
+    def test_the_hard_cap_binds_on_a_huge_account(self, sizer: PositionSizer) -> None:
+        """The budget alone would allow thousands of lots; the hard cap decides."""
         result = sizer.calculate(
             account_value=10_000_000,
             option_price=0.10,  # Very cheap
@@ -299,13 +300,13 @@ class TestFloorAndCap:
             strategy="long_straddle",  # 1.2x multiplier
             underlying_price=450.0,
         )
-        # $10M account: account-scale cap would allow 1000, but the hard
+        # $10M account: the budget alone would allow tens of thousands, but the hard
         # per-trade cap (max_contracts_per_trade, default 10 — added
-        # 2026-07-02 to keep cost-per-trade minimal) binds first.
+        # 2026-07-02 to keep cost-per-trade minimal) binds.
         assert result.contracts == 10
 
-    def test_small_account_cap(self, sizer: PositionSizer) -> None:
-        """$100k account should cap at 10 contracts."""
+    def test_the_hard_cap_binds_on_a_100k_account(self, sizer: PositionSizer) -> None:
+        """$100k account: the budget allows far more than 10, the hard cap holds it at 10."""
         result = sizer.calculate(
             account_value=100_000,
             option_price=0.10,
@@ -315,9 +316,3 @@ class TestFloorAndCap:
             underlying_price=450.0,
         )
         assert result.contracts == 10
-
-    def test_max_contracts_for_budget(self, sizer: PositionSizer) -> None:
-        """max_contracts_for_budget should be budget / (price * 100)."""
-        assert sizer.max_contracts_for_budget(5000, 2.50) == 20
-        assert sizer.max_contracts_for_budget(5000, 0) == 0
-        assert sizer.max_contracts_for_budget(249, 2.50) == 0

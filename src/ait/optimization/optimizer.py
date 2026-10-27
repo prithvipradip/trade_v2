@@ -96,7 +96,7 @@ class StrategyOptimizer:
         initial_capital: float | None = None,     # W90a: None -> account.capital (was a stale 50_000)
         train_days: int | None = None,    # W90b: None -> backtest.walkforward_tuning.train_days (was 365)
         features_cache: "pd.DataFrame | None" = None,
-        # W64: None -> backtest.position_size_pct, else risk.max_position_risk_pct
+        # W64: None -> risk.max_position_risk_pct (W108: backtest.position_size_pct is retired)
         # (live's per-trade budget). Was a 0.05 literal; live funded 0.0133-0.03.
         position_size_pct: float | None = None,
         # W64 live parity (see Backtester): None -> config.

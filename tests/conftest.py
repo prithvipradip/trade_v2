@@ -74,7 +74,6 @@ def risk_config() -> RiskConfig:
 def position_config() -> PositionConfig:
     return PositionConfig(
         max_open_positions=5,
-        max_position_pct=0.05,
         max_portfolio_delta=0.30,
         max_portfolio_risk_pct=0.02,
     )

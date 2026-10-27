@@ -4,13 +4,12 @@
 
 Every setting under `backtest` and `parity`: the research engine, learner, optimizer and parity tools. The sections research shares with the live bot (`ml`, `regime`, `meta_label`, `exit`, `options`, ...) are in [SETTINGS_LIVE.md](SETTINGS_LIVE.md); research reads them from `config.yaml`, and a study or `config_research.yaml` overrides only the keys it names. The *Shipped* column is the value research runs with: the overlay's value when `config_research.yaml` sets the key, else `config.yaml`'s, else the schema default. How the layers combine: [RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#4-configuration-where-every-value-lives).
 
-193 settings; 0 have no description in the schema yet (shown as `-`).
+191 settings; 0 have no description in the schema yet (shown as `-`).
 
 ## Backtest and research (`backtest`)
 
 | Setting | Type | Allowed range | Default | Shipped | Listed in | Meaning |
 |---|---|---|---|---|---|---|
-| `backtest.position_size_pct` | `float \| None` | 0.01 - 0.25 | null | 0.2 | config.yaml | Fraction of capital risked per trade (max-loss basis). |
 | `backtest.history_start_date` | `datetime.date \| None` | - | null | 2024-01-01 | config_research.yaml | First date of the research history. |
 | `backtest.history_days` | `int` | 400 - 6000 | 1826 | 1826 | config_research.yaml | Calendar days of history a research run requests when no history_start_date is set (legacy fallback). |
 | `backtest.research_table_prefix` | `str` | - |  |  | neither (schema default) | Table prefix of the history tables research reads in historical.db. |
@@ -126,7 +125,6 @@ Every setting under `backtest` and `parity`: the research engine, learner, optim
 | `backtest.friction_fit.min_sessions_for_cv` | `int` | 2 - 1000 | 3 | 3 | config_research.yaml | Leave-one-session-out cross-validation needs at least this many trading days; with fewer the forms are compared in-sample. |
 | `backtest.friction_fit.min_train_rows` | `int` | 1 - 100000 | 3 | 3 | config_research.yaml | A cross-validation fold whose training part has fewer rows than this is skipped. |
 | `backtest.friction_fit.min_affine_points` | `int` | 2 - 100000 | 3 | 3 | config_research.yaml | The affine form (a + b * mid) is fitted only from at least this many points, else it falls back to a constant. |
-| `backtest.spread_tuning.max_cost_fraction_of_capital` | `float` | 0.0 - 1.0 | 0.25 | 0.25 | config_research.yaml | A single spread's max loss (credit structures) or cost (debit structures) per contract may not exceed this fraction of capital; a larger one is not opened. |
 | `backtest.spread_tuning.wing_expected_move_fraction` | `float` | 0.0 - 5.0 | 0.5 | 0.5 | config_research.yaml | Wing width of the iron butterfly, put / call credit spreads and jade lizard = wing_k x expected move x this (floored at the wing floor). 0.5 = half an expected move. |
 | `backtest.engine_tuning.put_skew_coefficient` | `float` | 0.0 - 2.0 | 0.1 | 0.1 | config_research.yaml | Legacy put-skew term of the leg-IV model: skew_factor x (log-moneyness OTM) x this. |
 | `backtest.engine_tuning.call_skew_coefficient` | `float` | 0.0 - 2.0 | 0.02 | 0.02 | config_research.yaml | Call-skew term of the leg-IV model: skew_factor x max(0, ln(K/S)) x this. |

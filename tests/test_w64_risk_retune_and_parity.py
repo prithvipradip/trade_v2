@@ -41,18 +41,18 @@ def real_settings():
 class TestRetunedConfig:
     def test_live_values(self, real_settings):
         s = real_settings
-        assert s.risk.max_position_risk_pct == pytest.approx(0.20)
-        assert s.risk.max_daily_loss_pct == pytest.approx(0.20)
+        assert s.risk.max_position_risk_pct == pytest.approx(0.05)   # W108: 0.20 (W100) -> 0.05
+        assert s.risk.max_daily_loss_pct == pytest.approx(0.045)
         assert s.risk.breaker_to_max_loss_ratio == pytest.approx(1.0)
 
     def test_research_values(self):
-        # W68: position_size_pct / budget_aware_wings are research-only knobs; they live in the
-        # research overlay (config_research.yaml), not in the live config.yaml.
+        # W68: budget_aware_wings is a research-only knob; it lives in the research overlay
+        # (config_research.yaml), not in the live config.yaml. W108: backtest.position_size_pct is
+        # retired: research sizes from risk.max_position_risk_pct, the same budget live funds.
         from pathlib import Path
         from ait.config.research import load_research_settings
         s = load_research_settings(str(Path(__file__).resolve().parent.parent / "config.yaml"))
-        # position_size_pct follows live unless a study sets it
-        assert s.backtest.position_size_pct is None
+        assert not hasattr(s.backtest, "position_size_pct")
         assert s.backtest.budget_aware_wings is True
 
     def test_code_defaults_match_config_so_bare_models_do_not_skew(self, real_settings):
@@ -65,27 +65,30 @@ class TestRetunedConfig:
 
 
 # --------------------------------------------------------------------------
-# The link between the two live per-trade knobs
+# The links between the per-trade budget and the aggregate / per-symbol caps
+# (W108: the sizer's own cap, positions.max_position_pct, is retired; one budget remains)
 # --------------------------------------------------------------------------
 class TestPerTradeKnobsAreLinked:
-    def _with(self, real_settings, risk_pct=None, pos_pct=None):
+    def _with(self, real_settings, risk_pct=None, portfolio_pct=None):
         d = real_settings.model_dump(exclude={"ibkr", "api_keys"})
         if risk_pct is not None:
             d["risk"]["max_position_risk_pct"] = risk_pct
-        if pos_pct is not None:
-            d["positions"]["max_position_pct"] = pos_pct
+        if portfolio_pct is not None:
+            d["positions"]["max_portfolio_risk_pct"] = portfolio_pct
         return Settings(**d)
 
-    def test_gate_cap_above_sizer_cap_is_a_startup_error(self, real_settings):
-        with pytest.raises(ValueError, match="max_position_pct"):
+    def test_budget_above_the_aggregate_cap_is_a_startup_error(self, real_settings):
+        with pytest.raises(ValueError, match="max_portfolio_risk_pct"):
             self._with(real_settings, risk_pct=0.25)
 
     def test_equal_is_allowed(self, real_settings):
-        self._with(real_settings, risk_pct=0.05, pos_pct=0.05)
+        self._with(real_settings, risk_pct=0.05, portfolio_pct=0.05)
 
-    def test_sizer_cap_below_gate_cap_is_a_startup_error(self, real_settings):
-        with pytest.raises(ValueError):
-            self._with(real_settings, pos_pct=0.02)
+    def test_the_retired_sizer_cap_is_not_a_key_any_more(self, real_settings):
+        d = real_settings.model_dump(exclude={"ibkr", "api_keys"})
+        d["positions"]["max_position_pct"] = 0.20
+        with pytest.raises(ValueError):          # extra="forbid": a local config naming it is an error
+            Settings(**d)
 
 
 # --------------------------------------------------------------------------
@@ -144,10 +147,11 @@ class _Stub:
 class TestResolvers:
     def test_position_size_precedence(self, real_settings):
         assert resolve_position_size_pct(0.07, real_settings) == pytest.approx(0.07)
-        assert resolve_position_size_pct(None, real_settings) == pytest.approx(0.20)
+        assert resolve_position_size_pct(None, real_settings) == pytest.approx(0.05)
+        # W108: backtest.position_size_pct is retired; the loaded risk budget is the only default
         study = _Stub(backtest=_Stub(position_size_pct=0.10),
                       risk=_Stub(max_position_risk_pct=0.03))
-        assert resolve_position_size_pct(None, study) == pytest.approx(0.10)
+        assert resolve_position_size_pct(None, study) == pytest.approx(0.03)
 
     def test_position_size_survives_missing_settings(self):
         assert resolve_position_size_pct(None, None) == pytest.approx(
@@ -165,7 +169,7 @@ class TestEntryPointsInheritLive:
     def test_walkforward_config(self):
         from ait.backtesting.walkforward import WalkForwardConfig
         c = WalkForwardConfig()
-        assert c.position_size_pct == pytest.approx(0.20)
+        assert c.position_size_pct == pytest.approx(0.05)
         assert c.budget_aware_wings is True
         assert c.max_contracts_per_trade == 1
         e = WalkForwardConfig(position_size_pct=0.03, budget_aware_wings=False,
@@ -176,7 +180,7 @@ class TestEntryPointsInheritLive:
     def test_optimizer(self):
         from ait.optimization.optimizer import StrategyOptimizer
         o = StrategyOptimizer(symbols=["SPY"], strategies=["iron_condor"], n_trials=1)
-        assert o._position_size_pct == pytest.approx(0.20)
+        assert o._position_size_pct == pytest.approx(0.05)
         assert o._budget_aware_wings is True and o._max_contracts_per_trade == 1
         o2 = StrategyOptimizer(symbols=["SPY"], strategies=["iron_condor"], n_trials=1,
                                position_size_pct=0.03, budget_aware_wings=False,
@@ -270,7 +274,7 @@ class TestEngineBudgetAwareWings:
         from ait.backtesting.engine import Backtester
         bt = Backtester(data=_df(), strategies=["iron_condor"])
         assert bt._budget_aware_wings is False and bt._max_contracts_per_trade is None
-        assert bt._position_size_pct == pytest.approx(0.20)
+        assert bt._position_size_pct == pytest.approx(0.05)
 
 
 class TestEngineContractCap:

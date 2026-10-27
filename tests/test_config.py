@@ -22,7 +22,7 @@ class TestValidConfig:
         """Default Settings should validate without errors."""
         settings = Settings()
         assert settings.trading.mode == "paper"
-        assert settings.risk.max_daily_loss_pct == 0.20  # W100: 0.045 -> 0.20 (breaker = one max-loss condor at the 20% budget)
+        assert settings.risk.max_daily_loss_pct == 0.045  # W108: back to 0.045 with the 5% budget (W100 had 0.20)
 
     def test_custom_valid_config(self) -> None:
         settings = Settings(
@@ -35,7 +35,7 @@ class TestValidConfig:
     def test_position_config_defaults(self) -> None:
         config = PositionConfig()
         assert config.max_open_positions == 5
-        assert config.max_position_pct == 0.20
+        assert not hasattr(config, "max_position_pct")   # W108: retired; risk.max_position_risk_pct is the one budget
 
     def test_risk_config_bounds(self) -> None:
         """Risk config should accept values at boundaries."""
@@ -143,13 +143,17 @@ class TestInvalidValues:
         with pytest.raises(ValidationError):
             TradingConfig(scan_interval_seconds=7200)
 
-    def test_max_position_pct_too_high(self) -> None:
+    def test_max_position_risk_pct_too_high(self) -> None:
         with pytest.raises(ValidationError):
-            PositionConfig(max_position_pct=0.50)
+            RiskConfig(max_position_risk_pct=0.50)
 
-    def test_max_position_pct_too_low(self) -> None:
+    def test_max_position_risk_pct_too_low(self) -> None:
         with pytest.raises(ValidationError):
-            PositionConfig(max_position_pct=0.001)
+            RiskConfig(max_position_risk_pct=0.001)
+
+    def test_the_retired_sizer_cap_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            PositionConfig(max_position_pct=0.05)
 
     def test_max_daily_loss_pct_out_of_range(self) -> None:
         with pytest.raises(ValidationError):
