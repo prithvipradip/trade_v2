@@ -266,8 +266,14 @@ def main():
         checks.append({"check": "mirror_sync", "status": "SKIP", "msg": str(e)[:90]})
 
     # [10] orphan raw fills (executions pointing at no known trade)
+    # W105: the operator's manual fills (clientId 0) and the probes' have no bot trade by
+    # design; only a bot order whose fill we could not attribute (origin 'bot', or a row
+    # written before the column existed) is a break.
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(executions)")}
+    only_bot = " AND COALESCE(e.origin,'bot') = 'bot'" if "origin" in cols else ""
     orphans = cur.execute("SELECT COUNT(*) FROM executions e LEFT JOIN trades t "
-                          "ON t.trade_id=e.trade_id WHERE t.trade_id IS NULL").fetchone()[0]
+                          "ON t.trade_id=e.trade_id WHERE t.trade_id IS NULL"
+                          + only_bot).fetchone()[0]
     check("orphan_fills", orphans == 0, f"{orphans} executions with unknown trade_id")
 
     con.close()

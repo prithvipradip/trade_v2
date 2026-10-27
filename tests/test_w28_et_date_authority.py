@@ -143,6 +143,11 @@ class TestTodayEtIsTheEtDate:
         host_tz(BERLIN)
         if not (18 <= now_et().hour <= 23):
             pytest.skip("not inside the 18:00-24:00 ET divergence window")
+        # Berlin is 6h ahead of ET except between the EU and US clock changes (late
+        # October to the first Sunday of November), when it is 5h: the host date then
+        # rolls an hour later (19:00 ET) and the premise below does not hold yet.
+        if now_et().date() == date.today():
+            pytest.skip("the host date has not rolled over yet (5h Berlin/ET gap weeks)")
         assert today_et() != date.today()
 
 

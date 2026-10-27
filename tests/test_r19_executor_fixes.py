@@ -473,7 +473,8 @@ def _sweep_rows(trade, *, order_trade_map: dict,
     rows: list[dict] = []
     ex = TradeExecutor.__new__(TradeExecutor)
     ex._state = SimpleNamespace(record_execution=lambda **kw: rows.append(kw))
-    ex._ibkr = SimpleNamespace(ib=SimpleNamespace(trades=lambda: [trade]))
+    ex._ibkr = SimpleNamespace(ib=SimpleNamespace(
+        trades=lambda: [trade], fills=lambda: list(trade.fills)))   # W105: ledger reads ib.fills()
     ex._order_trade_map = dict(order_trade_map)
     ex._pending_orders = {}
     ex._pending_exit_orders = {}

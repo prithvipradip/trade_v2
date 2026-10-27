@@ -32,7 +32,7 @@ from ait.config.invariants import (  # W70: fixed limits, one visible home
     ORDER_RATE_LIMIT_WINDOW_S,
 )
 from ait.bot.state import StateManager, TradeDirection, TradeRecord, TradeStatus
-from ait.execution.roll_booking import PendingRollOrder, book_roll_fill
+from ait.execution.roll_booking import PendingRollOrder, book_roll_fill, parse_roll_order_ref
 from ait.risk.circuit_breaker import CircuitBreaker
 from ait.strategies.base import (
     CREDIT_STRATEGIES,
@@ -1887,73 +1887,119 @@ class TradeExecutor:
           * single-leg orders: unchanged — price and mid are the same unit.
         """
         try:
+            # W105: the ledger is written from ib.fills() (one entry per execId), not
+            # from each Trade's fills: a fill replayed after a reconnect that has no
+            # Trade object (the operator's manual fills, 11 of them in September) was
+            # never seen. The Trade loop remains for what only a Trade knows: the
+            # order's ids and symbol, and whether it was a combo.
+            trade_of_exec: dict[str, object] = {}
             for t in self._ibkr.ib.trades():
-                oid = t.order.orderId
-                t_perm = getattr(t.order, "permId", 0) or 0
-                self._remember_perm_id(oid, t_perm)
-                is_combo = getattr(t.contract, "secType", "") == "BAG"
-                for f in t.fills:
-                    if not f.execution or not f.execution.execId:
-                        continue
-                    # R19: attribute per FILL, not per Trade. A trade
-                    # recovered via reqCompletedOrders after a reconnect can
-                    # carry order.orderId = 0 (IBKR keys completed orders by
-                    # permId), which used to write every one of its fills with
-                    # order_id 0 and trade_id '' — the ledger declared "the
-                    # ground truth the PF verdict needs" losing commission and
-                    # P&L attribution for exactly the fills around a
-                    # connection loss. Execution objects carry the true
-                    # orderId and permId; prefer whichever key resolves.
-                    f_oid = int(getattr(f.execution, "orderId", 0) or 0)
-                    f_perm = int(getattr(f.execution, "permId", 0) or 0)
-                    row_oid = int(oid or 0) or f_oid
-                    row_perm = int(t_perm or 0) or f_perm
-                    self._remember_perm_id(row_oid, row_perm)
-                    trade_id, sig_price, live_mid, nbbo = self._ledger_context(
-                        row_oid, row_perm)
-                    px = float(f.execution.price or 0)
-                    # R16: see the docstring — combo context belongs on the
-                    # combo row only, in the combo row's own unit.
-                    if is_combo:
-                        if self._is_bag_row(f):
-                            px = abs(px)
-                            row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
-                        else:
-                            row_sig = row_mid = row_nbbo = 0.0
-                    else:
+                self._remember_perm_id(t.order.orderId,
+                                       getattr(t.order, "permId", 0) or 0)
+                for tf in t.fills:
+                    if tf.execution and tf.execution.execId:
+                        trade_of_exec[tf.execution.execId] = t
+            for f in self._ibkr.ib.fills():
+                if not f.execution or not f.execution.execId:
+                    continue
+                t = trade_of_exec.get(f.execution.execId)
+                oid = t.order.orderId if t is not None else 0
+                t_perm = (getattr(t.order, "permId", 0) or 0) if t is not None else 0
+                # R19: attribute per FILL, not per Trade. A trade
+                # recovered via reqCompletedOrders after a reconnect can
+                # carry order.orderId = 0 (IBKR keys completed orders by
+                # permId), which used to write every one of its fills with
+                # order_id 0 and trade_id '' — the ledger declared "the
+                # ground truth the PF verdict needs" losing commission and
+                # P&L attribution for exactly the fills around a
+                # connection loss. Execution objects carry the true
+                # orderId and permId; prefer whichever key resolves.
+                f_oid = int(getattr(f.execution, "orderId", 0) or 0)
+                f_perm = int(getattr(f.execution, "permId", 0) or 0)
+                row_oid = int(oid or 0) or f_oid
+                row_perm = int(t_perm or 0) or f_perm
+                self._remember_perm_id(row_oid, row_perm)
+                client_id = getattr(f.execution, "clientId", None)
+                order_ref = str(getattr(f.execution, "orderRef", "") or "")
+                trade_id, sig_price, live_mid, nbbo = self._ledger_context(
+                    row_oid, row_perm, order_ref)
+                origin = self._execution_origin(trade_id, client_id, order_ref)
+                # A fill with a Trade knows whether its order was a combo and the order's
+                # symbol; a fill replayed without one (manual) only has its own contract.
+                is_combo = (getattr(t.contract, "secType", "") == "BAG"
+                            if t is not None else self._is_bag_row(f))
+                symbol = ((getattr(t.contract, "symbol", "") or "") if t is not None
+                          else (getattr(f.contract, "symbol", "") or ""))
+                px = float(f.execution.price or 0)
+                # R16: see the docstring — combo context belongs on the
+                # combo row only, in the combo row's own unit.
+                if is_combo:
+                    if self._is_bag_row(f):
+                        px = abs(px)
                         row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
-                    # W48: None means "not yet reported" -- a real 0.0
-                    # broker report (routine for a BAG summary row) must
-                    # stay distinguishable from a fill still awaiting one.
-                    # See record_execution's docstring.
-                    comm = None
-                    rpnl = 0.0
-                    if f.commissionReport:
-                        comm = float(f.commissionReport.commission or 0.0)
-                        rp = f.commissionReport.realizedPNL
-                        rpnl = float(rp) if rp and rp == rp and abs(rp) < 1e12 else 0.0
-                    self._state.record_execution(
-                        exec_id=f.execution.execId,
-                        order_id=row_oid,
-                        perm_id=row_perm,
-                        trade_id=trade_id,
-                        symbol=t.contract.symbol,
-                        con_id=getattr(f.contract, "conId", 0) or 0,
-                        side=f.execution.side,
-                        shares=float(f.execution.shares or 0),
-                        price=px,
-                        exec_time=self._normalize_exec_time(f.execution.time),
-                        commission=comm,
-                        realized_pnl=rpnl,
-                        signal_price=row_sig,
-                        live_mid=row_mid,
-                        nbbo_spread=row_nbbo,
-                    )
+                    else:
+                        row_sig = row_mid = row_nbbo = 0.0
+                else:
+                    row_sig, row_mid, row_nbbo = sig_price, live_mid, nbbo
+                # W48: None means "not yet reported" -- a real 0.0
+                # broker report (routine for a BAG summary row) must
+                # stay distinguishable from a fill still awaiting one.
+                # See record_execution's docstring.
+                comm = None
+                rpnl = 0.0
+                if f.commissionReport:
+                    comm = float(f.commissionReport.commission or 0.0)
+                    rp = f.commissionReport.realizedPNL
+                    rpnl = float(rp) if rp and rp == rp and abs(rp) < 1e12 else 0.0
+                self._state.record_execution(
+                    exec_id=f.execution.execId,
+                    order_id=row_oid,
+                    perm_id=row_perm,
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    con_id=getattr(f.contract, "conId", 0) or 0,
+                    side=f.execution.side,
+                    shares=float(f.execution.shares or 0),
+                    price=px,
+                    # W105: Fill.time, not Execution.time. ib_insync converts a
+                    # zone-less gateway time with the HOST's zone, so a live fill's
+                    # Execution.time was off by minus the host's UTC offset (2 h on
+                    # the 2026-09-28 fill); Fill.time is the aware UTC arrival time
+                    # for a live fill and the execution time for a replayed one.
+                    exec_time=self._normalize_exec_time(
+                        getattr(f, "time", None) or f.execution.time),
+                    commission=comm,
+                    realized_pnl=rpnl,
+                    signal_price=row_sig,
+                    live_mid=row_mid,
+                    nbbo_spread=row_nbbo,
+                    client_id=int(client_id) if client_id is not None else None,
+                    order_ref=order_ref,
+                    origin=origin,
+                )
         except Exception as e:  # noqa: BLE001
             log.debug("executions_sweep_failed", error=str(e))
 
-    def _ledger_context(self, order_id: int,
-                        perm_id: int = 0) -> tuple[str, float, float, float]:
+    @staticmethod
+    def _execution_origin(trade_id: str, client_id, order_ref: str) -> str:
+        """W105: who placed the order behind a ledger row.
+
+        ``bot``: attributed to a trade, or placed by the bot but not attributed (a real
+        orphan: the readers must keep flagging it). ``manual``: the operator in TWS
+        (clientId 0). ``other``: carries an order reference that matches no trade (the
+        probes, other tools). The operator manages by hand only what was opened by hand,
+        so a manual fill never belongs to a bot trade.
+        """
+        if trade_id:
+            return "bot"
+        if client_id is not None and int(client_id) == 0:
+            return "manual"
+        if order_ref:
+            return "other"
+        return "bot"
+
+    def _ledger_context(self, order_id: int, perm_id: int = 0,
+                        order_ref: str = "") -> tuple[str, float, float, float]:
         """R19: (trade_id, signal_price, live_mid, nbbo_spread) for a ledger
         row, resolved by orderId and — when that fails — by permId.
 
@@ -1969,6 +2015,13 @@ class TradeExecutor:
             trade_id = getattr(_p, "trade_id", "") if _p else ""
         if not trade_id and perm_id:
             trade_id = self._perm_maps()[1].get(int(perm_id), "")
+        if not trade_id and order_ref:
+            # W105: the maps above live in memory and are empty after a restart, but the
+            # bot tags every order with orderRef == trade_id (a roll with ROLL:<A>:<B>,
+            # booked to the closing trade like the in-memory path). Only a reference that
+            # IS a known trade attributes the fill: manual (no ref) and probe refs match
+            # nothing and stay unattributed.
+            trade_id = self._trade_id_from_order_ref(order_ref)
         pend = (getattr(self, "_pending_orders", {}).get(order_id)
                 or getattr(self, "_pending_exit_orders", {}).get(order_id))
         # R13 (shadow-referee break #7): the pending entry is gone by the
@@ -1982,6 +2035,17 @@ class TradeExecutor:
         live_mid = (getattr(pend, "live_mid", 0.0) or 0.0) or ctx[1]
         nbbo = (getattr(pend, "nbbo_spread", 0.0) or 0.0) or ctx[2]
         return trade_id, sig_price, live_mid, nbbo
+
+    def _trade_id_from_order_ref(self, order_ref: str) -> str:
+        """W105: the trade an orderRef names, or '' (unknown / not ours)."""
+        try:
+            ref = order_ref
+            rolled = parse_roll_order_ref(order_ref)
+            if rolled:
+                ref = rolled[0]
+            return ref if self._state.get_trade_by_id(ref) is not None else ""
+        except Exception:  # noqa: BLE001 — attribution is best-effort, never blocks the sweep
+            return ""
 
     @staticmethod
     def _normalize_exec_time(t) -> str:

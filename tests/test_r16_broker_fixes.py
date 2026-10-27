@@ -165,7 +165,8 @@ def _sweep(fills: list, sec_type: str = "BAG") -> list[dict]:
     )
     ex = TradeExecutor.__new__(TradeExecutor)
     ex._state = SimpleNamespace(record_execution=lambda **kw: rows.append(kw))
-    ex._ibkr = SimpleNamespace(ib=SimpleNamespace(trades=lambda: [trade]))
+    ex._ibkr = SimpleNamespace(ib=SimpleNamespace(
+        trades=lambda: [trade], fills=lambda: list(trade.fills)))   # W105: ledger reads ib.fills()
     ex._order_trade_map = {555: "T-SPY"}
     ex._pending_orders = {}
     ex._pending_exit_orders = {}
