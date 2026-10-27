@@ -78,12 +78,10 @@ ORDER_ENTRY = [
 ]
 
 CEILINGS = [
-    ("risk.max_position_risk_pct", "One structure's maximum loss as a fraction of net liquidation; also the budget the condor builder is handed"),
+    ("risk.max_position_risk_pct", "One structure's maximum loss as a fraction of net liquidation; also the budget the condor builder, the position sizer and the research engine are handed"),
     ("risk.max_daily_loss_pct", "The daily-loss breaker; blocks new entries only, exits keep running"),
-    ("positions.max_position_pct", "The position sizer's hard per-position cap"),
     ("positions.max_portfolio_risk_pct", "Aggregate open capital at risk"),
     ("risk.max_symbol_concentration_pct", "Exposure in one symbol"),
-    ("backtest.position_size_pct", "Research per-trade size, never looser than live's per-trade range"),
 ]
 
 # Meanings written by hand where the schema description is a continuation of the previous setting ("... and ..."), empty, or carries a
@@ -122,7 +120,8 @@ MEANING: dict[str, str] = {
     "ml.range_min_confidence": "Floor applied to a signal's confidence once a payoff-matched model (range, vol-magnitude) has replaced it. Enforce mode only.",
     "ml.observe_mode_neutral_confidence": "Observe mode only: the confidence a direction-neutral structure carries into risk validation instead of the directional confidence.",
     "positions.max_portfolio_risk_pct": "Aggregate capital at risk across all open positions, as a fraction of net liquidation.",
-    "risk.max_position_risk_pct": "Maximum loss of one trade as a fraction of net liquidation, and the budget the condor builder is handed to size the wings.",
+    "risk.max_daily_loss_pct": "Daily loss breaker, as a fraction of net liquidation (realised and mark-to-market); it blocks new entries only, exits keep running. The startup self-test expects it to be at least `risk.breaker_to_max_loss_ratio` times the largest max loss the builder emits.",
+    "risk.max_position_risk_pct": "Maximum loss of one trade as a fraction of net liquidation, and THE budget: the condor builder sizes the wings from it, the position sizer counts lots from it, and the research engine and pool use the same number.",
     "risk.max_symbol_concentration_pct": "Maximum fraction of the account in one symbol (a risk-manager gate separate from the aggregate cap `positions.max_portfolio_risk_pct`).",
     "ml.binary_cv_min_gap_days": "Minimum purge gap in the binary models' validation; the gap used is the larger of this and the label horizon, so overlapping labels cannot leak into the validation score.",
     "exit.exit_cross_amount": "How far a combo exit limit crosses the spread so the close actually fills.",

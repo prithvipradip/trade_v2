@@ -63,9 +63,8 @@ DEPLOYED_NLV = 10_000.0
 @pytest.fixture(scope="module")
 def settings():
     # These tests describe the 5% per-trade regime (a $2.1k account cannot hold a $120 condor).
-    # Pin it so they do not move with the shipped per-trade budget (W100: 0.20 in config.yaml).
+    # Pin it so they do not move with the shipped per-trade budget (W108: 0.05 again after W100's 0.20).
     s = load_settings("config.yaml").model_copy(deep=True)
-    s.positions.max_position_pct = 0.05
     s.risk.max_position_risk_pct = 0.05
     s.risk.max_daily_loss_pct = 0.045
     return s
@@ -209,8 +208,7 @@ class TestTheProbeUsesTheBudgetTheBuilderReceives:
         at the builder itself, which is the only place the claim is true or false.
         """
         s = settings.model_copy(deep=True)
-        s.risk.max_position_risk_pct = 0.10      # gate LOOSER than the sizer
-        s.positions.max_position_pct = 0.05
+        s.risk.max_position_risk_pct = 0.10
 
         seen: list[float] = []
         real = IronCondor.generate_signals
@@ -225,40 +223,28 @@ class TestTheProbeUsesTheBudgetTheBuilderReceives:
         assert seen, "the check never ran the builder at all"
         assert set(seen) == {DEPLOYED_NLV * 0.10}, (
             f"the builder was funded {sorted(set(seen))} but the live scan hands "
-            f"it nlv * max_position_risk_pct = {DEPLOYED_NLV * 0.10}; "
-            f"min(gate, sizer) would be {DEPLOYED_NLV * 0.05}"
+            f"it nlv * max_position_risk_pct = {DEPLOYED_NLV * 0.10}"
         )
 
-    def test_it_alerts_when_the_gate_cap_outruns_the_sizer_cap(self, settings):
-        """R26's acceptance case: gate 10% / sizer 5% at $10k must alert.
-
-        This is the documented Phase-2 recipe (PLAN.md: max_position_risk_pct
-        0.03 -> 0.07). At HEAD it produced zero alerts.
-        """
+    def test_no_second_cap_exists_to_skew_against(self, settings):
+        """W108: R26's acceptance case (gate 10% / sizer 5% at $10k must alert) is retired with the
+        knob. positions.max_position_pct no longer exists, the sizer is funded from
+        risk.max_position_risk_pct, and the check names no retired knob at a raised budget."""
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.10
-        s.positions.max_position_pct = 0.05
 
         probe = _Probe(s)
         assert _run(probe, DEPLOYED_NLV)
-
-        assert any("positions.max_position_pct" in a for a in probe.alerts), (
-            f"the sizer cap bricks every entry at this setting and the check did "
-            f"not name it: {probe.alerts}"
-        )
+        assert not any("max_position_pct" in a or "cap-grid SKEW" in a for a in probe.alerts), (
+            f"the retired two-knob skew arm is back: {probe.alerts}")
 
     @pytest.mark.asyncio
-    async def test_the_real_risk_manager_agrees_the_entry_is_bricked(self, settings):
-        """The W25 ADDENDUM's own condition, against the real validate_trade.
-
-        Raising max_position_risk_pct above max_position_pct must not SILENTLY
-        brick entries. Two halves, and both must hold: the real manager really
-        does refuse the structure the builder builds, and the check really does
-        say so.
-        """
+    async def test_the_real_risk_manager_approves_what_the_builder_builds(self, settings):
+        """W108 (was: ...agrees_the_entry_is_bricked). With one budget the real validate_trade, which
+        runs the real sizer, approves the structure the real builder emits at a raised budget: the
+        silent brick the W25 ADDENDUM registered cannot occur."""
         s = settings.model_copy(deep=True)
         s.risk.max_position_risk_pct = 0.10
-        s.positions.max_position_pct = 0.05
 
         probe = _Probe(s)
         built = [p for p in probe._probe_cap_grid(DEPLOYED_NLV * 0.10)["probes"]
@@ -270,16 +256,10 @@ class TestTheProbeUsesTheBudgetTheBuilderReceives:
             entry_price=1.20, confidence=0.70, implied_vol=0.22,
             max_loss=built[0]["max_loss"], vix=16.0, iv_rank=55.0,
         ))
-        assert not verdict.approved, (
-            f"premise moved: the real manager now approves a ${built[0]['max_loss']} "
-            f"structure at ${DEPLOYED_NLV:,.0f}, so nothing is bricked ({verdict.reason})"
-        )
-
-        assert await probe._launch_size_coherence_check(DEPLOYED_NLV)
-        assert probe.alerts, (
-            "the real manager refuses this structure and the self-test stayed "
-            "silent — exactly the silent-brick the ADDENDUM registered"
-        )
+        assert verdict.approved, (
+            f"the real manager refuses a ${built[0]['max_loss']} structure the builder was funded "
+            f"for at ${DEPLOYED_NLV:,.0f}: {verdict.reason}")
+        assert verdict.position_size == 1
 
 
 class TestTheBuilderIsActuallyExecuted:

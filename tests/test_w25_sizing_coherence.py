@@ -40,9 +40,8 @@ from ait.risk.position_sizer import PositionSizer  # noqa: E402
 @pytest.fixture(scope="module")
 def settings():
     # These tests describe the 5% per-trade regime (a $2.1k account cannot hold a $120 condor).
-    # Pin it so they do not move with the shipped per-trade budget (W100: 0.20 in config.yaml).
+    # Pin it so they do not move with the shipped per-trade budget (W108: 0.05 again after W100's 0.20).
     s = load_settings("config.yaml").model_copy(deep=True)
-    s.positions.max_position_pct = 0.05
     s.risk.max_position_risk_pct = 0.05
     s.risk.max_daily_loss_pct = 0.045
     return s
@@ -78,7 +77,7 @@ def _zero_verdict_request(symbol: str = "QQQ") -> TradeRequest:
     max_loss is deliberately None: that is the only shape that reaches the haircut,
     because gate 6b (manager.py:512) rejects every defined-risk path first. With
     max_loss unset the sizer prices off the credit, and $1.20 x 100 = $120 exceeds
-    the $105 that positions.max_position_pct allows at $2.1k.
+    the $105 that the 5% budget allows at $2.1k.
     """
     return TradeRequest(
         symbol=symbol, strategy="iron_condor", direction="short", contracts=1,
@@ -377,7 +376,7 @@ class TestLaunchSizeCoherenceCheck:
         probe = IronCondor()
         # W64: pin the 3% budget this test was written under. The live value
         # moved to 5% ($105 here -> a $1.17 wing), which is a different premise.
-        probe.risk_budget = 2100.0 * min(0.03, settings.positions.max_position_pct)
+        probe.risk_budget = 2100.0 * 0.03
         real_width = probe._vol_scaled_width(1.0, None, None, None)
 
         assert real_width == pytest.approx(1.00, abs=0.01), (
@@ -433,36 +432,18 @@ class TestLaunchSizeCoherenceCheck:
         )
 
     @pytest.mark.asyncio
-    async def test_it_reads_both_caps_not_just_one(self, settings):
-        """D2: positions.max_position_pct must reach the verdict, not just gate 6b.
+    async def test_the_sizer_and_the_gate_share_one_budget(self, settings):
+        """W108: positions.max_position_pct is retired, so there is no second cap for the check to read.
 
-        W31 REWRITE. This used to assert the $50k run was SILENT and the starved
-        run alerted. Post-W31 both runs alert — $50k trips the breaker arm (see
-        TestTheBreakerArmSeesTheLargestStructure) — so "silent vs alerting" would
-        pass while measuring nothing, the vacuity this file exists to prevent.
-        The claim was never about silence: it is that the sizer cap is READ. So
-        compare the PROBLEM SETS, and require a problem that names that knob and
-        appears only when it binds.
+        This used to prove the sizer cap reached the verdict (a 0.1% sizer cap alerted). The
+        claim that replaces it: the check names no retired knob, and the structure the real
+        builder emits clears the real manager AND the real sizer at the same budget.
         """
         healthy = _CoherenceProbe(settings)
         await healthy._launch_size_coherence_check(50_000.0)
-        assert not any("positions.max_position_pct" in a for a in healthy.alerts), (
-            "premise moved: the sizer cap already binds at $50k on the real "
-            f"config, so this can no longer isolate it: {healthy.alerts}"
-        )
-
-        starved = _CoherenceProbe(settings)
-        starved._settings = settings.model_copy(deep=True)
-        starved._settings.positions.max_position_pct = 0.001  # $50 cap at $50k
-
-        await starved._launch_size_coherence_check(50_000.0)
-
-        assert any("positions.max_position_pct" in a for a in starved.alerts), (
-            "a 0.1% sizer cap caps a position at $50 while the builder is funded "
-            "$1,500 and emits a structure risking far more — the check never "
-            "named that knob, so it is reading only risk.max_position_risk_pct "
-            f"again: {starved.alerts}"
-        )
+        assert not any("max_position_pct" in a or "cap-grid SKEW" in a for a in healthy.alerts), (
+            f"the retired two-knob skew arm is back: {healthy.alerts}")
+        assert not hasattr(settings.positions, "max_position_pct")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("nlv,expected", [

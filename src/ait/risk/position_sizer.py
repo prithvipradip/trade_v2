@@ -1,7 +1,7 @@
 """Volatility-adjusted position sizing with Kelly criterion.
 
 Determines how many contracts to trade based on:
-- Account size and max position percentage
+- Account size and the per-trade budget (risk.max_position_risk_pct)
 - Current volatility of the underlying
 - ML model confidence
 - Strategy type (spreads risk less than naked options)
@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ait.config.settings import PositionConfig, PositionSizingConfig, RiskConfig
+from ait.risk.lot_sizing import lots_for_budget
 from ait.utils.logging import get_logger
 
 log = get_logger("risk.sizer")
@@ -105,8 +106,9 @@ class PositionSizer:
         # crash; the upstream credit fail-closed gate is unaffected.
         vix = vix or 0.0
 
-        # Base: max position as percentage of account
-        max_position_value = account_value * self._pos_config.max_position_pct
+        # W108: the per-trade budget is ONE number, risk.max_position_risk_pct, the same one gate 6b
+        # enforces and the condor builder is funded with (the sizer's former second cap,
+        # positions.max_position_pct, is retired). It is applied inside lots_for_budget below.
         cost_per_contract = option_price * 100  # Options are 100 shares
 
         # Confidence adjustment: scale down for low confidence
@@ -155,31 +157,29 @@ class PositionSizer:
         # elevated (75%).
         vix_adj = self._tier_factor(vix, sz.vix_size_tiers)
 
-        # Calculate contracts
-        adjusted_max = (max_position_value * conf_adj * vol_adj
-                        * strategy_adj * iv_rank_adj * drawdown_adj * vix_adj)
-        max_contracts = int(adjusted_max / cost_per_contract)
-
-        # Scale cap with account size: 10 contracts per $100k, minimum 1
-        account_scale_cap = max(1, int(account_value / 10_000))
-        # Hard per-trade contract cap (config) — keep cost-per-trade small so
-        # the book can hold many more concurrent positions (learning volume).
-        hard_cap = self._pos_config.max_contracts_per_trade
-        # Deep-audit SR-M4 + R7-SOON (launch coherence): viability is decided
-        # by the HARD cap alone (account x max_position_pct). The SOFT
-        # multipliers (confidence, vol, strategy, IV-rank, drawdown, VIX)
-        # used to gate viability too — at small NLV they shrank the budget
-        # below ONE contract and bricked every defined-risk entry (0.07 x
-        # $2.1k = $147 budget x 0.4 IC strategy_adj x ... = $17-42 vs $130
-        # min condor -> 0 contracts, account unusable). SR-M4's intent is
-        # honored by the hard check: a structure the raw cap can't afford is
-        # still 0. Soft multipliers throttle COUNT above the 1-contract floor.
-        if cost_per_contract > max_position_value:
+        # W108: the six multipliers are computed (they are reported on PositionSize) but they
+        # ACT only for a strategy in position_sizing.scaled_strategies (empty today); every other
+        # strategy is sized by the budget alone. Either way the count comes from the ONE shared
+        # rule (ait.risk.lot_sizing), the same one the research engine and pool call:
+        #   - viability is decided by the UNSCALED budget (Deep-audit SR-M4 + R7-SOON: at small
+        #     NLV the soft multipliers shrank the budget below ONE contract and bricked every
+        #     defined-risk entry: 0.07 x $2.1k = $147 x 0.4 IC strategy_adj x ... = $17-42 vs a
+        #     $130 minimum condor -> 0 contracts, account unusable). A structure one lot of which
+        #     exceeds the raw budget is 0 (rejected);
+        #   - the multipliers throttle the COUNT above the 1-contract floor, never below it;
+        #   - positions.max_contracts_per_trade caps it (keeps cost-per-trade small so the book
+        #     can hold many concurrent positions).
+        scaler = 1.0
+        if strategy in sz.scaled_strategies:
+            scaler = (conf_adj * vol_adj * strategy_adj * iv_rank_adj
+                      * drawdown_adj * vix_adj)
+        contracts = lots_for_budget(
+            cost_per_contract, account_value, self._risk_config.max_position_risk_pct,
+            max_lots=self._pos_config.max_contracts_per_trade, scaler=scaler)
+        if contracts < 1:
             return PositionSize(0, 0.0, conf_adj, vol_adj,
-                                "single contract exceeds max_position_pct cap")
-        if max_contracts < 1:
-            max_contracts = 1
-        contracts = min(max_contracts, account_scale_cap, hard_cap)
+                                "single contract exceeds the per-trade budget "
+                                "(risk.max_position_risk_pct)")
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).
         # For naked options, risk is the full premium paid.
@@ -187,7 +187,8 @@ class PositionSizer:
 
         reason = (
             f"account=${account_value:.0f}, "
-            f"max_pos={self._pos_config.max_position_pct:.0%}, "
+            f"budget={self._risk_config.max_position_risk_pct:.0%}, "
+            f"scaled={'yes' if strategy in sz.scaled_strategies else 'no'}, "
             f"conf_adj={conf_adj:.2f}, vol_adj={vol_adj:.2f}, "
             f"iv_rank_adj={iv_rank_adj:.2f}, strat_adj={strategy_adj:.1f}"
         )
@@ -208,11 +209,3 @@ class PositionSizer:
             volatility_adjustment=vol_adj,
             reason=reason,
         )
-
-    def max_contracts_for_budget(
-        self, budget: float, option_price: float
-    ) -> int:
-        """Simple calculation: how many contracts can we afford."""
-        if option_price <= 0:
-            return 0
-        return int(budget / (option_price * 100))

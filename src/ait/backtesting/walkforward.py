@@ -34,6 +34,7 @@ from ait.ml.feature_spec import FeatureSpec, spec_from_config  # W88d
 from ait.config.settings import (
     MLConfig,
     PositionConfig,
+    RiskConfig,
     WalkForwardTuningConfig,
     loaded_account_capital,
     loaded_cash_yield,
@@ -2839,6 +2840,15 @@ class WalkForwardBacktester:
                 None, "positions", "max_portfolio_risk_pct", PositionConfig, self._settings)),
             "max_open_positions": int(resolve_config_value(
                 None, "positions", "max_open_positions", PositionConfig, self._settings)),
+            # W108: live's remaining book-level entry gates (risk manager 6c, 4b and 5), from the
+            # same loaded settings. The per-expiry env override (AIT_MAX_PER_EXPIRY) is a
+            # deployment knob and is not modelled; the config home is risk.max_positions_per_expiry.
+            "max_symbol_concentration_pct": float(resolve_config_value(
+                None, "risk", "max_symbol_concentration_pct", RiskConfig, self._settings)),
+            "max_positions_per_expiry": int(resolve_config_value(
+                None, "risk", "max_positions_per_expiry", RiskConfig, self._settings)),
+            "max_correlated_positions": int(resolve_config_value(
+                None, "risk", "max_correlated_positions", RiskConfig, self._settings)),
         }
 
     def _prior_window_is_trusted(self, prior_oos_result) -> bool:

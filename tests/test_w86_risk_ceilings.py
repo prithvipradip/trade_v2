@@ -1,9 +1,9 @@
 """W86a: the risk-family ceilings are raised, consistent, and linked.
 
-Operator decision 2026-10-21: risk.max_position_risk_pct 0.10 -> 0.25, risk.max_daily_loss_pct 0.10 -> 0.20,
-positions.max_position_pct 0.25 -> 0.30 (config VALUES unchanged). The same wave:
+Operator decision 2026-10-21: risk.max_position_risk_pct 0.10 -> 0.25, risk.max_daily_loss_pct 0.10 -> 0.20
+(config VALUES unchanged). W108 (2026-10-27) retired positions.max_position_pct and backtest.position_size_pct
+(one per-trade budget, risk.max_position_risk_pct) and returned the shipped values to 0.05 / 0.045. The same wave:
 
-  * backtest.position_size_pct (research per-trade size) no longer outranges live's per-trade ceiling
   * the per-trade budget must also fit under the aggregate cap (gate 6b-2) and the single-symbol cap
     (gate 6c); above either, every entry is refused at runtime, silently, so it is a startup error
   * the GUIDE table of ranges is the model's (a drift test)
@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from ait.config.settings import (
-    BacktestConfig, PositionConfig, RiskConfig, Settings, load_settings, resolve_position_size_pct,
+    PositionConfig, RiskConfig, Settings, load_settings, resolve_position_size_pct,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +42,6 @@ class TestCeilings:
     @pytest.mark.parametrize("model, field, top, above", [
         (RiskConfig, "max_position_risk_pct", 0.25, 0.26),
         (RiskConfig, "max_daily_loss_pct", 0.20, 0.21),
-        (PositionConfig, "max_position_pct", 0.30, 0.31),
-        (BacktestConfig, "position_size_pct", 0.25, 0.26),
     ])
     def test_the_new_top_is_accepted_and_just_above_is_not(self, model, field, top, above):
         assert getattr(model(**{field: top}), field) == top
@@ -54,24 +52,22 @@ class TestCeilings:
     def test_the_floors_did_not_move(self):
         assert _bounds(RiskConfig, "max_position_risk_pct")[0] == 0.005
         assert _bounds(RiskConfig, "max_daily_loss_pct")[0] == 0.005
-        assert _bounds(PositionConfig, "max_position_pct")[0] == 0.01
         with pytest.raises(ValidationError):
             RiskConfig(max_daily_loss_pct=0.001)
 
     def test_the_ranges_that_stayed_still_reject(self):
-        """tests/test_config.py pins 0.50 for both; they must still be out of range."""
+        """tests/test_config.py pins 0.50; it must still be out of range."""
         with pytest.raises(ValidationError):
-            PositionConfig(max_position_pct=0.50)
+            RiskConfig(max_position_risk_pct=0.50)
         with pytest.raises(ValidationError):
             RiskConfig(max_daily_loss_pct=0.50)
 
     def test_the_shipped_values_are_unchanged(self, real_settings):
         s = real_settings
-        assert (s.risk.max_position_risk_pct, s.risk.max_daily_loss_pct,
-                s.positions.max_position_pct) == (0.20, 0.20, 0.20)
+        assert (s.risk.max_position_risk_pct, s.risk.max_daily_loss_pct) == (0.05, 0.045)   # W108
         assert (s.positions.max_portfolio_risk_pct, s.risk.max_symbol_concentration_pct) == (0.20, 0.20)
         again = load_settings("config.yaml", ignore_frozen=True)       # the file itself loads
-        assert again.risk.max_position_risk_pct == 0.20
+        assert again.risk.max_position_risk_pct == 0.05
 
     def test_an_explicit_research_size_is_not_bounded_by_the_yaml_ceiling(self):
         """The ceiling bounds the config VALUE; a deliberate constructor argument (a sizing study) is
@@ -89,27 +85,27 @@ class TestLinks:
         return Settings(**d)
 
     def test_a_raise_that_clears_every_cap_is_accepted(self, real_settings):
-        s = self._with(real_settings, risk__max_position_risk_pct=0.25, positions__max_position_pct=0.30,
+        s = self._with(real_settings, risk__max_position_risk_pct=0.25,
                        positions__max_portfolio_risk_pct=0.50, risk__max_symbol_concentration_pct=0.50)
         assert s.risk.max_position_risk_pct == 0.25
 
     def test_equal_caps_are_allowed(self, real_settings):
-        self._with(real_settings, risk__max_position_risk_pct=0.20, positions__max_position_pct=0.20)
+        self._with(real_settings, risk__max_position_risk_pct=0.20)
 
     def test_above_the_aggregate_cap_is_a_startup_error(self, real_settings):
         with pytest.raises(ValueError, match="max_portfolio_risk_pct.*gate 6b-2"):
-            self._with(real_settings, risk__max_position_risk_pct=0.25, positions__max_position_pct=0.30,
+            self._with(real_settings, risk__max_position_risk_pct=0.25,
                        risk__max_symbol_concentration_pct=0.50)
 
     def test_above_the_symbol_concentration_cap_is_a_startup_error(self, real_settings):
         with pytest.raises(ValueError, match="max_symbol_concentration_pct.*gate 6c"):
-            self._with(real_settings, risk__max_position_risk_pct=0.25, positions__max_position_pct=0.30,
+            self._with(real_settings, risk__max_position_risk_pct=0.25,
                        positions__max_portfolio_risk_pct=0.50)
 
-    def test_above_the_sizer_cap_is_still_a_startup_error(self, real_settings):
-        with pytest.raises(ValueError, match="max_position_pct"):
-            self._with(real_settings, risk__max_position_risk_pct=0.25, positions__max_portfolio_risk_pct=0.50,
-                       risk__max_symbol_concentration_pct=0.50)
+    def test_the_sizer_cap_is_not_a_key_any_more(self, real_settings):
+        """W108: positions.max_position_pct is retired (one per-trade budget); naming it is an error."""
+        with pytest.raises(ValueError):
+            self._with(real_settings, positions__max_position_pct=0.30)
 
     def test_lowering_the_aggregate_cap_below_the_shipped_budget_is_refused(self, real_settings):
         with pytest.raises(ValueError, match="gate 6b-2"):
@@ -117,7 +113,7 @@ class TestLinks:
 
     def test_the_breaker_below_one_max_loss_is_not_a_startup_error(self, real_settings):
         """Alert-only by design (orchestrator A2): a measurement of the real builder."""
-        self._with(real_settings, risk__max_position_risk_pct=0.20, positions__max_position_pct=0.30,
+        self._with(real_settings, risk__max_position_risk_pct=0.20,
                    risk__max_daily_loss_pct=0.05)
 
 
@@ -131,11 +127,10 @@ class TestGuideIsTheModel:
     def test_the_ranges_table_matches_the_schema(self):
         sec = _ceilings_block()
         rows = re.findall(r"^\|\s*`([a-z_.]+)`\s*\|[^|]*\|\s*([0-9.]+) - ([0-9.]+)\s*\|", sec, re.M)
-        models = {"risk": RiskConfig, "positions": PositionConfig, "backtest": BacktestConfig}
+        models = {"risk": RiskConfig, "positions": PositionConfig}
         assert {n for n, _, _ in rows} == {
-            "risk.max_position_risk_pct", "risk.max_daily_loss_pct", "positions.max_position_pct",
-            "positions.max_portfolio_risk_pct", "risk.max_symbol_concentration_pct",
-            "backtest.position_size_pct"}
+            "risk.max_position_risk_pct", "risk.max_daily_loss_pct",
+            "positions.max_portfolio_risk_pct", "risk.max_symbol_concentration_pct"}
         for name, lo, hi in rows:
             section, field = name.split(".")
             ge, le = _bounds(models.get(section, RiskConfig), field)
@@ -144,7 +139,6 @@ class TestGuideIsTheModel:
     def test_the_shipped_values_column_is_the_config(self, real_settings):
         sec = _ceilings_block()
         for name, value in (("risk.max_position_risk_pct", real_settings.risk.max_position_risk_pct),
-                            ("risk.max_daily_loss_pct", real_settings.risk.max_daily_loss_pct),
-                            ("positions.max_position_pct", real_settings.positions.max_position_pct)):
+                            ("risk.max_daily_loss_pct", real_settings.risk.max_daily_loss_pct)):
             m = re.search(rf"`{re.escape(name)}`\s*\|\s*([0-9.]+)\s*\|", sec)
             assert m and float(m.group(1)) == value, name

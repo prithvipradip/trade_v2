@@ -200,8 +200,11 @@ class TestDivergenceReport:
 
     def test_list_and_none_default_fields_are_now_seen(self, real):
         names = {d for d, _c, _a in default_divergences(real)}
-        assert {"trading.universe", "options.dte_range", "options.strategies",
-                "backtest.position_size_pct"} <= names
+        assert {"trading.universe", "options.dte_range", "options.strategies"} <= names
+        # W108: backtest.position_size_pct (the old None-default example) is retired; the same rule is
+        # shown on another None-default field, once a value is set for it.
+        edited = _with(real, backtest={"expiry_guard_dte": 3})
+        assert "backtest.expiry_guard_dte" in {d for d, _c, _a in default_divergences(edited)}
 
     def test_the_pdt_flag_is_no_longer_hidden_by_the_secret_filter(self, real):
         assert "account.pdt_account_under_25k" in {d for d, _c, _a in default_divergences(real)}
@@ -243,8 +246,8 @@ class TestResearchReadsLoadedRows:
     def test_the_registry_has_exactly_the_rows_proven_here(self):
         rows = {d for d, (k, _r) in DIVERGENCE_CLASSES.items() if k == "research_reads_loaded"}
         assert rows == {"positions.max_open_positions", "positions.max_contracts_per_trade",
-                        "risk.min_confidence", "options.dte_range", "backtest.position_size_pct",
-                        "backtest.max_concurrent_positions", "options.strategies"}   # W87a added the last
+                        "risk.min_confidence", "options.dte_range",
+                        "backtest.max_concurrent_positions", "options.strategies"}   # W87a added the last; W108 retired position_size_pct
 
     def test_options_strategies(self, real):
         """W87a: a bare research run trades the LOADED live selector list (explicit lists still win)."""
@@ -257,9 +260,9 @@ class TestResearchReadsLoadedRows:
         assert resolve_max_contracts_per_trade(None, _with(real, positions={"max_contracts_per_trade": 4})) == 4
 
     def test_position_size_pct(self, real):
-        assert resolve_position_size_pct(None, _with(real, backtest={"position_size_pct": 0.07})) == 0.07
-        assert resolve_position_size_pct(None, _with(real, backtest={"position_size_pct": None})) == \
-            real.risk.max_position_risk_pct
+        """W108: research sizes from the LOADED risk budget; the old backtest key is retired."""
+        assert resolve_position_size_pct(None, _with(real, risk={"max_position_risk_pct": 0.07})) == 0.07
+        assert resolve_position_size_pct(None, real) == real.risk.max_position_risk_pct
 
     def test_min_confidence(self, real, monkeypatch):
         _patched_load(monkeypatch, _with(real, risk={"min_confidence": 0.61}))

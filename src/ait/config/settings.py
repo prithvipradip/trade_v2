@@ -164,13 +164,6 @@ class AccountConfig(_StrictModel):
 class PositionConfig(_StrictModel):
     max_open_positions: int = Field(default=5, ge=1, le=20,
         description="Maximum number of positions open at once (the risk manager's position-count gate; the research pool applies the same cap).")
-    max_position_pct: float = Field(default=0.20, ge=0.01, le=0.30,
-        description="The position sizer's hard per-position cap, fraction of NLV (a defined-risk "
-                    "structure's max loss per contract must fit). Must stay >= risk.max_position_risk_pct "
-                    "(Settings validates, W64). W86 (2026-10-21, operator): ceiling 0.25 -> 0.30 so the "
-                    "sizer cap can sit above a raised per-trade budget (risk.max_position_risk_pct, ceiling "
-                    "0.25); the value in config.yaml is unchanged. The ceilings are in code on purpose: "
-                    "a limit in the same file as the value lets one edit loosen both.")
     max_portfolio_delta: float = Field(default=0.30, ge=0.05, le=1.0,
         description="Net portfolio delta limit as a fraction of account value. The bot has no live greeks feed, so this gate is largely inert; the aggregate-risk and concentration limits carry the load.")
     max_portfolio_risk_pct: float = Field(default=0.20, ge=0.005, le=0.50,
@@ -245,6 +238,8 @@ class PositionSizingConfig(_StrictModel):
     multiplies six adjustments (confidence, volatility, strategy, IV rank,
     losing-day drawdown, VIX) into the position budget; this section is those
     curves' breakpoints and factors. position_sizer.py still owns the formulas.
+    W108: the multipliers act only on the strategies in ``scaled_strategies``
+    (empty today); every other strategy is sized by the budget alone.
     """
 
     confidence_size_floor: float = Field(default=0.30, ge=0.05, le=1.0,
@@ -293,7 +288,20 @@ class PositionSizingConfig(_StrictModel):
         },
         description="Per-strategy fraction of the position budget. A strategy "
                     "missing from this table is sized at 1.0 (the sizer's "
-                    "existing fallback).")
+                    "existing fallback). Applied ONLY to a strategy listed in "
+                    "scaled_strategies (W108).")
+    scaled_strategies: list[str] = Field(
+        default=[],
+        description="W108: the strategies whose lot COUNT is throttled by the six multipliers "
+                    "above (confidence, volatility, strategy_risk, IV rank, drawdown, VIX). A strategy "
+                    "not listed is sized by the budget alone: lots = floor(risk.max_position_risk_pct x NLV "
+                    "/ max loss of one lot), at least 1 when one lot fits the budget and 0 (rejected) "
+                    "when it does not (ait.risk.lot_sizing, shared with the research engine and pool). "
+                    "A listed strategy is still refused only when ONE lot exceeds the unscaled budget: "
+                    "the multipliers lower the count above 1 lot, never below it. Empty by default "
+                    "(operator decision 2026-10-27: scalers off until a study shows they help); "
+                    "directional strategies stay off until the research engine reproduces live's "
+                    "multi-timeframe confidence.")
 
     @field_validator("drawdown_tiers", "vix_size_tiers")
     @classmethod
@@ -339,14 +347,16 @@ class PositionSizingConfig(_StrictModel):
 
 
 class RiskConfig(_StrictModel):
-    max_daily_loss_pct: float = Field(default=0.20, ge=0.005, le=0.20,
+    max_daily_loss_pct: float = Field(default=0.045, ge=0.005, le=0.20,
         description="Daily loss breaker, fraction of NLV (realised AND mark-to-market "
                     "trips; entries only, exits keep running). W64: 0.02 -> 0.045 at the "
                     "$5k account (breaker $225 vs the $3-wide condor's $201-212 max "
                     "loss on real chains); the startup self-test's rule is breaker >= "
                     "breaker_to_max_loss_ratio x the largest max loss the builder emits. "
+                    "W100 raised it to 0.20 with the 20% per-trade budget; W108 (2026-10-27) "
+                    "returned it to 0.045 with the 5% budget. "
                     "W86 (2026-10-21, operator): ceiling 0.10 -> 0.20 (it dated from the initial "
-                    "commit, no recorded reason); the value is unchanged. A breaker below one "
+                    "commit, no recorded reason). A breaker below one "
                     "full max loss is reported by the startup check (alert-only) and, as always, "
                     "only blocks ENTRIES after the loss.")
     breaker_to_max_loss_ratio: float = Field(default=1.0, ge=0.5, le=3.0,
@@ -370,18 +380,20 @@ class RiskConfig(_StrictModel):
                     "(user-approved) - the <=4 window blacked out ~half of all "
                     "trading days and refused the richest premium; every 14-30 "
                     "DTE hold spans events regardless, wings cap the surprise.")
-    max_position_risk_pct: float = Field(default=0.20, ge=0.005, le=0.25,
-        description="Per-trade max_loss cap as a fraction of NLV (was "
-                    "hardcoded 0.03 in manager.py — audit item 3.3), AND the budget the "
-                    "condor builder is handed (wing width = budget/90 snapped to the "
-                    "strike grid). History: 0.03 -> 0.0133 on 2026-09-29 to match the "
-                    "breaker (max_daily_loss_pct / 1.5); W64 (2026-10-08) -> 0.05 at the "
-                    "$5k account, MEASURED on live TWS chains: budgets $66/$150 build "
-                    "nothing at the $0.70 credit floor ($2-wide credits only $0.62-0.68); "
-                    "$250 builds a $3-wide condor (credit $0.88-0.99, max loss "
-                    "$201-212). Must stay <= positions.max_position_pct (the sizer's "
-                    "cap) — Settings validates it (W64). W86 (2026-10-21, operator): ceiling "
-                    "0.10 -> 0.25; the value is unchanged. A raise is only accepted while it also "
+    max_position_risk_pct: float = Field(default=0.05, ge=0.005, le=0.25,
+        description="THE per-trade budget, a fraction of NLV: gate 6b refuses a structure whose max "
+                    "loss exceeds it, the condor builder is handed it (wing width = budget/90 snapped "
+                    "to the strike grid), the position sizer counts lots from it and the research "
+                    "engine and pool size from the same number (ait.risk.lot_sizing, W108). It is a "
+                    "CEILING the builder fills through the wing width, not a loss a structure may "
+                    "reach: at 20% a condor was built 11-wide and risked $750-$900 of a $5k account. "
+                    "History: 0.03 -> 0.0133 on 2026-09-29 to match the breaker "
+                    "(max_daily_loss_pct / 1.5); W64 (2026-10-08) -> 0.05 at the $5k account, "
+                    "MEASURED on live TWS chains: budgets $66/$150 build nothing at the $0.70 credit "
+                    "floor ($2-wide credits only $0.62-0.68); $250 builds a $3-wide condor (credit "
+                    "$0.88-0.99, max loss $201-212); W100 (2026-10-26) -> 0.20, reversed to 0.05 "
+                    "by W108 (2026-10-27) once the ceiling effect was understood. W86 (2026-10-21, "
+                    "operator): ceiling 0.10 -> 0.25. A raise is only accepted while it also "
                     "stays <= positions.max_portfolio_risk_pct and <= risk.max_symbol_concentration_pct "
                     "(Settings validates): above either, gate 6b-2 / 6c would refuse EVERY entry, "
                     "silently. Above about 4.5k of budget the vol-scaled wing width binds before the "
@@ -938,11 +950,10 @@ class SpreadTuningConfig(_StrictModel):
     """W90f: sizing numbers of the research engine's single-structure builders: the put / call credit spreads, the iron butterfly,
     the jade lizard and the debit structures. The iron-condor builder does not read them (it sizes from the risk budget and
     ``wing_k``). RESEARCH ONLY: the live selector trades iron condors only, so these are for studies of the other structures
-    before any of them is made live. Defaults = the pre-W90f literals."""
+    before any of them is made live. Defaults = the pre-W90f literals. W108: the "open one lot anyway if it costs up to 25% of
+    capital" fallback (``max_cost_fraction_of_capital``) is retired; every structure is sized by ait.risk.lot_sizing and a lot that
+    does not fit ``risk.max_position_risk_pct`` is refused, as live's gate 6b refuses it."""
 
-    max_cost_fraction_of_capital: float = Field(default=0.25, gt=0.0, le=1.0,
-        description="A single spread's max loss (credit structures) or cost (debit structures) per contract may not exceed this "
-                    "fraction of capital; a larger one is not opened.")
     wing_expected_move_fraction: float = Field(default=0.5, gt=0.0, le=5.0,
         description="Wing width of the iron butterfly, put / call credit spreads and jade lizard = wing_k x expected move x this "
                     "(floored at the wing floor). 0.5 = half an expected move.")
@@ -967,13 +978,6 @@ class BacktestConfig(_StrictModel):
                 f"macro_event_types must be a non-empty subset of {sorted(allowed)}; got {v}")
         return list(dict.fromkeys(v))
 
-    position_size_pct: float | None = Field(default=None, ge=0.01, le=0.25,
-        description="Fraction of capital risked per trade (max-loss basis). W64: None "
-                    "(the default) resolves to risk.max_position_risk_pct — the SAME "
-                    "per-trade budget live funds — so research and live cannot drift. "
-                    "Set a number only for a deliberate sizing study. W86: ceiling 0.50 -> 0.25 = "
-                    "risk.max_position_risk_pct's ceiling, so a YAML value cannot size what live's "
-                    "schema forbids (an explicit constructor argument is not bounded by this).")
     history_start_date: date | None = Field(default=None,
         description="W65: first date of the research history. When set it wins over "
                     "history_days: the research loader trims frames to it and walk-forward "
@@ -3071,22 +3075,13 @@ class Settings(_StrictModel):
 
     @model_validator(mode="after")
     def _per_trade_knobs_are_linked(self) -> "Settings":
-        """W64 + W86: link the live per-trade knobs (registered W25 ADDENDUM / W31 A3).
+        """W64 + W86 + W108: link the live per-trade knobs (registered W25 ADDENDUM / W31 A3).
 
-        risk.max_position_risk_pct funds the condor builder and gate 6b;
-        positions.max_position_pct is the position sizer's hard cap. For a
-        defined-risk condor both bound the SAME number (one structure's max
-        loss), at different layers. If the gate cap exceeds the sizer cap, gate
-        6b passes a structure the sizer then refuses with 0 contracts, one
-        routine-looking verdict at a time, and entries brick silently. A startup
-        error is the same philosophy as extra="forbid"; the coherence check's A3
-        arm stays as the runtime guard.
+        risk.max_position_risk_pct is THE per-trade budget: it funds the condor builder, gate 6b
+        and (W108) the position sizer. The sizer's former second cap, positions.max_position_pct,
+        is retired, so the W64 link "gate cap <= sizer cap" and the coherence check's A3 arm that
+        guarded it no longer exist: there is one number.
         """
-        if self.positions.max_position_pct < self.risk.max_position_risk_pct:
-            raise ValueError(
-                f"positions.max_position_pct ({self.positions.max_position_pct}) must be "
-                f">= risk.max_position_risk_pct ({self.risk.max_position_risk_pct}): the "
-                "sizer's cap would refuse structures the risk gate passes (W64 link)")
         # W86: the other two caps one structure's max loss must also fit under. Gate 6b-2
         # (positions.max_portfolio_risk_pct, open + new risk) and gate 6c
         # (risk.max_symbol_concentration_pct) were never tied to the per-trade budget, so a
@@ -3108,15 +3103,13 @@ class Settings(_StrictModel):
 def resolve_position_size_pct(explicit, settings) -> float:
     """W64: the per-trade budget fraction research uses.
 
-    explicit arg > backtest.position_size_pct (a deliberate sizing study) >
-    risk.max_position_risk_pct (what live funds the builder with) >
-    RiskConfig's own default. `settings` may be None or a partial test stub.
+    explicit arg (a deliberate sizing study) > risk.max_position_risk_pct (what live
+    funds the builder with) > RiskConfig's own default. `settings` may be None or a
+    partial test stub. W108: the ``backtest.position_size_pct`` key is retired; one
+    budget number, ``risk.max_position_risk_pct``, serves live and research.
     """
     if explicit is not None:
         return float(explicit)
-    bt = getattr(settings, "backtest", None)
-    if bt is not None and getattr(bt, "position_size_pct", None) is not None:
-        return float(bt.position_size_pct)
     rk = getattr(settings, "risk", None)
     if rk is not None and getattr(rk, "max_position_risk_pct", None) is not None:
         return float(rk.max_position_risk_pct)
@@ -3467,7 +3460,7 @@ def default_divergences(settings: "Settings") -> list[tuple[str, object, object]
     so no NEW divergence appears unclassified.
 
     W86: also covers list / tuple fields (universe, dte_range, strategies) and fields
-    whose default is None but whose active value is set (backtest.position_size_pct).
+    whose default is None but whose active value is set (backtest.history_start_date).
     Still skipped: nested models, and fields with no default at all.
     """
     from pydantic import BaseModel as _BM
@@ -3528,8 +3521,6 @@ DIVERGENCE_CLASSES: dict[str, tuple[str, str]] = {
     "options.strategies": (DIVERGENCE_RESEARCH_LOADED,
                            "W87a: run_backtest.py / run_optimizer.py default --strategies to this list "
                            "(config.resolve_universe); an explicit --strategies still wins"),
-    "backtest.position_size_pct": (DIVERGENCE_RESEARCH_LOADED,
-                                   "resolve_position_size_pct: explicit > this > risk.max_position_risk_pct"),
     "backtest.max_concurrent_positions": (DIVERGENCE_RESEARCH_LOADED,
                                           "W86: WalkForwardConfig / StrategyOptimizer resolve it from the "
                                           "loaded settings (was a hard-coded 1)"),

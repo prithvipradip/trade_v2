@@ -361,6 +361,13 @@
    "category": "structural",
    "note": "[:10] ISO-date slice of a stored date string"
   },
+  "src/ait/backtesting/pool.py::_expiry_key": {
+   "values": [
+    8
+   ],
+   "category": "structural",
+   "note": "W108: the YYYYMMDD slice of an expiry date, the same compare live's per-expiry gate makes (not a tunable)"
+  },
   "src/ait/backtesting/pool.py::_per_contract_risk": {
    "values": [
     100.0

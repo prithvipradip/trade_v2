@@ -278,10 +278,10 @@ class TestCommissionTrueUp:
 class TestMinors:
     def test_sizer_survives_vix_none(self):
         sizer = PositionSizer.__new__(PositionSizer)
-        sizer._pos_config = SimpleNamespace(max_position_pct=0.10,
-                                            max_contracts_per_trade=1,
+        sizer._pos_config = SimpleNamespace(max_contracts_per_trade=1,
                                             max_portfolio_risk_pct=0.20)
-        sizer._risk_config = SimpleNamespace(min_confidence=0.5)
+        sizer._risk_config = SimpleNamespace(min_confidence=0.5,
+                                             max_position_risk_pct=0.10)
         size = sizer.calculate(
             account_value=100_000, option_price=2.0, confidence=0.7,
             implied_vol=0.3, strategy="long_straddle", underlying_price=300,

@@ -87,10 +87,28 @@ LIVE_ONLY_GATES: tuple[GateRow, ...] = (
             "(risk.credit_cap_vix_tiers); research caps by max_concurrent_positions only",
             "risk.credit_cap_vix_tiers"),
     GateRow("account_risk", RESEARCH_ONLY,
-            "circuit breaker, PDT guard, correlation and the position sizer are live-only; "
+            "circuit breaker, PDT guard and live's 60-day price-correlation branch are live-only; "
             "research caps contracts at max_contracts_per_trade and does not simulate account "
-            "state", None),
+            "state (the lot count, the per-expiry cap, the SECTOR_GROUPS cluster cap and the "
+            "per-symbol cap ARE shared, see POOL_REJECT_REASONS)", None),
 )
+
+# W108: the rejections the walk-forward POOL (backtesting/pool.py allocate_pool) records, each with
+# the live gate it mirrors. The engine's own reasons are ENGINE_REJECT_REASONS above; these are
+# the book-level gates applied after every symbol's engine run. A guard test (tests/
+# test_lot_sizing_parity.py) fails when pool.py records a reason that has no row here.
+POOL_REJECT_REASONS: dict[str, GateRow] = dict([
+    _g("no_contracts", MECHANICS, "the engine sized the candidate at zero lots"),
+    _g("max_open_positions", TWIN, "risk manager gate 3b: positions.max_open_positions"),
+    _g("per_expiry_cap", TWIN, "risk manager gate 4b: risk.max_positions_per_expiry (the "
+       "AIT_MAX_PER_EXPIRY env override is not modelled)"),
+    _g("correlation_cluster", TWIN, "risk manager gate 5: risk.max_correlated_positions in the same "
+       "SECTOR_GROUPS cluster or symbol (live's 60-day price-correlation branch is not modelled)"),
+    _g("unaffordable", TWIN, "risk manager gate 6b / PositionSizer: one lot above "
+       "risk.max_position_risk_pct x NLV (the shared rule, ait.risk.lot_sizing)"),
+    _g("portfolio_risk", TWIN, "risk manager gate 6b-2: positions.max_portfolio_risk_pct"),
+    _g("symbol_concentration", TWIN, "risk manager gate 6c: risk.max_symbol_concentration_pct"),
+])
 
 
 def classify(reason: str) -> GateRow | None:

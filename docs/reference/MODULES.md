@@ -205,6 +205,7 @@ Reporting authorities shared by every operator-facing surface.
 | `capital_tiers.py` | Capital-tier universe selection. |
 | `circuit_breaker.py` | Circuit breaker — automatic trading halt on adverse conditions. |
 | `correlation.py` | Position correlation guard — prevents correlated position stacking. |
+| `lot_sizing.py` | The ONE lot-count rule, shared by the live position sizer and every research sizing site. |
 | `manager.py` | Portfolio-level risk management. |
 | `pdt_guard.py` | Pattern Day Trader (PDT) protection. |
 | `position_sizer.py` | Volatility-adjusted position sizing with Kelly criterion. |

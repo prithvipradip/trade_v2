@@ -35,12 +35,13 @@ def test_defaults_equal_the_old_literals_in_schema_and_yaml():
     old = {"surface_tuning": dict(min_volume=10, min_price=0.05, max_abs_moneyness=0.10, min_points=5, min_span=0.01,
                                   iv_lower_bound=0.03, iv_upper_bound=2.5, clamp_margin=0.01, max_stale_days=5),
            "friction_fit": dict(min_samples=5, min_sessions_for_cv=3, min_train_rows=3, min_affine_points=3),
-           "spread_tuning": dict(max_cost_fraction_of_capital=0.25, wing_expected_move_fraction=0.5)}
+           "spread_tuning": dict(wing_expected_move_fraction=0.5)}   # W108: max_cost_fraction_of_capital retired
     b = load_settings().backtest
     for block, fields in old.items():
         for name, value in fields.items():
             assert getattr(getattr(b, block), name) == value, (block, name)
-    assert {SurfaceTuningConfig().min_volume, FrictionFitConfig().min_samples, SpreadTuningConfig().max_cost_fraction_of_capital} == {10, 5, 0.25}
+    assert {SurfaceTuningConfig().min_volume, FrictionFitConfig().min_samples} == {10, 5}
+    assert "max_cost_fraction_of_capital" not in SpreadTuningConfig.model_fields   # W108: the 25% fallback is gone
     assert (ivs.MIN_VOLUME, ivs.MIN_PRICE, ivs.MAX_ABS_M, ivs.MIN_POINTS, ivs.MIN_SPAN, ivs.IV_BOUNDS, ivs.CLAMP_MARGIN,
             ivs.MAX_STALE_DAYS) == (10, 0.05, 0.10, 5, 0.01, (0.03, 2.5), 0.01, 5)       # the importable aliases are the schema defaults
 
@@ -208,40 +209,40 @@ class TestFrictionFit:
 class TestSpreadBuilders:
     S, IV, DTE = 100.0, 0.20, 21
 
-    def _build(self, strategy="put_credit_spread", **spread):
+    def _build(self, strategy="put_credit_spread", pct=0.5, **spread):
         s = load_settings()
         settings = s.model_copy(update={"backtest": s.backtest.model_copy(update={
             "spread_tuning": s.backtest.spread_tuning.model_copy(update=spread)})})
-        # a 1% budget buys no contract of a credit spread (the cap path); the jade lizard is sized on naked margin, so it needs more
-        bt = _bt(settings=settings, position_size_pct=0.5 if strategy == "jade_lizard" else 0.01, initial_capital=5000.0)
+        # W108: the budget decides alone. 50% carries one lot of every structure here; 1% carries none.
+        bt = _bt(settings=settings, position_size_pct=pct, initial_capital=5000.0)
         t = self.DTE / 365.0
         return bt._build_credit_position(strategy, self.S, self.IV, t, 0.05, self.DTE, date(2024, 3, 4), 5000.0)
 
     @pytest.mark.parametrize("strategy", ["put_credit_spread", "call_credit_spread"])
-    def test_the_capital_cap_decides_whether_a_too_big_spread_is_opened_at_one_contract(self, strategy):
+    def test_a_spread_too_big_for_the_budget_is_refused_not_opened_at_one_lot(self, strategy):
+        """W108: the "open one lot anyway if it costs <= 25% of capital" fallback is retired; live's gate 6b
+        refuses a lot above risk.max_position_risk_pct x NLV and research now does the same."""
         pos = self._build(strategy)
-        assert pos is not None and pos["contracts"] == 1           # the 1% budget buys 0 contracts; the 25% cap lets 1 in
-        assert self._build(strategy, max_cost_fraction_of_capital=0.01) is None
+        assert pos is not None and pos["contracts"] >= 1
+        assert self._build(strategy, pct=0.01) is None
 
     @pytest.mark.parametrize("strategy,key", [("put_credit_spread", "long_put_strike"), ("call_credit_spread", "long_call_strike"),
                                               ("jade_lizard", "long_call_strike")])
     def test_the_wing_fraction_sets_the_wing_width(self, strategy, key):
-        base = self._build(strategy, max_cost_fraction_of_capital=1.0)
-        wide = self._build(strategy, max_cost_fraction_of_capital=1.0, wing_expected_move_fraction=1.5)
+        base = self._build(strategy)
+        wide = self._build(strategy, wing_expected_move_fraction=1.5)
         assert base is not None and wide is not None
         shorts = {"long_put_strike": "short_put_strike", "long_call_strike": "short_call_strike"}
         assert abs(wide[key] - wide[shorts[key]]) > abs(base[key] - base[shorts[key]])
 
-    def test_the_debit_structures_use_the_same_cap(self):
+    def test_the_debit_structures_are_sized_by_the_same_budget_rule(self):
         from ait.strategies.base import SignalDirection
         s = load_settings()
 
-        def build(strategy, **spread):
-            settings = s.model_copy(update={"backtest": s.backtest.model_copy(update={
-                "spread_tuning": s.backtest.spread_tuning.model_copy(update=spread)})})
-            bt = _bt(settings=settings, position_size_pct=0.001, initial_capital=5000.0)
+        def build(strategy, pct):
+            bt = _bt(settings=s, position_size_pct=pct, initial_capital=5000.0)
             return bt._build_debit_position(strategy, SignalDirection.BULLISH, self.S, self.IV, self.DTE / 365.0, 0.05,
                                             self.DTE, date(2024, 3, 4), 5000.0)
         for strategy in ("long_strangle", "bull_call_spread"):
-            assert build(strategy) is not None, strategy
-            assert build(strategy, max_cost_fraction_of_capital=0.001) is None, strategy
+            assert build(strategy, 0.5) is not None, strategy
+            assert build(strategy, 0.001) is None, strategy      # one lot above the budget: refused (W108)
