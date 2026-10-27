@@ -269,6 +269,13 @@ class StateManager:
                     live_mid REAL DEFAULT 0,
                     nbbo_spread REAL DEFAULT 0
                 )""",
+                # W105: who placed the order. The operator also trades by hand in
+                # this account, and the probes use their own client ids; their fills
+                # legitimately have no bot trade. Without these a trade-less row could
+                # not be told from a bot fill we failed to attribute.
+                "ALTER TABLE executions ADD COLUMN client_id INTEGER",
+                "ALTER TABLE executions ADD COLUMN order_ref TEXT",
+                "ALTER TABLE executions ADD COLUMN origin TEXT",
                 # W1 (R23 concurrency-2 / trade-life-close-booking-two-owners):
                 # transactional exit outbox. close_trade enqueues a row in the
                 # SAME transaction as the close; every booking path CLAIMS the
@@ -1111,7 +1118,8 @@ class StateManager:
                          shares: float, price: float, exec_time: str,
                          commission: float | None = None, realized_pnl: float = 0.0,
                          signal_price: float = 0.0, live_mid: float = 0.0,
-                         nbbo_spread: float = 0.0) -> None:
+                         nbbo_spread: float = 0.0, client_id: int | None = None,
+                         order_ref: str = "", origin: str | None = None) -> None:
         """R7: upsert one broker execution (commission may arrive later —
         re-upserting the same exec_id refreshes it).
 
@@ -1123,15 +1131,30 @@ class StateManager:
         report that genuinely said $0 — a completeness check built on row
         presence (or even on `commission IS NOT NULL` without this change)
         could never tell "reported" from "not yet reported".
+
+        W105: ``client_id`` / ``order_ref`` say who placed the order and ``origin``
+        classes the row: ``bot`` (a bot order, attributed or not), ``manual`` (the
+        operator in TWS, clientId 0) or ``other`` (a probe or another tool). NULL is a
+        row written before this column existed. Manual and other rows have no bot
+        trade by design; an unattributed ``bot`` row is the real orphan.
         """
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO executions
                    (exec_id, order_id, perm_id, trade_id, symbol, con_id,
                     side, shares, price, exec_time, commission, realized_pnl,
-                    signal_price, live_mid, nbbo_spread)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    signal_price, live_mid, nbbo_spread, client_id, order_ref, origin)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(exec_id) DO UPDATE SET
+                     client_id=COALESCE(client_id, excluded.client_id),
+                     order_ref=CASE WHEN COALESCE(order_ref, '') = ''
+                                    THEN excluded.order_ref ELSE order_ref END,
+                     -- a bot row never becomes manual/other; a row first seen as
+                     -- manual/other becomes bot if a later pass attributes it
+                     origin=CASE WHEN excluded.origin = 'bot' THEN 'bot'
+                                 WHEN origin = 'bot' THEN 'bot'
+                                 WHEN excluded.origin IS NOT NULL THEN excluded.origin
+                                 ELSE origin END,
                      -- W48: never regress a known commission back to unknown
                      -- (a later sweep pass re-seeing the same fill without a
                      -- fresh commissionReport attached must not erase one
@@ -1153,7 +1176,7 @@ class StateManager:
                                       THEN excluded.nbbo_spread ELSE nbbo_spread END""",
                 (exec_id, order_id, perm_id, trade_id, symbol, con_id, side,
                  shares, price, exec_time, commission, realized_pnl,
-                 signal_price, live_mid, nbbo_spread),
+                 signal_price, live_mid, nbbo_spread, client_id, order_ref or "", origin),
             )
 
     def total_commission(self, trade_id: str) -> float:

@@ -173,6 +173,14 @@ A green test suite is not a safe deploy: unit tests once passed and the deployed
 
    Do not treat the script's own exit code as proof: `--check-live-corpus` re-reads the DB independently and is what closes the migration. If it reports naive rows, the migration did not land; the snapshot path is printed by the `--apply` run.
    `--apply` aborts rather than relabelling any row written on or after the host move date; those need handling by hand.
+   **One-off, after the deploy that added `executions.origin` (stop the bot first).** Tags the 31 older trade-less rows of the executions ledger (8 of your own TWS orders, 23 from an earlier probe) and corrects five wrongly stored fill times of the bot's first real fill. It refuses to run if the database no longer matches the audit it was written from, never deletes a row and never gives one a trade:
+
+   ```
+   python scripts/restate_w105_executions.py          # dry run (opens the database read-only)
+   python scripts/restate_w105_executions.py --apply  # snapshot to data/backups/, then write
+   ```
+
+   New fills are tagged as they are recorded: `origin` is `bot`, `manual` (clientId 0, you in TWS) or `other` (a probe or another tool). A trade-less `bot` row is a real orphan and the shadow referee's `orphan_fills` check breaks on it; `manual` and `other` rows are not breaks. The weekly scorecard's executions line shows the bot's commissions apart from the manual/other ones.
 4. **Confirm liveness after the next RTH open** (~09:35–09:45 ET). `python scripts/check_first_rth_liveness.py` makes the heartbeat, scan-event, LOOP IMPAIRED / cycle-error and marks checks below in one go, prints the verdict, sends it to Telegram (unless `--no-telegram`) and exits 1 on a failure. To check by hand:
    - fresh heartbeat: `Get-Item data\bot_heartbeat | Select-Object LastWriteTime` must be minutes old and refreshing;
    - one completed trading cycle in the logs: `Select-String -Path logs\bot_stdout.log -Pattern "scan_symbol_timing" | Select-Object -Last 3` (timestamps post-open), and no fresh

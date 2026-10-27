@@ -158,13 +158,13 @@ scripts/verify_deadman.py:
 
 scripts/shadow_referee.py:
   group: Operate
-  what: "Recomputes per-trade P&L and the go-live numbers from the broker-derived executions ledger and compares them with the system's own books. Imports nothing from src/ait on purpose."
+  what: "Recomputes per-trade P&L and the go-live numbers from the broker-derived executions ledger and compares them with the system's own books. A fill with no trade counts as a break only when the bot placed it (your own TWS orders and the probes' are not). Imports nothing from src/ait on purpose."
   when: "Before trusting the scorecard, at a go-live review, or after a change to booking code. Exits nonzero on any BREAK."
   needs_ib: "no"
   writes: "nothing (state database opened read-only, DuckDB mirror read-only); --json for machine output"
   example: "python scripts/shadow_referee.py [--db data/ait_state.db] [--mirror <duckdb>] [--json]"
   explained: "[GUIDE.md](../GUIDE.md#12-monitoring-and-operator-surfaces)"
-  stamp: "03c5139e4a4e"
+  stamp: "e312c687237d"
 
 scripts/unify_history_tables.py:
   group: "One-time migration"
@@ -515,6 +515,16 @@ scripts/restate_w21_tz_aware.py:
   example: "python scripts/restate_w21_tz_aware.py"
   explained: "[RUNBOOK.md](../RUNBOOK.md#deploy-checklist-every-deploy)"
   stamp: "91c9df2fb45d"
+
+scripts/restate_w105_executions.py:
+  group: One-time migration
+  what: "Tags the 31 trade-less rows of the executions ledger as the operator's manual orders (8) or an earlier probe's (23), and corrects five wrongly stored fill times of the bot's first real fill. Refuses to run unless the database still matches the audit it was written from; never deletes a row or gives one a trade."
+  when: "Once, after deploying the code that records who placed each fill (the executions origin column), with the bot stopped. The dry run is always safe."
+  needs_ib: "no"
+  writes: "The dry run opens data/ait_state.db read-only. With --apply it snapshots the database to data/backups/, adds the columns client_id, order_ref and origin to executions if missing, and UPDATES origin, client_id and order_ref on those 31 rows and exec_time on five."
+  example: "python scripts/restate_w105_executions.py"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#deploy-checklist-every-deploy)"
+  stamp: "57ff895c6703"
 
 scripts/typecheck.py:
   group: Developer

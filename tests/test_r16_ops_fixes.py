@@ -152,7 +152,7 @@ class TestDigestCatchup:
         monkeypatch.setattr(_master, "_mirror_content_age_hours", lambda: 1.0)
         stale = tmp_path / "digest_sent_20250101"
         stale.write_text("old")
-        today = datetime.now().strftime("%Y%m%d")
+        today = _master.now_et().strftime("%Y%m%d")      # W105: the marker is stamped in ET
 
         # failed send -> no marker (next boot's catch-up retries)
         monkeypatch.setattr(_master, "_alert", lambda m: False)
@@ -349,7 +349,10 @@ class TestForeignBotRefusal:
         monkeypatch.setattr(gw, "ensure_gateway",
                             lambda port, **kw: gateway_calls.append(port) and False)
         mgr.start()
-        assert gateway_calls == [int(os.environ.get("IBKR_PORT", "4002"))]
+        from ait.config.settings import IBKREnvConfig
+        # W105: with no IBKR_PORT the supervisor uses the bot's own default (7497), not a second literal
+        assert gateway_calls == [int(os.environ.get(
+            "IBKR_PORT", IBKREnvConfig.model_fields["ibkr_port"].default))]
         assert mgr._proc is None
         assert not any("REFUSING" in a for a in alerts)
 

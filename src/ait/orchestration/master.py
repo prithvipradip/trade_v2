@@ -435,8 +435,19 @@ def _port_hint(configured: int) -> str:
     return ""
 
 
-def _configured_ib_port(default: int = 4002) -> int:
-    """W94: the ONE read of IBKR_PORT in this module (a class guard pins that)."""
+def _configured_ib_port(default: int | None = None) -> int:
+    """W94: the ONE read of IBKR_PORT in this module (a class guard pins that).
+
+    W105: a missing or empty IBKR_PORT falls back to the bot's own default
+    (``IBKREnvConfig.ibkr_port``, the port the bot connects to), not to a second,
+    different literal. The supervisor used to assume 4002 here while the bot assumed
+    7497, so with no ``.env`` value the two watched different endpoints and the status
+    page quoted an ``.env`` setting that did not exist. Read lazily: this module must
+    stay light at import.
+    """
+    if default is None:
+        from ait.config.settings import IBKREnvConfig
+        default = int(IBKREnvConfig.model_fields["ibkr_port"].default)
     return int(os.environ.get("IBKR_PORT") or default)
 
 
@@ -2055,7 +2066,7 @@ def daily_digest():
         src = DATA_DIR / "ait_state.db"
         if src.exists():
             con = _sq.connect(str(src))
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = now_et().strftime("%Y-%m-%d")   # W105: trades are stamped in ET
             # R8: NULL-safe. W3 string-contracts-1/-4: the hand-rolled
             # trio is replaced by the ONE shared authority, which also
             # excludes the reconciler's $0 needs-manual-review sentinels.
@@ -2137,7 +2148,9 @@ def daily_digest():
         # failed/credless send leaves no marker, so the next boot retries.
         if _alert("DIGEST: " + " | ".join(parts)):
             try:
-                marker = DATA_DIR / f"digest_sent_{datetime.now().strftime('%Y%m%d')}"
+                # W105: the ET date, as the catch-up check reads it (it was the host's
+                # local date: from 19:00 ET a manual digest stamped tomorrow).
+                marker = DATA_DIR / f"digest_sent_{now_et().strftime('%Y%m%d')}"
                 for _old in DATA_DIR.glob("digest_sent_*"):
                     if _old != marker:
                         _old.unlink()
@@ -2241,12 +2254,16 @@ def weekly_scorecard():
         # with no gate label attached to it.
         con2 = _sq.connect(str(src)); con2.row_factory = _sq.Row
         try:
+            # W105: the bot's own commissions apart from the operator's manual fills and
+            # the probes' (they are real account costs but belong to no bot trade).
             xr = con2.execute(
                 "SELECT COUNT(*) n, SUM(CASE WHEN live_mid > 0 THEN 1 ELSE 0 END) m, "
-                "COALESCE(SUM(commission),0) c FROM executions").fetchone()
+                "COALESCE(SUM(CASE WHEN COALESCE(trade_id,'') != '' THEN commission END),0) c, "
+                "COALESCE(SUM(CASE WHEN COALESCE(trade_id,'') = '' THEN commission END),0) o "
+                "FROM executions").fetchone()
             exec_line = (f"executions: {xr['n']} fills "
                          f"({xr['m'] or 0} with a live mid), "
-                         f"${xr['c']:.2f} commissions")
+                         f"${xr['c']:.2f} commissions (bot) + ${xr['o']:.2f} manual/other")
             att = con2.execute(
                 f"SELECT COALESCE(exit_reason_detailed,'?') r, COUNT(*) n, "
                 f"SUM(realized_pnl) p FROM trades WHERE status='closed' {real} "
