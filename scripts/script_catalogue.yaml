@@ -334,7 +334,7 @@ scripts/run_integration_test.py:
   writes: "Its own data/integration_test.db, reports/integration_test/ (old window_*.json files there are deleted at the start) and reports/runs/<run_id>/. IB client id 88, port 4002 by default; --skip-backfill avoids IB. With --archive-data it stashes the working tree (untracked files included), switches to data/experiment-archives, commits the run and PUSHES to origin, then switches back."
   example: "python scripts/run_integration_test.py --symbols SPY --years 2 --skip-backfill"
   explained: "[WALKFORWARD_DASHBOARD.md](../WALKFORWARD_DASHBOARD.md#1-what-it-can-show-today)"
-  stamp: "8a6f63dc6122"
+  stamp: "fb6f21e79a6d"
 
 scripts/run_fractal_diagnostics.py:
   group: Research tool
@@ -434,7 +434,7 @@ scripts/post_event_study.py:
   writes: "reports/post_event_study/entry_dte_<n>[_<tag>]/ (per-variant .json and _summary.txt, results.json, results.md). It changes into the --data-root tree to read its data/historical.db; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/post_event_study.py --entry-dte 14"
   explained: "-"
-  stamp: "aba5e646519b"
+  stamp: "29e3b75aa39a"
 
 scripts/take_profit_study.py:
   group: Study
@@ -444,7 +444,7 @@ scripts/take_profit_study.py:
   writes: "reports/take_profit_study/entry_dte_<n>/ (per-variant .json and _summary.txt, results.json, results.md); the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/take_profit_study.py [--entry-dte 14]"
   explained: "-"
-  stamp: "995033d2493c"
+  stamp: "7f935d99859f"
 
 scripts/wing_budget_study.py:
   group: Study
@@ -454,7 +454,7 @@ scripts/wing_budget_study.py:
   writes: "reports/wing_budget_study/entry_dte_<n>/ (per-variant .json and _summary.txt, results.json, results.md); the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/wing_budget_study.py [--entry-dte 14]"
   explained: "-"
-  stamp: "dbccd3137f85"
+  stamp: "60508ee5cbe6"
 
 scripts/probe_w53_roll_atomicity.py:
   group: IB paper probe
@@ -564,7 +564,7 @@ scripts/wingk_study.py:
   writes: "reports/wingk_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/wingk_study.py"
   explained: "PLAN.md (the wing_k study entries)"
-  stamp: "4488ef6c13e3"
+  stamp: "ad7f8349fa9f"
 
 scripts/ablation_study.py:
   group: Historical
@@ -574,7 +574,7 @@ scripts/ablation_study.py:
   writes: "reports/ablation_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/ablation_study.py"
   explained: "PLAN.md (the ML ABLATION entries)"
-  stamp: "5d85f082f828"
+  stamp: "e38ab676c929"
 
 scripts/ablation_armB.py:
   group: Historical
@@ -584,7 +584,7 @@ scripts/ablation_armB.py:
   writes: "reports/ablation_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/ablation_armB.py"
   explained: "PLAN.md (the ML ABLATION entries)"
-  stamp: "8a1c00ddf8dd"
+  stamp: "b57bd05f2954"
 
 scripts/ablation_confirm.py:
   group: Historical
@@ -594,7 +594,7 @@ scripts/ablation_confirm.py:
   writes: "reports/ablation_confirm/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/ablation_confirm.py"
   explained: "PLAN.md (ML ABLATION verdict; RERUN B VERDICT)"
-  stamp: "9813294635b2"
+  stamp: "aee1835db9ce"
 
 scripts/ablation_rerun.py:
   group: Historical
@@ -604,7 +604,7 @@ scripts/ablation_rerun.py:
   writes: "reports/ablation_rerun/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/ablation_rerun.py"
   explained: "PLAN.md (RERUN B VERDICT)"
-  stamp: "451208c42593"
+  stamp: "b599e2138814"
 
 scripts/range_floor_study.py:
   group: Historical
@@ -614,7 +614,7 @@ scripts/range_floor_study.py:
   writes: "reports/range_floor_study/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/range_floor_study.py"
   explained: "PLAN.md (the RANGE-FLOOR STUDY entry)"
-  stamp: "cad70911d3a1"
+  stamp: "4558e05177b9"
 
 scripts/touch_stop_impact.py:
   group: Historical
@@ -624,7 +624,7 @@ scripts/touch_stop_impact.py:
   writes: "reports/touch_stop_impact/. Sets AIT_BT_TOUCH_STOP in its own process. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/touch_stop_impact.py"
   explained: "PLAN.md (TOUCH-STOP MIRROR; SIM FIDELITY)"
-  stamp: "51fb301b5d6e"
+  stamp: "28c686bd5fb8"
 
 scripts/shadow_tournament.py:
   group: Historical
@@ -634,7 +634,7 @@ scripts/shadow_tournament.py:
   writes: "reports/shadow_tournament/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_tournament.py"
   explained: "PLAN.md (SHADOW STRATEGY PIPELINE; SHADOW TOURNAMENT VERDICT)"
-  stamp: "261262467fd5"
+  stamp: "fb79d975c243"
 
 scripts/shadow_round1b.py:
   group: Historical
@@ -644,7 +644,7 @@ scripts/shadow_round1b.py:
   writes: "reports/shadow_tournament/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_round1b.py"
   explained: "PLAN.md (SHADOW ROUND 2)"
-  stamp: "190443d516ff"
+  stamp: "4ddab0ab56e2"
 
 scripts/shadow_tournament_uncorr.py:
   group: Historical
@@ -654,7 +654,7 @@ scripts/shadow_tournament_uncorr.py:
   writes: "reports/shadow_tournament_uncorr/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_tournament_uncorr.py"
   explained: "PLAN.md (SHADOW TOURNAMENT VERDICT)"
-  stamp: "e39dd1bba253"
+  stamp: "c253a0ef7843"
 
 scripts/shadow_round3.py:
   group: Historical
@@ -664,7 +664,7 @@ scripts/shadow_round3.py:
   writes: "reports/shadow_round3/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_round3.py"
   explained: "PLAN.md (shadow tournament)"
-  stamp: "5c90a6fe0ff6"
+  stamp: "6f6cc0ac54df"
 
 scripts/shadow_round3_gated.py:
   group: Historical
@@ -674,7 +674,7 @@ scripts/shadow_round3_gated.py:
   writes: "reports/shadow_round3_gated/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_round3_gated.py"
   explained: "PLAN.md (shadow tournament)"
-  stamp: "a9edb2b8266f"
+  stamp: "922eeb7257b9"
 
 scripts/shadow_round3_rerun.py:
   group: Historical
@@ -684,4 +684,4 @@ scripts/shadow_round3_rerun.py:
   writes: "reports/shadow_round3_rerun/. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python scripts/shadow_round3_rerun.py"
   explained: "PLAN.md (RERUN B VERDICT)"
-  stamp: "b3b5869378b2"
+  stamp: "475040d0ad91"

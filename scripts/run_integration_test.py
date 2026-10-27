@@ -615,7 +615,7 @@ async def _section_e_walkforward(
         optimize_seed=args.optuna_seed,
         optimize_val_split=_val_split,
         initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
-        position_size_pct=_bc.position_size_pct,
+        position_size_pct=None,  # W108b: resolves to risk.max_position_risk_pct (backtest.position_size_pct is retired)
         wing_floor_dollars=_bc.wing_floor_dollars,
         wing_k=_bc.wing_k,
         iv_floor=_bc.iv_floor,
@@ -690,7 +690,7 @@ async def _section_f_ablation(
         optimize_min_trades=_min_trades,
         optimize_n_jobs=_n_jobs,
         initial_capital=None,  # account.capital of the loaded settings (WalkForwardConfig resolves None)
-        position_size_pct=_bc.position_size_pct,
+        position_size_pct=None,  # W108b: resolves to risk.max_position_risk_pct (backtest.position_size_pct is retired)
         wing_floor_dollars=_bc.wing_floor_dollars,
         wing_k=_bc.wing_k,
         iv_floor=_bc.iv_floor,
@@ -1232,7 +1232,7 @@ async def _main(args: argparse.Namespace) -> int:
         ablation = await _section_f_ablation(args, out, shared_daily_data)
 
         # Capture WalkForwardConfig fields for archival
-        from ait.config.settings import load_settings, resolve_account_capital
+        from ait.config.settings import load_settings, resolve_account_capital, resolve_position_size_pct
         _cfg = load_settings(args.config)
         _bc = _cfg.backtest
         _n_trials = args.wf_trials if args.wf_trials is not None else _bc.optimize_n_trials
@@ -1244,7 +1244,7 @@ async def _main(args: argparse.Namespace) -> int:
             "optimize_n_trials": _n_trials,
             "optuna_seed": args.optuna_seed,
             "initial_capital": resolve_account_capital(None, _cfg),   # what the archive records: account.capital of --config
-            "position_size_pct": _bc.position_size_pct,
+            "position_size_pct": resolve_position_size_pct(None, _cfg),   # W108b: the risk budget research sizes from
         }
     else:
         print("\nSECTIONS E & F — Walk-forward SKIPPED (--skip-walkforward)")
