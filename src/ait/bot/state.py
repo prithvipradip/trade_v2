@@ -1243,6 +1243,40 @@ class StateManager:
                     (trade_id, exclude_con_id)).fetchone()
             return int(row[0] or 0)
 
+    def executed_shares_by_con(self, trade_id: str) -> dict[int, float]:
+        """W112: contracts executed per ``con_id`` for a trade (the BAG summary row included under its
+        own id), from the on-disk ledger. Used to recover how many lots a fill that predates a reconnect
+        covered, from the one source that survives it."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(con_id, 0), COALESCE(SUM(shares), 0) FROM executions "
+                "WHERE trade_id = ? GROUP BY COALESCE(con_id, 0)", (trade_id,)).fetchall()
+        return {int(c): float(q or 0.0) for c, q in rows}
+
+    def sum_commissioned_shares(self, trade_id: str, exclude_con_id: int | None = None) -> float:
+        """W112: the CONTRACTS (not rows) of a trade's executions whose commission is known.
+
+        The commission true-up's completeness is "every leg's entry and exit contracts have a reported
+        commission". At one lot a leg fills in one execution so a row count says that; at N lots a leg can
+        fill in several executions, and the rows of the entry alone can reach the row count before any exit
+        commission exists. Same filters as `count_executions_with_commission` (known commission, BAG row
+        excluded, a NULL con_id is not the BAG row). A row with no recorded size counts as one contract,
+        which is what the row count assumed.
+        """
+        with self._connect() as conn:
+            if exclude_con_id is None:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN shares IS NULL OR shares <= 0 THEN 1 ELSE shares END), 0) "
+                    "FROM executions WHERE trade_id = ? AND commission IS NOT NULL",
+                    (trade_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN shares IS NULL OR shares <= 0 THEN 1 ELSE shares END), 0) "
+                    "FROM executions WHERE trade_id = ? "
+                    "AND commission IS NOT NULL AND (con_id IS NULL OR con_id != ?)",
+                    (trade_id, exclude_con_id)).fetchone()
+            return float(row[0] or 0.0)
+
     def state_keys_like(self, pattern: str) -> list[str]:
         """R16: bot_state keys matching a SQL LIKE pattern.
 

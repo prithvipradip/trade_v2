@@ -400,6 +400,10 @@ builder and the breaker never closes a position (it blocks entries after the los
 An unfilled entry is repriced on a timer and finally cancelled; a partial fill has its remainder cancelled so legs are not orphaned. The whole timeline (grace periods,
 rests, timeouts, what each floor rests on) is in [section 8.4](#84-order-lifecycle-timeline); do not rely on the example durations here.
 
+At more than one lot (`positions.max_contracts_per_trade` above 1) three facts matter. An entry that fills only in part is booked at the filled quantity when its order ends (the entry timeout cancels the
+remainder); until then the filled lots carry no stops or exits. The exit, the realized P&L, the expiry booking and the reconciler's quantity checks all work from the quantity on the trade row. Legs are 1:1 by
+invariant (the reconciler and the executions ledger count contracts per leg), so a structure with another leg ratio needs both taught about ratios before it is added.
+
 ### 8.2 Exits and booking
 
 Closing a position is a combo order priced from the current mark with a bounded cross, re-priced on each unfilled attempt, with a ceiling relative to the mark and a band-reject memory so a
@@ -476,7 +480,7 @@ enough paper orders, exits included, exist. Which alerts these timers produce, a
 | 3c | IV-crush pre-close | Short-premium positions are closed within a couple of days before a known earnings date, whatever their P&L (moot for index ETFs, which have none) |
 | 3d | Macro-event flatten | Applies to undefined-risk / assignment-risk shapes; **defined-risk condors are exempt** (the wings cap the surprise and post-event vol crush is the payoff). New credit entries are separately kept out of the days before an event ([4.2](#42-pre-execution-checks)) |
 | 3e | Ex-dividend risk | A short call is closed ahead of an ex-dividend date regardless of DTE |
-| 4 | Partial exits | Scale-out milestones for strategies that use them; each level fires once (recorded in the database) |
+| 4 | Partial exits | Scale-out milestones for single-leg positions that hold more than one contract; each level fires once (recorded in the database). A multi-leg position (condor, vertical) is managed whole, whatever its lot count: one closing combo at the full quantity |
 | 5 | PDT veto | Can hold back an exit that would be an illegal day trade |
 
 **Thesis check.** For *directional* strategies the 5-minute cycle also re-evaluates the entry thesis (direction flipped, regime shifted to high volatility, VIX spiked since entry) and exits if it

@@ -601,6 +601,23 @@ class PositionReconciler:
             or (expiry_d == _today and now_et().time() >= _dtime(16, 15)))
         settlement_px = (self._settlement_price(trade.symbol, expiry_d)
                          if settle_due else None)
+        # W112: a trade that already sold part of itself (exit slices, N >= 2) carries those slices' P&L
+        # on its row, and ``close_trade`` adds them to whatever is booked here. The broker's per-leg
+        # realizedPNL covers the legs' whole life, slices included, so booking it as is would count the
+        # slices twice. An EXPIRED structure is valued instead on what is left (the intrinsic path below,
+        # remaining quantity), which the slices complement exactly once.
+        if found_ibkr_pnl and expiry_d is not None and expiry_d <= _today:
+            try:
+                _slices = self._state.get_partial_exits(trade.trade_id)
+            except Exception:  # noqa: BLE001 - unreadable history: close_trade folds nothing either
+                _slices = []
+            if isinstance(_slices, list) and _slices:
+                log.warning("reconcile_expired_with_exit_slices_valued_on_remaining",
+                            trade_id=trade.trade_id, slices=len(_slices),
+                            broker_realized_sum=round(realized_pnl, 2),
+                            note="the broker's per-leg figure covers the slices too; booking the "
+                                 "remaining quantity at the settlement value instead")
+                found_ibkr_pnl = False
         if settlement_px is not None and found_ibkr_pnl:
             _si = self._structure_intrinsic(trade, settlement_px)
             if _si is not None and trade.entry_price > 0:

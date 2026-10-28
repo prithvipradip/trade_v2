@@ -3796,17 +3796,27 @@ class TradingOrchestrator:
             # Persist TOTAL capital-at-risk for this position = per-contract
             # max_loss x the executed contract count. (See _position_capital_at_risk.)
             _total_risk = self._position_capital_at_risk(signal, adjusted_size)
-            self._state.set_state(
-                f"trade_maxloss_{trade_id}",
-                str(_total_risk),
-            )
-            # R7: capital-at-risk RETAINED on the trade row (the KV above is
-            # deleted on close) so PF-per-unit-risk and DD-vs-deployed-risk
-            # stay reconstructable for the go-live verdict.
-            try:
-                self._state.set_trade_capital_at_risk(trade_id, _total_risk)
-            except Exception:  # noqa: BLE001
-                pass
+            # W112: the fill's restatement (real fill price, real filled quantity) can land BEFORE this
+            # placement-time stamp (an event-driven fill during the awaits above); it is the better
+            # figure, so it is kept. A stub store answers with a non-number: stamp as before.
+            _row = self._find_trade_by_id(trade_id)
+            _stamped = getattr(_row, "capital_at_risk", 0.0)
+            if isinstance(_stamped, (int, float)) and not isinstance(_stamped, bool) and _stamped > 0:
+                log.info("placement_capital_at_risk_kept_restated_from_fill",
+                         trade_id=trade_id, restated=round(float(_stamped), 2),
+                         placement_figure=round(float(_total_risk), 2))
+            else:
+                self._state.set_state(
+                    f"trade_maxloss_{trade_id}",
+                    str(_total_risk),
+                )
+                # R7: capital-at-risk RETAINED on the trade row (the KV above is
+                # deleted on close) so PF-per-unit-risk and DD-vs-deployed-risk
+                # stay reconstructable for the go-live verdict.
+                try:
+                    self._state.set_trade_capital_at_risk(trade_id, _total_risk)
+                except Exception:  # noqa: BLE001
+                    pass
             # trade-life-entry-vix-refetch-defeats-lkg (R22): this line was
             # `vix=await self._market_data.get_vix() or 0` — a SECOND,
             # independent network fetch (get_vix is uncached) seconds after
@@ -4802,6 +4812,33 @@ class TradingOrchestrator:
         # that leg: one exit row fewer.
         return 2 * legs_n - self._excluded_exit_legs(trade.trade_id)
 
+    def _lots_traded(self, trade) -> int:
+        """W112: the lot count the trade was OPENED with: what is left plus what exit slices already
+        closed (an exit partial fill lowers ``trade.quantity``, the executions keep all of it)."""
+        qty = max(1, int(getattr(trade, "quantity", 1) or 1))
+        try:
+            slices = self._state.get_partial_exits(trade.trade_id)
+            qty += sum(int(s.get("quantity", 0) or 0) for s in slices)
+        except Exception:  # noqa: BLE001 - unreadable history: judge on what is left
+            pass
+        return qty
+
+    def _commission_ledger_complete(self, trade_id: str, trade) -> tuple[bool, int, int]:
+        """W112: has every leg's entry and exit CONTRACT a reported commission? Returns
+        (complete, rows, expected_rows). Rows alone were the old test (``2 * legs``); at N lots one leg can
+        fill in several executions, so the entry rows alone could reach it. The contract test is additive:
+        at one lot (one execution per leg per side) it is the same number, and a store that gives no numeric
+        answer (a stub) leaves the row test as it was."""
+        rows = self._state.count_executions_with_commission(trade_id, exclude_con_id=BAG_CON_ID)
+        expected_rows = self._expected_commission_rows(trade)
+        if rows < expected_rows:
+            return False, rows, expected_rows
+        units = self._state.sum_commissioned_shares(trade_id, exclude_con_id=BAG_CON_ID)
+        if isinstance(units, (int, float)) and not isinstance(units, bool):
+            if units + 1e-9 < expected_rows * self._lots_traded(trade):
+                return False, rows, expected_rows
+        return True, rows, expected_rows
+
     def _excluded_exit_legs(self, trade_id: str) -> int:
         """W101: how many legs the last exit attempt left out of its combo."""
         try:
@@ -4877,10 +4914,8 @@ class TradingOrchestrator:
                     self._state.delete_state(f"trueup_pending_{_tid}")
                     continue
                 _legs_n = self._legs_count(_t)
-                _exec_n = self._state.count_executions_with_commission(
-                    _tid, exclude_con_id=BAG_CON_ID)
-                _expected_n = self._expected_commission_rows(_t)
-                if _exec_n < _expected_n:
+                _complete, _exec_n, _expected_n = self._commission_ledger_complete(_tid, _t)
+                if not _complete:
                     log.info("commission_trueup_deferred_partial_ledger_post_market",
                              trade_id=_tid, executions=_exec_n,
                              expected=_expected_n)
@@ -4950,7 +4985,9 @@ class TradingOrchestrator:
             legs_n = self._legs_count(trade)
             exec_n = self._state.count_executions_with_commission(
                 trade_id, exclude_con_id=BAG_CON_ID)
-            if real > 0 and trade and exec_n >= self._expected_commission_rows(trade):
+            # completeness is asked only when there is a commission to true up (as the row test was: the
+            # expected count is not even computed for a trade with no known commission yet)
+            if real > 0 and trade and self._commission_ledger_complete(trade_id, trade)[0]:
                 delta = round(self._booked_commission_estimate(trade) - real, 2)
                 self._forget_commission_estimate(trade_id)
                 if abs(delta) >= 0.01:

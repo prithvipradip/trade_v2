@@ -3,6 +3,8 @@
 
     python scripts/probe_w101_combo_close.py preflight                       # default; places nothing
     python scripts/probe_w101_combo_close.py open  --trial F1 --kind far     # open a 1-lot SPY condor
+    python scripts/probe_w101_combo_close.py open  --trial M1 --kind far --quantity 2   # W112: a 2-lot condor
+    python scripts/probe_w101_combo_close.py close --trial M1 --quantity 1  # ... close ONE lot, then the rest
     python scripts/probe_w101_combo_close.py close --trial F1                # THE EXPERIMENT
     python scripts/probe_w101_combo_close.py flatten --trial F1              # combo ladder, then leg-out
     python scripts/probe_w101_combo_close.py cancel                          # cancel W101PROBE orders only
@@ -22,7 +24,8 @@ SAFETY, by design (this script PLACES REAL PAPER ORDERS; the operator runs it, b
     because a fallback id cannot cancel the orders placed under 96;
   - refuses to run while the supervisor holds `data/orchestrator.lock` (a flock test: the pid in
     the file is informational), or while `data/bot_heartbeat` is fresh in market hours;
-  - SPY only, one lot, exactly four legs, wing width <= 3; no combo limit is ever above the wing
+  - SPY or QQQ only, one lot by default (`--quantity 2` or `3` for the W112 multi-lot ramp), exactly
+    four legs, wing width <= 3; no combo limit is ever above the wing
     width (the structure's maximum loss); every order is tagged `W101PROBE-...` (the reconciler
     only ever adopts an order whose orderRef equals a trade id);
   - one probe order live at a time: each rung's cancel is CONFIRMED, and the executions are checked
@@ -72,7 +75,8 @@ PROBE_CLIENT_ID = 96            # 98 is validate_w55_synthetic_delta.py; the bot
 SYMBOL = "SPY"                  # the underlying of THIS run; `use_symbol` changes it (state / --symbol)
 PROBE_SYMBOLS = ("SPY", "QQQ")  # the only underlyings the probe will trade; also what its guards watch
 SPOT_HINT: float | None = None  # --spot-hint: a rough price of the underlying, the parity search's starting point
-QUANTITY = 1
+QUANTITY = 1                    # lots of THIS run; `use_quantity` changes it (open / close / flatten read the trial)
+MAX_QUANTITY = 3                # W112: the multi-lot ramp stops at three lots
 MAX_WIDTH = 3.0
 TAG = "W101PROBE"
 SCHEMA = 1
@@ -125,6 +129,14 @@ def use_symbol(symbol: str) -> None:
     if symbol not in PROBE_SYMBOLS:
         raise ProbeGuardError(f"the probe trades only {PROBE_SYMBOLS}, not {symbol!r}")
     SYMBOL = symbol
+
+
+def use_quantity(quantity: int) -> None:
+    """W112: the lot count of this run's orders (1 by default; the multi-lot ramp uses 2 or 3)."""
+    global QUANTITY
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= MAX_QUANTITY:
+        raise ProbeGuardError(f"the probe trades 1 to {MAX_QUANTITY} lots, not {quantity!r}")
+    QUANTITY = quantity
 
 
 class ProbeGuardError(RuntimeError):
@@ -477,9 +489,9 @@ def guard_window(cmd: str, kind: str | None = None, *, step: str | None = None) 
 
 
 def guard_caps(legs: list[dict]) -> None:
-    """SPY only, one lot, exactly two puts and two calls, each wing <= MAX_WIDTH."""
-    if SYMBOL not in PROBE_SYMBOLS or QUANTITY != 1:
-        raise ProbeGuardError(f"the probe is pinned to {PROBE_SYMBOLS}, one lot")
+    """SPY or QQQ only, 1 to MAX_QUANTITY lots, exactly two puts and two calls, each wing <= MAX_WIDTH."""
+    if SYMBOL not in PROBE_SYMBOLS or not 1 <= QUANTITY <= MAX_QUANTITY:
+        raise ProbeGuardError(f"the probe is pinned to {PROBE_SYMBOLS}, 1 to {MAX_QUANTITY} lots")
     if len(legs) != 4:
         raise ProbeGuardError(f"a condor has exactly 4 legs, got {len(legs)}")
     for right in ("P", "C"):
@@ -851,13 +863,21 @@ def trial_legs(tstate: dict, which: str) -> list[dict]:
              "action": l[key], "ratio": 1} for l in tstate["legs"]]
 
 
+def trial_closed(t: dict) -> bool:
+    """W112: is the trial FLAT? A trial opened with a lot count tracks ``remaining`` (a staged close leaves
+    some); an older one (no ``remaining``) is closed once any closing step filled."""
+    if "remaining" in t:
+        return int(t["remaining"]) <= 0
+    return any((t.get(s) or {}).get("status") == "filled" for s in ("close", "flatten"))
+
+
 def owned_con_ids(state: dict, *, active_only: bool = True) -> set[int]:
     """conIds of every trial whose open filled and which has not been closed/flattened."""
     out: set[int] = set()
     for t in state.get("trials", {}).values():
         if (t.get("open") or {}).get("status") != "filled":
             continue
-        closed = any((t.get(s) or {}).get("status") == "filled" for s in ("close", "flatten"))
+        closed = trial_closed(t)
         if active_only and closed:
             continue
         out |= {int(l["conId"]) for l in t["legs"]}
@@ -868,6 +888,7 @@ def new_trial(name: str, kind: str, structure: dict, data_type: int) -> dict:
     return {"name": name, "kind": kind, "symbol": SYMBOL, "created": now_et().isoformat(),
             "expiry": structure["expiry"],
             "dte": structure["dte"], "width": structure["width"], "data_type": data_type,
+            "quantity": QUANTITY, "remaining": QUANTITY,
             "legs": structure["legs"]}
 
 
@@ -1339,6 +1360,7 @@ async def _prepare(ibkr, state: dict, ev: Evidence, owned: set[int], *, init_mar
 
 
 async def cmd_preflight(args) -> dict:
+    use_quantity(int(getattr(args, "quantity", 1) or 1))
     """Read-only: account, the structures the probe would build, whether the BAG ticks, a what-if
     margin preview, and the ladder it would walk. Never calls placeOrder."""
     ev = Evidence("preflight")
@@ -1398,7 +1420,26 @@ async def cmd_preflight(args) -> dict:
         await ibkr.disconnect()
 
 
+async def bot_liveness(ibkr, tstate: dict, lots: int) -> str:
+    """W112: what the BOT's own ``PositionReconciler.position_liveness`` says about this trial held at
+    ``lots`` lots (the answer its exit path acts on: "live" lets a reverse combo go out, "partial" refuses
+    it). Evidence only: any trouble is returned as text, never raised."""
+    try:
+        await fresh_positions(ibkr)                 # the bot reads its cached view: bring it up to date first
+        rec = PositionReconciler.__new__(PositionReconciler)
+        rec._ibkr = ibkr
+        legs = [{"strike": l["strike"], "right": l["right"], "expiry": str(l["expiry"]),
+                 "action": l["open_action"]} for l in tstate["legs"]]
+        trade = SimpleNamespace(trade_id=f"{TAG}-{tstate.get('name', '')}", symbol=tstate.get("symbol", SYMBOL),
+                                quantity=lots, legs=json.dumps(legs), expiry=str(tstate["expiry"]),
+                                strike=None, contract_type="iron_condor")
+        return await rec.position_liveness(trade)
+    except Exception as e:  # noqa: BLE001 - evidence, not a gate
+        return f"error:{type(e).__name__}:{str(e)[:80]}"
+
+
 async def cmd_open(args) -> dict:
+    use_quantity(int(getattr(args, "quantity", 1) or 1))
     state = load_state()
     if args.trial in state["trials"]:
         raise ProbeGuardError(f"trial {args.trial!r} already exists -- pick a new name or inspect 'status'")
@@ -1452,6 +1493,11 @@ async def cmd_open(args) -> dict:
         positions = await fresh_positions(ibkr)
         ev.emit("trial_end", step="open_positions", positions=positions_snapshot(
             positions, {int(l["conId"]) for l in structure["legs"]}))
+        if result["outcome"] in ("filled", "cancel_race_filled"):
+            ev.emit("quantity_check", step="open", lots=QUANTITY,
+                    positions=positions_snapshot(positions, {int(l["conId"]) for l in structure["legs"]}),
+                    bot_liveness=await bot_liveness(ibkr, tstate, QUANTITY),
+                    bot_liveness_one_lot_more=await bot_liveness(ibkr, tstate, QUANTITY + 1))
         if result["outcome"] not in ("filled", "cancel_race_filled"):
             raise ProbeGuardError(f"open ended {result['outcome']!r}: nothing to close "
                                   "(run 'status' and 'cancel' if an order may be left)")
@@ -1468,8 +1514,9 @@ async def cmd_open(args) -> dict:
 
 def _positions_match_open(tstate: dict, positions) -> tuple[bool, dict]:
     snap, ok = {}, True
+    lots = float(tstate.get("remaining", 1))
     for l in tstate["legs"]:
-        want = 1.0 if l["open_action"] == "BUY" else -1.0
+        want = lots if l["open_action"] == "BUY" else -lots
         got = _pos_of(positions, int(l["conId"]))
         snap[str(l["conId"])] = got
         ok = ok and got == want
@@ -1562,8 +1609,13 @@ async def cmd_close(args) -> dict:
     tstate = state["trials"].get(args.trial)
     if not tstate or (tstate.get("open") or {}).get("status") != "filled":
         raise ProbeGuardError(f"trial {args.trial!r} has no filled 'open' step")
-    if any((tstate.get(s) or {}).get("status") == "filled" for s in ("close", "flatten")):
+    if trial_closed(tstate):
         raise ProbeGuardError(f"trial {args.trial!r} is already closed")
+    remaining = int(tstate.get("remaining", tstate.get("quantity", 1)))
+    lots = int(getattr(args, "quantity", None) or remaining)
+    if not 1 <= lots <= remaining:
+        raise ProbeGuardError(f"trial {args.trial!r} holds {remaining} lot(s); cannot close {lots}")
+    use_quantity(lots)
     use_symbol(tstate.get("symbol", "SPY"))
     guard_window("close", tstate["kind"])
     guard_bot_stopped()
@@ -1588,7 +1640,15 @@ async def cmd_close(args) -> dict:
         after = await fresh_positions(ibkr)
         ev.emit("trial_end", step="close_positions", positions=positions_snapshot(
             after, {int(l["conId"]) for l in tstate["legs"]}))
-        return {"trial": args.trial, **result}
+        if result["outcome"] in ("filled", "cancel_race_filled"):
+            tstate["remaining"] = remaining - lots
+            save_state(state)
+            ev.emit("quantity_check", step="close", lots_closed=lots, remaining=tstate["remaining"],
+                    positions=positions_snapshot(after, {int(l["conId"]) for l in tstate["legs"]}),
+                    bot_liveness_at_remaining=(await bot_liveness(ibkr, tstate, tstate["remaining"])
+                                               if tstate["remaining"] > 0 else None),
+                    bot_liveness_at_old_size=await bot_liveness(ibkr, tstate, remaining))
+        return {"trial": args.trial, "remaining": tstate.get("remaining"), **result}
     finally:
         errors.detach()
         ev.emit("run_end")
@@ -1612,7 +1672,7 @@ async def single_leg_ladder(ibkr, leg: dict, action: str, position: float, ev: E
             lim = max(0.01, b - LEGOUT_STEP * k)
         lim = round(lim, 2)
         ev.emit("rung_plan", step="legout", k=k, leg=leg["conId"], action=action, bid=bid, ask=ask, limit=lim)
-        order = OrderBuilder.limit(action, QUANTITY, lim)
+        order = OrderBuilder.limit(action, abs(int(position)) or QUANTITY, lim)
         last = await place_and_rest(ibkr, leg["_contract"], order,
                                     make_order_ref(trial, f"legout-{leg['conId']}", k), LEGOUT_REST_S,
                                     ev, errors, k)
@@ -1681,8 +1741,10 @@ async def cmd_flatten(args) -> dict:
     tstate = state["trials"].get(args.trial)
     if not tstate or (tstate.get("open") or {}).get("status") != "filled":
         return {"status": "nothing_to_flatten"}
-    if any((tstate.get(s) or {}).get("status") == "filled" for s in ("close", "flatten", "legout")):
+    if trial_closed(tstate) or ("remaining" not in tstate and any(
+            (tstate.get(s) or {}).get("status") == "filled" for s in ("legout",))):
         return {"status": "already_flat"}
+    use_quantity(max(1, int(tstate.get("remaining", tstate.get("quantity", 1)))))
     use_symbol(tstate.get("symbol", "SPY"))
     guard_window("flatten")
     guard_bot_stopped()
@@ -1701,16 +1763,22 @@ async def cmd_flatten(args) -> dict:
         held = {int(l["conId"]) for l in tstate["legs"] if _pos_of(positions, int(l["conId"])) != 0}
         if not held:
             tstate["flatten"] = {"status": "filled", "outcome": "already_flat_at_broker"}
+            tstate["remaining"] = 0
             save_state(state)
             return {"status": "already_flat"}
         if not args.legout_only:
             result = await _run_close_like(ibkr, state, tstate, args.trial, "flatten", ev, errors, params,
                                            rest_s=args.rest or LEGOUT_REST_S, tail=False)
             if result["outcome"] in ("filled", "cancel_race_filled"):
+                tstate["remaining"] = 0
+                save_state(state)
                 return {"status": "flattened_by_combo", **result}
             if result["outcome"] in ("cancel_unconfirmed", "partial"):
                 raise ProbeGuardError(f"combo flatten ended {result['outcome']!r}: run 'status' and 'cancel'")
         out = await leg_out(ibkr, state, tstate, args.trial, ev, errors)
+        if out.get("status") == "filled":
+            tstate["remaining"] = 0
+            save_state(state)
         return {"status": "flattened_by_legout", "legout": out}
     finally:
         errors.detach()
@@ -1797,8 +1865,9 @@ async def cmd_status(_args) -> dict:
                    if any((t.get(s) or {}).get("status") in ("working", "placing", "partial", "short_still_open")
                           for s in ("open", "close", "flatten", "legout"))
                    or ((t.get("open") or {}).get("status") == "filled"
+                       and not trial_closed(t)
                        and not any((t.get(s) or {}).get("status") in ("filled", "longs_left")
-                                   for s in ("close", "flatten", "legout")))]
+                                   for s in ("close", "flatten", "legout") if "remaining" not in t))]
         checklist = {"no_spy_option_positions": not spy, "no_probe_orders_working": not working,
                      "no_spy_keys_in_halt_untracked": not halt, "no_trial_open_or_working": not pending}
         result = {"trials": {n: {s: (t.get(s) or {}).get("status") for s in ("open", "close", "flatten", "legout")}
@@ -2028,6 +2097,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
     for name in _HANDLERS:
         sp = sub.add_parser(name)
+        if name in ("preflight", "open", "close"):
+            sp.add_argument("--quantity", type=int, default=None, choices=range(1, MAX_QUANTITY + 1),
+                            metavar=f"1..{MAX_QUANTITY}",
+                            help="lots: open/preflight default 1; close default = every lot still held "
+                                 "(a smaller number closes that many and leaves the rest)")
         if name in ("preflight", "open"):
             sp.add_argument("--data-type", type=int, default=3, choices=(1, 2, 3, 4),
                             help="market-data type for this session (default 3 = the bot's)")

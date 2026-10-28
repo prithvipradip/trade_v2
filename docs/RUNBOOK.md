@@ -162,6 +162,14 @@ While the paper account runs the shipped configuration, `python scripts/paper_ch
 
 Read the pace and fill section first: with few fills the question is why entries do not fill, not whether the model is right. The epoch, the model figures and the decision classes are fixed in PLAN.md (the entry that pre-registers the paper checkpoint); nothing here changes a go-live gate. Weekly is a sensible rhythm; the comparison only becomes informative as closes accumulate.
 
+## Multi-lot ramp (before `positions.max_contracts_per_trade` is raised above 1)
+Live places one lot because that cap is 1. Raising it needs the IB paper probe to show, once, that the broker and the bot agree at two and three lots. Run it with the supervisor and the bot stopped (the probe refuses otherwise), in market hours, on the paper account; it takes about half an hour and interrupts the paper run, which continues unchanged on restart.
+1. `python scripts/probe_w101_combo_close.py preflight --quantity 2` places nothing and checks the guards and the margin for two lots.
+2. `open --trial M1 --kind far --quantity 2`: expect `filled`, and in the evidence (`reports/w101_probe/<date>/events.jsonl`) a `quantity_check` event with two lots on every leg and `bot_liveness: live`, `bot_liveness_one_lot_more: partial`.
+3. `close --trial M1 --quantity 1 --no-truth-tail`: expect one lot left and a `quantity_check` with `bot_liveness_at_remaining: live` and `bot_liveness_at_old_size: partial`.
+4. `close --trial M1 --no-truth-tail` closes the rest; `status` must then say it is ready to restart the bot. Repeat steps 1 to 4 with `--quantity 3`.
+A different answer at any step means the cap stays at 1: read the evidence, then fix the code before trying again. Partial entry fills, stops, take-profits and expiry cannot be forced on paper; the test suite covers them.
+
 ## Deploy checklist (EVERY deploy)
 A green test suite is not a safe deploy: unit tests once passed and the deployed code still killed the trading loop for a full session (stops/TPs unmanaged), found a day later. Do all five steps, in order:
 
