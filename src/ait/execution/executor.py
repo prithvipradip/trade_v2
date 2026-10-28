@@ -2461,9 +2461,34 @@ class TradeExecutor:
             except Exception:  # noqa: BLE001 — no ledger answer is not evidence
                 n = 0
             if n > 0:
-                return {"units": 0.0, "price": None,
+                return {"units": self._ledger_units(trade_id, pending), "price": None,
                         "source": "executions_ledger", "n_fills": n}
         return None
+
+    def _ledger_units(self, trade_id: str, pending=None) -> float:
+        """W112: combo units that filled, from the executions ledger; 0.0 when the ledger cannot say.
+
+        The BAG summary rows carry the combo units; without them every leg must be present and the units
+        are the smallest leg total (legs are 1:1 by invariant). A ledger that cannot give a figure returns
+        0.0, which callers treat as "unknown" and answer with the requested size, as before: at N = 1 the
+        figure is 1 either way, at N lots it is the quantity that really filled."""
+        try:
+            by_con = self._state.executed_shares_by_con(trade_id)
+        except Exception:  # noqa: BLE001 - no ledger answer is not evidence
+            return 0.0
+        if not isinstance(by_con, dict):
+            return 0.0
+        bag = by_con.get(BAG_CON_ID, 0.0)
+        if bag > 0:
+            return float(bag)
+        legs = {c: q for c, q in by_con.items() if c != BAG_CON_ID and q > 0}
+        try:
+            n_legs = len(getattr(getattr(pending, "signal", None), "legs", None) or []) or 1
+        except TypeError:
+            n_legs = 1
+        if not legs or len(legs) < n_legs:
+            return 0.0
+        return float(min(legs.values()))
 
     def _cancel_verdict(self, order_id: int, pending=None) -> str:
         """R19: the ONLY place an entry 'cancelled' verdict is minted.

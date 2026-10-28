@@ -1122,7 +1122,11 @@ class PortfolioManager:
 
         # 4. Check for partial exit milestones (only if not already exiting
         # fully, and only with real marks)
-        if not should_exit and not marks_missing and trade.quantity > 1:
+        # W112: single-leg positions only. A multi-leg position (condor, vertical) is managed whole: the
+        # orchestrator refuses a multi-leg partial without recording the level, so at N >= 2 the same
+        # trigger fired every cycle and kept the position out of the roll and thesis passes.
+        if (not should_exit and not marks_missing and trade.quantity > 1
+                and trade.contract_type in ("call", "put")):
             partial_exit_quantity = self._check_partial_exit(
                 trade.trade_id, pnl_pct, trade.quantity,
             )
