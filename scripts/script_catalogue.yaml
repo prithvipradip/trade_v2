@@ -466,6 +466,16 @@ scripts/narrow_wing_study.py:
   explained: "-"
   stamp: "32ff4a6cd390"
 
+scripts/budget_ladder_study.py:
+  group: Study
+  what: "Walk-forward study of the per-trade budget (5%, 7.5%, 10%, 15% and 20% of the pool at wing_k 1.6 and 1 lot) with a pre-registered decision rule, an absolute-profit criterion, a dose-response check and a stressed-friction repeat; rungs above the operator's per-trade cap are reported but never supported."
+  when: "To decide whether a larger per-trade budget than the shipped 5% is supported by the model (the pre-registered rule is in the script docstring and PLAN.md)."
+  needs_ib: "no"
+  writes: "reports/budget_ladder_study/entry_dte_<n>/ and stress_2x/ (per-variant .json), results.json, results.md; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/budget_ladder_study.py [--entry-dtes 18,25] [--skip-stress]"
+  explained: "-"
+  stamp: "b8f73fa7710e"
+
 scripts/probe_w53_roll_atomicity.py:
   group: IB paper probe
   what: "Probe of whether IB accepts and fills ONE four-leg cross-expiry order that closes a vertical at one expiry and opens one at another. The subcommands `open`, `roll` and `flatten` PLACE ORDERS."
