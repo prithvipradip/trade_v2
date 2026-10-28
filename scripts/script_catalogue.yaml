@@ -456,6 +456,16 @@ scripts/wing_budget_study.py:
   explained: "-"
   stamp: "60508ee5cbe6"
 
+scripts/narrow_wing_study.py:
+  group: Study
+  what: "Walk-forward study of narrower condor wings and more than one lot (budget, wing_k and lot cap varied, 1 lot at 5% per trade as the baseline) with a pre-registered decision rule, a sanity variant, wiring checks and a stressed-friction repeat; its verdict decides whether live multi-lot is worth building."
+  when: "To decide whether a narrower wing or a multi-lot condor beats the shipped configuration (the pre-registered rule is in the script docstring and PLAN.md)."
+  needs_ib: "no"
+  writes: "reports/narrow_wing_study/entry_dte_<n>/ and stress_2x/ (per-variant .json), results.json, results.md; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/narrow_wing_study.py [--entry-dtes 18,25] [--skip-stress]"
+  explained: "-"
+  stamp: "32ff4a6cd390"
+
 scripts/probe_w53_roll_atomicity.py:
   group: IB paper probe
   what: "Probe of whether IB accepts and fills ONE four-leg cross-expiry order that closes a vertical at one expiry and opens one at another. The subcommands `open`, `roll` and `flatten` PLACE ORDERS."
