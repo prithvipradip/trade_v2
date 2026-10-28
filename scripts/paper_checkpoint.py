@@ -11,7 +11,7 @@ report under ``reports/paper_checkpoint/`` (statistics only, git-ignored).
 POPULATION (the same definition the go-live scorecard uses). ``trades`` rows with strategy iron_condor and
 status closed, minus the not-real closes (``ait.reporting.go_live.not_real_close_sql``), rolled chains folded
 into one outcome each (``fold_roll_chains``), whose ORIGIN was entered at or after ``--epoch-start``
-(default 2026-10-29, the paper restart). The weekly scorecard is the whole-DB reference; this is the same
+(default 2026-10-28, the earliest possible paper restart). The weekly scorecard is the whole-DB reference; this is the same
 population restricted to the epoch.
 
 EXIT-REASON MAPPING (live ``exit_reason_detailed`` -> the model's categories). The model's exits are
@@ -36,7 +36,7 @@ artefact, so the comparison uses the non-forced exits only. The live friction sh
 crossing (it is inside the exit price and not separable), as the model's does. A PF measured on about 25
 closes has a wide interval; the 80% bootstrap interval is printed with it.
 
-Usage: python scripts/paper_checkpoint.py [--checkpoint C1|C2] [--epoch-start 2026-10-29] [--now ISO]
+Usage: python scripts/paper_checkpoint.py [--checkpoint C1|C2] [--epoch-start 2026-10-28] [--now ISO]
        [--db data/ait_state.db] [--out reports/paper_checkpoint]
 """
 from __future__ import annotations
@@ -54,7 +54,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-EPOCH_START_DEFAULT = "2026-10-29"
+EPOCH_START_DEFAULT = "2026-10-28"
 OUT_BASE = ROOT / "reports" / "paper_checkpoint"
 
 # --- pre-registered thresholds (PLAN.md W110) -----------------------------------------------------

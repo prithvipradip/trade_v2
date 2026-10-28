@@ -484,7 +484,7 @@ scripts/paper_checkpoint.py:
   writes: "reports/paper_checkpoint/<date>_<C1|C2>.md (statistics only); the state database is opened read-only."
   example: "python scripts/paper_checkpoint.py [--checkpoint C1|C2] [--epoch-start <YYYY-MM-DD>]"
   explained: "-"
-  stamp: "7da5a04f3bb9"
+  stamp: "b6a9e9082e57"
 
 scripts/probe_w53_roll_atomicity.py:
   group: IB paper probe
