@@ -24,7 +24,7 @@ pc = importlib.util.module_from_spec(_spec)
 sys.modules["paper_checkpoint"] = pc
 _spec.loader.exec_module(pc)
 
-EPOCH = "2026-10-29"
+EPOCH = "2026-10-28"
 NOW = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
 
 
@@ -95,7 +95,7 @@ class TestThePopulation:
         db = make_db(tmp_path, [
             {"trade_id": "T-20260928-195224-adfe01", "entry_time": "2026-09-28T13:52:24-04:00"},
             {"trade_id": "in-1", "entry_time": "2026-11-02T10:00:00-05:00"},
-            {"trade_id": "in-2", "entry_time": "2026-10-29T09:40:00-04:00"}])
+            {"trade_id": "in-2", "entry_time": "2026-10-28T09:40:00-04:00"}])
         _, info = pc.run(db, "C1", EPOCH, NOW)
         assert info["metrics"]["n"] == 2
 
@@ -266,4 +266,4 @@ class TestTheModelFigures:
                 pc.PF_PESSIMISTIC, pc.PF_CONSISTENT) == (10, 12, 25, 26, 52, 15, 1.0, 0.6)
 
     def test_the_default_epoch_is_the_paper_restart(self):
-        assert pc.EPOCH_START_DEFAULT == "2026-10-29"
+        assert pc.EPOCH_START_DEFAULT == "2026-10-28"
