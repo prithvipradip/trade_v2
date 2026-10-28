@@ -52,6 +52,14 @@ from ait.utils.time import ET, get_market_close, time_to_expiry_years  # W74: re
 from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 from ait.risk.lot_sizing import lots_for_budget  # W108: the ONE lot rule, shared with live's PositionSizer and the pool
+from ait.risk.scalers import (  # W114: the ONE set of scalers + their inputs, shared with live's PositionSizer
+    RANGE_GATED_STRATEGIES,
+    ScalerInputs,
+    lot_scaler,
+    recent_losing_days,
+    scaler_factors,
+    sizing_confidence,
+)
 
 log = get_logger("backtesting.engine")
 
@@ -514,6 +522,15 @@ class Backtester:
         self._calibrated_spreads = None
         # W90a: None -> risk.max_position_risk_pct (what live funds the builder with; W108 retired backtest.position_size_pct)
         self._position_size_pct = resolve_position_size_pct(position_size_pct, _settings)
+        # W114: the scalers live uses (ait.risk.scalers), read from the same settings. They act only for a
+        # strategy in position_sizing.scaled_strategies (empty today), so nothing below changes a run until
+        # that list is set. min_confidence is LIVE's risk.min_confidence, not the learner-moved engine value.
+        from ait.config.settings import MLConfig as _MLC, PositionSizingConfig as _PSC, RiskConfig as _RC
+        self._sizing = getattr(_settings, "position_sizing", None) or _PSC()
+        self._scalers_on = bool(self._sizing.scaled_strategies)
+        self._sizing_min_conf = float(_resolve_setting(None, "risk", "min_confidence", _RC, _settings))
+        self._neutral_conf = float(_resolve_setting(
+            None, "ml", "observe_mode_neutral_confidence", _MLC, _settings))
         self._budget_aware_wings = bool(budget_aware_wings)
         self._condor_any_direction = bool(condor_any_direction)
         if friction_model not in ("legacy", "per_leg_usd"):
@@ -854,7 +871,7 @@ class Backtester:
     def _build_iv_rank_array(self) -> np.ndarray | None:
         """W68: IV rank aligned to `self._data` rows (NaN = unmeasurable), or None when the gate
         is off. Uses only observations at or before each row (no look-ahead)."""
-        if not getattr(self, "_iv_rank_gate", False):
+        if not (getattr(self, "_iv_rank_gate", False) or getattr(self, "_scalers_on", False)):
             return None
         from ait.data.iv_rank import iv_rank_series
         ser = self._iv_rank_series_arg
@@ -867,6 +884,48 @@ class Backtester:
                                  "entry fails closed, as live does when the rank is unknown")
                 return np.full(len(self._data), np.nan)
         return ser.reindex(self._data.index).to_numpy(dtype=float)
+
+    def _decision_vix(self, hist_dec: pd.DataFrame) -> float | None:
+        """W114: the raw VIX level (points, as live's sizer reads it) at the decision bar, or None.
+
+        Same lookup ``_get_iv`` uses for its VIX proxy: the market-context frame aligned to the last
+        decision bar. The feature column ``vix_level`` is VIX / 40 and cannot feed the VIX tiers."""
+        mc = self._market_context
+        if not mc:
+            return None
+        vix = mc.get("vix_close") or mc.get("vix")
+        try:
+            if vix is None:
+                return None
+            if hasattr(vix, "reindex"):
+                v = float(vix["Close"].reindex(hist_dec.index, method="ffill").iloc[-1])
+            else:
+                v = float(vix)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        return v if v == v and v > 0 else None
+
+    @staticmethod
+    def _losing_days_at(today: date, closed: list[dict], open_positions: list[dict]) -> int:
+        """W114: live's losing-day streak (ait.risk.scalers.recent_losing_days) on this run's own book:
+        an entry counts on its entry date, a close's P&L on its exit date (live's daily_stats)."""
+        from types import SimpleNamespace
+        entries: dict[date, int] = {}
+        for p in (*closed, *open_positions):
+            try:
+                d = datetime.fromisoformat(str(p["entry_date"])).date()
+            except (KeyError, ValueError):
+                continue
+            entries[d] = entries.get(d, 0) + 1
+        pnl: dict[date, float] = {}
+        for p in closed:
+            try:
+                d = datetime.fromisoformat(str(p.get("exit_date") or p.get("exit_time"))).date()
+            except ValueError:
+                continue
+            pnl[d] = pnl.get(d, 0.0) + float(p.get("pnl", 0.0))
+        return recent_losing_days(
+            today, lambda d: SimpleNamespace(trades_taken=entries.get(d, 0), total_pnl=pnl.get(d, 0.0)))
 
     def _would_reject(self, reason: str) -> None:
         """W67: observe mode -- the gate WOULD have rejected this day but did not.
@@ -1195,6 +1254,11 @@ class Backtester:
                     self._reject("regime_veto")
                     continue
 
+            # W114: what a structure is SIZED on (ait.risk.scalers.sizing_confidence): the directional
+            # confidence as it stands here, and the range probability the block below may compute.
+            _size_directional_conf = confidence
+            _size_range_prob = None
+
             # Range model gate: for neutral credit structures, replace
             # confidence with P(stays in range). Skip if below range threshold.
             if strategy in NEUTRAL_CREDIT_GATED:
@@ -1255,6 +1319,7 @@ class Backtester:
                             _entry_decision["range_gate"]["raw_prob"] = round(
                                 float(rp.probability_in_range), 4)
                             confidence = _p_range
+                            _size_range_prob = _p_range
                     except Exception:
                         pass
 
@@ -1418,10 +1483,28 @@ class Backtester:
                 fill_ctx = {"spot": float(limit_price),
                             "as_of": datetime.fromisoformat(fill_time_str).astimezone(ET),
                             "iv_hist": hist.iloc[:-1]}
-            pos = self._build_position(
-                strategy, direction, row, hist, today_date, capital,
-                market_context=self._market_context, fill_ctx=fill_ctx,
-            )
+            # W114: the scaler inputs of this entry (only when position_sizing.scaled_strategies is set):
+            # the same five live's sizer reads, each from the research source of the same quantity.
+            self._size_in = None
+            if self._scalers_on and strategy in self._sizing.scaled_strategies:
+                _ivr = (float(self._iv_rank_arr[i - _dec_lag]) if self._iv_rank_arr is not None
+                        else float("nan"))
+                self._size_in = {
+                    "confidence": sizing_confidence(
+                        strategy, gates_on=(self._gates_mode == "enforce"),
+                        range_prob=_size_range_prob, directional_conf=_size_directional_conf,
+                        neutral_conf=self._neutral_conf, range_gated=RANGE_GATED_STRATEGIES),
+                    "iv_rank": None if _ivr != _ivr else _ivr,        # NaN = unmeasurable = unknown
+                    "vix": self._decision_vix(hist_dec),
+                    "losing_days": self._losing_days_at(today_date, trades, open_positions),
+                }
+            try:
+                pos = self._build_position(
+                    strategy, direction, row, hist, today_date, capital,
+                    market_context=self._market_context, fill_ctx=fill_ctx,
+                )
+            finally:
+                self._size_in = None
             if pos is None:
                 self._reject("builder_none")
                 continue
@@ -2157,6 +2240,15 @@ class Backtester:
     _surface = None                         # W75: IVSurface when pricing_source == "surface"
     _realistic: bool = False
     _expiry_guard_dte: int | None = None
+    # W114: the sizing scalers (position_sizing.scaled_strategies). Partial engines (Backtester.__new__ in
+    # tests) stay scaler-free: no strategy is listed, no inputs are set, every scaler is 1.0.
+    _scalers_on: bool = False
+    _sizing = None
+    _sizing_min_conf: float | None = None   # set from the settings in __init__; read only when scalers are on
+    _neutral_conf: float | None = None
+    _size_in = None      # per-entry inputs set by run() just before _build_position
+    _size_ctx = None     # the same plus the strategy and the entry IV, live only while a builder runs
+    _last_scaler: float = 1.0
     _max_hold_fraction: float | None = None
     _flatten_minutes: int | None = None
     # W77: settlement knobs; the stats dict is created on first use for partial engines.
@@ -2381,11 +2473,22 @@ class Backtester:
             self._reject("builder:iv_floor")  # detail of the loop's builder_none
             return None
 
-        if strategy in CREDIT_STRATEGIES:
-            pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital,
-                                              expiry=expiry_override)
-        else:
-            pos = self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date, capital)
+        # W114: while a builder runs, _lots can see the entry's scaler inputs (set by run(); None = scalers off)
+        self._size_ctx = (None if self._size_in is None
+                          else {**self._size_in, "strategy": strategy, "iv": float(iv)})
+        self._last_scaler = 1.0
+        try:
+            if strategy in CREDIT_STRATEGIES:
+                pos = self._build_credit_position(strategy, underlying, iv, t, r, dte, today_date, capital,
+                                                  expiry=expiry_override)
+            else:
+                pos = self._build_debit_position(strategy, direction, underlying, iv, t, r, dte, today_date,
+                                                 capital)
+        finally:
+            self._size_ctx = None
+        if pos is not None and self._size_in is not None:
+            pos["size_scaler"] = round(float(self._last_scaler), 6)
+            pos["size_confidence"] = round(float(self._size_in["confidence"]), 4)
         # W64: live trades at most positions.max_contracts_per_trade contracts
         # (sizer hard cap, config 1). The engine sized off capital x pct alone,
         # so a larger account backtested 2-4 contracts/trade where live trades 1.
@@ -2520,7 +2623,19 @@ class Backtester:
         is no "open one lot anyway" fallback any more. The live per-trade contract cap is applied
         by ``_build_position`` after the builder returns.
         """
-        return lots_for_budget(risk_per_contract, capital, self._position_size_pct)
+        scaler = 1.0
+        ctx = self._size_ctx
+        if self._scalers_on and ctx is not None and ctx["strategy"] in self._sizing.scaled_strategies:
+            # W114: the SAME six factors live's PositionSizer computes (ait.risk.scalers), on the entry's
+            # inputs; lots_for_budget clamps the product at 1 (a scaler only throttles)
+            factors = scaler_factors(
+                ctx["strategy"],
+                ScalerInputs(confidence=ctx["confidence"], implied_vol=ctx.get("leg_iv") or ctx["iv"],
+                             iv_rank=ctx["iv_rank"], recent_losing_days=ctx["losing_days"], vix=ctx["vix"]),
+                self._sizing, self._sizing_min_conf)
+            scaler = lot_scaler(ctx["strategy"], factors, self._sizing)
+        self._last_scaler = scaler
+        return lots_for_budget(risk_per_contract, capital, self._position_size_pct, scaler=scaler)
 
     def _log_unaffordable(self, strategy: str, risk_per_contract: float,
                           capital: float) -> None:
@@ -2639,6 +2754,15 @@ class Backtester:
                     S, short_call_strike, short_put_strike, long_call_strike, long_put_strike,
                     t, r, iv, self._skew_factor, self._skew_slope_per_pct_otm, self._iv_floor,
                     self._eng.put_skew_coefficient, self._eng.call_skew_coefficient)
+
+            # W114: live sizes a condor on its reference leg's IV, the short put (orchestrator:
+            # signal.contract = short_put); the scalers read the same leg here.
+            if self._size_ctx is not None:
+                self._size_ctx["leg_iv"] = (
+                    _ivs[1] if self._surface is not None else skewed_leg_iv(
+                        iv, short_put_strike, S, OptionType.PUT, self._skew_factor,
+                        self._skew_slope_per_pct_otm, self._iv_floor,
+                        self._eng.put_skew_coefficient, self._eng.call_skew_coefficient))
 
             # Net credit received at mid prices
             net_credit = (short_call_price + short_put_price) - (long_call_price + long_put_price)

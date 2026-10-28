@@ -119,36 +119,42 @@ class TestNoBareDuplicateOfTheRangeGatedSet:
     same category as W38's SQL-function guard and W28's .today() guard.
     """
 
+    # W114: the set is DEFINED in ait.risk.scalers (the research engine reads the same one); the
+    # orchestrator imports it. The guard scans both files and requires exactly one definition.
     TARGET = SRC / "ait" / "bot" / "orchestrator.py"
+    DEFINITION_FILE = SRC / "ait" / "risk" / "scalers.py"
 
     def _bare_duplicate_lines(self) -> list[int]:
-        tree = ast.parse(self.TARGET.read_text(encoding="utf-8"))
-
-        # The definition's OWN line — ast.walk() yields the Set literal
-        # nested inside `RANGE_GATED_STRATEGIES: frozenset[str] = frozenset(
-        # {...})` as its own node, so excluding the AnnAssign node itself
-        # does not exclude its child; exclude by line number instead.
-        definition_line = None
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-                    and node.target.id == "RANGE_GATED_STRATEGIES"):
-                definition_line = node.lineno
-                break
-        assert definition_line is not None, (
-            "RANGE_GATED_STRATEGIES's own definition was not found — the "
-            "guard cannot exclude it and would flag itself"
-        )
-
         offenders = []
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Tuple, ast.Set)):
-                continue
-            if node.lineno == definition_line:
-                continue
-            elts = {e.value for e in node.elts
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str)}
-            if {"iron_condor", "short_strangle"} <= elts and len(node.elts) == 2:
-                offenders.append(node.lineno)
+        definitions = 0
+        for path in (self.TARGET, self.DEFINITION_FILE):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+
+            # The definition's OWN line — ast.walk() yields the Set literal
+            # nested inside `RANGE_GATED_STRATEGIES: frozenset[str] = frozenset(
+            # {...})` as its own node, so excluding the AnnAssign node itself
+            # does not exclude its child; exclude by line number instead.
+            definition_line = None
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                        and node.target.id == "RANGE_GATED_STRATEGIES"):
+                    definition_line = node.lineno
+                    definitions += 1
+                    break
+
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Tuple, ast.Set)):
+                    continue
+                if node.lineno == definition_line:
+                    continue
+                elts = {e.value for e in node.elts
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+                if {"iron_condor", "short_strangle"} <= elts and len(node.elts) == 2:
+                    offenders.append(node.lineno)
+        assert definitions == 1, (
+            "RANGE_GATED_STRATEGIES must be defined exactly once (in ait.risk.scalers); found "
+            f"{definitions} definition(s) — the guard cannot exclude it and would flag itself"
+        )
         return offenders
 
     def test_no_bare_two_element_duplicate_remains(self):

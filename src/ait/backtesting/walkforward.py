@@ -3380,7 +3380,10 @@ class WalkForwardBacktester:
         Ranking the full series, not the window slice, gives every day live's 252-observation
         lookback (a slice would restart the warm-up each window); row t only ever uses
         observations at or before t, so this introduces no look-ahead."""
-        if not self._config.iv_rank_gate or self._iv_rank_series:
+        # W114: also needed when scalers are on (the iv-rank factor reads the same live-lookback series)
+        _scalers = bool(getattr(getattr(getattr(self, "_settings", None), "position_sizing", None),
+                                 "scaled_strategies", None))
+        if not (self._config.iv_rank_gate or _scalers) or self._iv_rank_series:
             return
         from ait.data.iv_rank import iv_rank_series
         for sym, df in data.items():

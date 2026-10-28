@@ -55,6 +55,7 @@ from ait.risk.correlation import CorrelationGuard
 from ait.risk.manager import RiskManager, TradeRequest
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
+from ait.risk.scalers import RANGE_GATED_STRATEGIES, sizing_confidence
 from ait.risk.capital_tiers import CapitalTierManager
 from ait.learning.counterfactual import CounterfactualTracker
 from ait.strategies.base import CREDIT_STRATEGIES, SignalDirection
@@ -67,14 +68,11 @@ from ait.utils.time import now_et, parse_trade_ts
 
 log = get_logger("bot.orchestrator")
 
-# Strategies whose ENTRY confidence must come from the payoff-matched range
-# model rather than the directional one — P(price stays inside the wings) is
-# what a short-premium neutral structure actually gets paid for.
-# fail-direction-02 (R22): declared once here so the fail-closed drop below
-# cannot drift from the membership it protects. (The two pre-existing literal
-# copies at the override and the neutral-only filter are set-membership-6, a
-# separate register entry, and are left untouched by this wave.)
-RANGE_GATED_STRATEGIES: frozenset[str] = frozenset({"iron_condor", "short_strangle"})
+# RANGE_GATED_STRATEGIES: strategies whose ENTRY confidence must come from the payoff-matched range
+# model rather than the directional one — P(price stays inside the wings) is what a short-premium
+# neutral structure actually gets paid for. fail-direction-02 (R22): declared once so the fail-closed
+# drop below cannot drift from the membership it protects. W114: it now lives in ait.risk.scalers (the
+# research engine reads the same set) and is imported above under the same name.
 
 # W31: the condor builder's own rejection tokens, in operator English, for the
 # launch cap-grid self-test. The RAW token is always reported beside the
@@ -2718,17 +2716,22 @@ class TradingOrchestrator:
                 # the payoff-matched model still owns the number.
                 if signal.strategy_name in model_overridden:
                     eff_conf = signal.confidence
-                elif (not self._settings.ml.entry_gates_enabled
-                        and signal.strategy_name in RANGE_GATED_STRATEGIES):
-                    eff_conf = float(
-                        self._settings.ml.observe_mode_neutral_confidence)
-                    log.debug("observe_mode_neutral_confidence_applied",
-                              symbol=signal.symbol,
-                              strategy=signal.strategy_name,
-                              directional=round(final_confidence, 3),
-                              used=eff_conf)
                 else:
-                    eff_conf = final_confidence
+                    # W114: the observe / directional choice is ait.risk.scalers.sizing_confidence, the
+                    # rule the research engine applies (a range-gated structure with the gates off is
+                    # sized on the configured neutral baseline; everything else on the directional value).
+                    eff_conf = sizing_confidence(
+                        signal.strategy_name,
+                        gates_on=bool(self._settings.ml.entry_gates_enabled),
+                        range_prob=None,
+                        directional_conf=final_confidence,
+                        neutral_conf=float(self._settings.ml.observe_mode_neutral_confidence))
+                    if eff_conf != final_confidence:
+                        log.debug("observe_mode_neutral_confidence_applied",
+                                  symbol=signal.symbol,
+                                  strategy=signal.strategy_name,
+                                  directional=round(final_confidence, 3),
+                                  used=eff_conf)
                 # R7 two-phase scan: in collect mode, defer execution to the
                 # cross-symbol ranking pass instead of executing in-place.
                 if collect is not None:
@@ -3683,7 +3686,7 @@ class TradingOrchestrator:
             scale_to_budget=True,
             vix=current_vix,
             # R12-B5c: IV-percentile cap (VRP top bucket = -2.3 vol pts)
-            iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0.0,
+            iv_rank=getattr(signal, "iv_rank", None),
         )
 
         validation = await self._risk_manager.validate_trade(request)

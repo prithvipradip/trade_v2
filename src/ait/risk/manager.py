@@ -17,6 +17,7 @@ from ait.risk.circuit_breaker import CircuitBreaker
 from ait.risk.correlation import CorrelationGuard
 from ait.risk.pdt_guard import PDTGuard
 from ait.risk.position_sizer import PositionSizer
+from ait.risk.scalers import recent_losing_days as _losing_streak
 from ait.utils.logging import get_logger
 from ait.utils.time import now_et, today_et
 
@@ -58,10 +59,11 @@ class TradeRequest:
     # For multi-leg strategies
     max_loss: float | None = None  # Defined risk strategies
     vix: float = 0.0  # Current VIX level for regime-aware sizing
-    # R12-B: IV percentile (0-100) for the VRP regime cap. 0.0 = unknown —
+    # R12-B: IV percentile (0-100) for the VRP regime cap. None = unknown —
     # the cap only fires on a real value (orchestrator must pass
-    # signal.iv_rank; see gate 2c-iv below).
-    iv_rank: float = 0.0
+    # signal.iv_rank; see gate 2c-iv below). W114: the sizer reads it too (an unknown rank is a
+    # neutral IV-rank factor, no longer a fabricated rank of 50).
+    iv_rank: float | None = None
     # W111: when True (with contracts == 1 and a positive per-LOT max_loss) the manager decides the number
     # of lots: the sizer's count after the correlation haircut, then the largest count whose dollar gates
     # all pass. Default False = the explicit-count semantics every other caller relies on (max_loss is then
@@ -134,19 +136,9 @@ class RiskManager:
         if not self._state:
             return 0
         try:
-            from datetime import date, timedelta
-            today = today_et()
-            losing_streak = 0
-            for days_back in range(1, 11):  # Look back up to 10 days
-                d = today - timedelta(days=days_back)
-                stats = self._state.get_daily_stats(d)
-                if stats.trades_taken == 0:
-                    continue  # Skip non-trading days
-                if stats.total_pnl < 0:
-                    losing_streak += 1
-                else:
-                    break  # Streak ended
-            return losing_streak
+            # W114: the streak rule is ait.risk.scalers.recent_losing_days (shared with the research
+            # engine); this method only supplies live's day source, the daily_stats table.
+            return _losing_streak(today_et(), self._state.get_daily_stats)
         except Exception as e:  # noqa: BLE001
             # W104: sizing keeps its direction (no streak assumed), but a store
             # read that fails no longer switches drawdown sizing off unseen.
@@ -595,6 +587,7 @@ class RiskManager:
             implied_vol=request.implied_vol,
             strategy=request.strategy,
             underlying_price=0,  # Not needed for final sizing
+            iv_rank=request.iv_rank,
             recent_losing_days=recent_losing_days,
             vix=request.vix,
         )
@@ -739,6 +732,7 @@ class RiskManager:
             implied_vol=request.implied_vol,
             strategy=request.strategy,
             underlying_price=0,
+            iv_rank=request.iv_rank,
             recent_losing_days=self._count_recent_losing_days(),
             vix=request.vix,
         )
