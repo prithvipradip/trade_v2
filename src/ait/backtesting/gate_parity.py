@@ -111,6 +111,39 @@ POOL_REJECT_REASONS: dict[str, GateRow] = dict([
 ])
 
 
+# W114: the sizing scalers (position_sizing.scaled_strategies, empty today) read five inputs. The factors,
+# the losing-day streak and the confidence a structure is sized on are ONE implementation (ait.risk.scalers)
+# called by live and by the engine; what still differs is where each INPUT comes from. Not gates: what a
+# study that switches the scalers on has to know. (input, live source, research source)
+SIZING_INPUT_DIFFERENCES: tuple[tuple[str, str, str], ...] = (
+    ("confidence",
+     "condor / short strangle: ml.observe_mode_neutral_confidence while the entry gates are off, else the "
+     "range probability; everything else: the ML direction confidence after the multi-timeframe boost and the "
+     "fractal penalty",
+     "same rule (ait.risk.scalers.sizing_confidence, keyed on backtest.gates_mode); the directional value "
+     "lacks the multi-timeframe boost until that analyzer is ported"),
+    ("implied_vol",
+     "signal.contract.implied_vol: the reference leg's IB model IV at scan time (the short put for a condor), "
+     "0.30 when missing",
+     "condor: the short-put leg IV from the previous session's surface (or the skew model); every other "
+     "structure: the entry's at-the-money IV"),
+    ("iv_rank",
+     "the rank the scan computed (store percentile, realized-vol proxy as fallback), possibly including "
+     "today's snapshot",
+     "the same percentile definition (ait.data.iv_rank) over the symbol's full history, at the decision bar"),
+    ("vix",
+     "the VIX at scan time, last good value up to 45 minutes old; None = calm",
+     "the raw VIX close at the previous session (decision bar); None = calm"),
+    ("recent_losing_days",
+     "the daily_stats table across the whole account",
+     "the run's own book, per symbol and per window (the pool does not feed it back)"),
+    ("learning_multiplier",
+     "applied to the lot COUNT after validation and re-validated; inert while learning.paper_trading_mode",
+     "the sequential walk-forward learner scales the budget percentage itself (so it can change whether one "
+     "lot fits); documented, not changed"),
+)
+
+
 def classify(reason: str) -> GateRow | None:
     """The registry row for an engine rejection reason (None = unregistered)."""
     if reason.startswith(BUILDER_PREFIX):

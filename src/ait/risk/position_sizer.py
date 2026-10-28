@@ -13,6 +13,14 @@ from dataclasses import dataclass
 
 from ait.config.settings import PositionConfig, PositionSizingConfig, RiskConfig
 from ait.risk.lot_sizing import lots_for_budget
+from ait.risk.scalers import (
+    SELLING_STRATEGIES,
+    ScalerFactors,
+    ScalerInputs,
+    lot_scaler,
+    scaler_factors,
+    tier_factor,
+)
 from ait.utils.logging import get_logger
 
 log = get_logger("risk.sizer")
@@ -27,6 +35,9 @@ class PositionSize:
     confidence_adjustment: float
     volatility_adjustment: float
     reason: str
+    # W114: the six factors and the scaler handed to the lot rule (None / 1.0 on a refusal before sizing)
+    factors: ScalerFactors | None = None
+    scaler: float = 1.0
 
 
 class PositionSizer:
@@ -57,18 +68,12 @@ class PositionSizer:
 
     @staticmethod
     def _tier_factor(value: float, tiers: list[list[float]]) -> float:
-        """1.0 below the first row; otherwise the factor of the highest row whose
-        threshold `value` has reached (rows are validated strictly ascending)."""
-        factor = 1.0
-        for threshold, row_factor in tiers:
-            if value >= threshold:
-                factor = row_factor
-        return factor
+        """1.0 below the first row; otherwise the factor of the highest row whose threshold `value` has
+        reached (W114: the one implementation is ``ait.risk.scalers.tier_factor``)."""
+        return tier_factor(value, tiers)
 
-    # Strategies that benefit from high IV (selling premium)
-    _SELLING_STRATEGIES = frozenset({
-        "covered_call", "cash_secured_put", "iron_condor", "short_strangle",
-    })
+    # Strategies that benefit from high IV (selling premium); W114: defined in ait.risk.scalers.
+    _SELLING_STRATEGIES = SELLING_STRATEGIES
 
     def calculate(
         self,
@@ -78,20 +83,23 @@ class PositionSizer:
         implied_vol: float,
         strategy: str,
         underlying_price: float,
-        iv_rank: float = 50.0,
+        iv_rank: float | None = None,
         recent_losing_days: int = 0,
-        vix: float = 0.0,
+        vix: float | None = 0.0,
     ) -> PositionSize:
         """Calculate recommended position size.
 
         Args:
             account_value: Total account value (net liquidation)
             option_price: Price per contract (mid price)
-            confidence: ML model confidence (0.0 to 1.0)
+            confidence: the confidence the structure is sized on (ML confidence; a condor in observe mode
+                is sized on ml.observe_mode_neutral_confidence, see ait.risk.scalers.sizing_confidence)
             implied_vol: Implied volatility of the option
             strategy: Strategy name (e.g., "bull_call_spread")
-            underlying_price: Current price of underlying
-            iv_rank: IV rank percentile 0-100 (used for strategy-aware sizing)
+            underlying_price: Current price of underlying (not used by the sizing arithmetic)
+            iv_rank: IV rank percentile 0-100 (used for strategy-aware sizing); None = unknown = neutral
+            recent_losing_days: consecutive losing days (drawdown throttle input)
+            vix: VIX level (None = regime unknown, treated as calm)
 
         Returns:
             PositionSize with recommended contracts and reasoning
@@ -99,87 +107,43 @@ class PositionSizer:
         if account_value <= 0 or option_price <= 0:
             return PositionSize(0, 0, 0, 0, "invalid inputs")
 
-        # R15 minor: a VIX outage passes vix=None (credit strategies fail
-        # closed upstream by design, but DEBIT strategies reach this compare
-        # and died with TypeError — silently blocking ALL debit entries).
-        # None = regime unknown: treat as calm (no VIX shrink) rather than
-        # crash; the upstream credit fail-closed gate is unaffected.
-        vix = vix or 0.0
-
         # W108: the per-trade budget is ONE number, risk.max_position_risk_pct, the same one gate 6b
         # enforces and the condor builder is funded with (the sizer's former second cap,
         # positions.max_position_pct, is retired). It is applied inside lots_for_budget below.
         cost_per_contract = option_price * 100  # Options are 100 shares
 
-        # Confidence adjustment: scale down for low confidence
-        # At min_confidence, use 50% of max. At 1.0, use 100%.
-        min_conf = self._risk_config.min_confidence
-        conf_adj = 0.5 + 0.5 * ((confidence - min_conf) / (1.0 - min_conf))
-        conf_adj = max(self._sizing.confidence_size_floor, min(1.0, conf_adj))
-
-        # Volatility adjustment: smooth linear scale-down in high-vol environments
-        # IV <= iv_full_size_max (20%) -> full size (1.0), IV >= iv_floor_size_min
-        # (60%) -> iv_floor_size_factor (0.5). round(.., 12) keeps 0.60-0.20 the
-        # exact 0.40 literal this formula was written with (0.6-0.2 is 0.39999..).
+        # W114: the six multipliers come from the ONE shared implementation (ait.risk.scalers), the same
+        # one the research engine calls. They are computed (and reported on PositionSize) always, but they
+        # ACT only for a strategy in position_sizing.scaled_strategies (empty today); every other strategy
+        # is sized by the budget alone.
         sz = self._sizing
-        iv_span = round(sz.iv_floor_size_min - sz.iv_full_size_max, 12)
-        if implied_vol <= sz.iv_full_size_max:
-            vol_adj = 1.0
-        elif implied_vol >= sz.iv_floor_size_min:
-            vol_adj = sz.iv_floor_size_factor
-        else:
-            # Linear interpolation: 1.0 at full_size_max -> factor at floor_min
-            vol_adj = 1.0 - (1.0 - sz.iv_floor_size_factor) * (
-                (implied_vol - sz.iv_full_size_max) / iv_span)
+        factors = scaler_factors(
+            strategy,
+            ScalerInputs(confidence=confidence, implied_vol=implied_vol, iv_rank=iv_rank,
+                         recent_losing_days=recent_losing_days, vix=vix),
+            sz, self._risk_config.min_confidence)
+        conf_adj, vol_adj = factors.conf, factors.vol
+        iv_rank_adj, strategy_adj = factors.iv_rank, factors.strategy
 
-        # IV rank alignment: boost size when IV conditions favor the strategy
-        # Selling strategies benefit from high IV rank (more premium to collect)
-        # Buying strategies benefit from low IV rank (cheaper options)
-        iv_rank_span = round(sz.iv_rank_adj_max - sz.iv_rank_adj_min, 12)
-        iv_rank_adj = 1.0
-        if strategy in self._SELLING_STRATEGIES:
-            # High IV rank -> up to iv_rank_adj_max; low IV rank -> iv_rank_adj_min
-            iv_rank_adj = sz.iv_rank_adj_min + iv_rank_span * (iv_rank / 100.0)
-        else:
-            # Low IV rank -> up to iv_rank_adj_max; high IV rank -> iv_rank_adj_min
-            iv_rank_adj = sz.iv_rank_adj_max - iv_rank_span * (iv_rank / 100.0)
-        iv_rank_adj = max(sz.iv_rank_adj_min, min(sz.iv_rank_adj_max, iv_rank_adj))
-
-        # Strategy adjustment
-        strategy_adj = sz.strategy_risk.get(strategy, 1.0)
-
-        # Drawdown throttle (defensive during rough patches): the default tiers
-        # halve size after 3+ consecutive losing days, quarter it after 5+.
-        drawdown_adj = self._tier_factor(recent_losing_days, sz.drawdown_tiers)
-
-        # VIX regime adjustment: shrink positions in high-vol regimes where
-        # gamma risk is amplified. Default: VIX>=30 crisis (half), VIX>=25
-        # elevated (75%).
-        vix_adj = self._tier_factor(vix, sz.vix_size_tiers)
-
-        # W108: the six multipliers are computed (they are reported on PositionSize) but they
-        # ACT only for a strategy in position_sizing.scaled_strategies (empty today); every other
-        # strategy is sized by the budget alone. Either way the count comes from the ONE shared
-        # rule (ait.risk.lot_sizing), the same one the research engine and pool call:
+        # Either way the count comes from the ONE shared rule (ait.risk.lot_sizing), the same one the
+        # research engine and pool call:
         #   - viability is decided by the UNSCALED budget (Deep-audit SR-M4 + R7-SOON: at small
         #     NLV the soft multipliers shrank the budget below ONE contract and bricked every
         #     defined-risk entry: 0.07 x $2.1k = $147 x 0.4 IC strategy_adj x ... = $17-42 vs a
         #     $130 minimum condor -> 0 contracts, account unusable). A structure one lot of which
         #     exceeds the raw budget is 0 (rejected);
-        #   - the multipliers throttle the COUNT above the 1-contract floor, never below it;
+        #   - the multipliers throttle the COUNT above the 1-contract floor, never below it (and, being
+        #     clamped at 1 inside the rule, never raise it above floor(budget / risk));
         #   - positions.max_contracts_per_trade caps it (keeps cost-per-trade small so the book
         #     can hold many concurrent positions).
-        scaler = 1.0
-        if strategy in sz.scaled_strategies:
-            scaler = (conf_adj * vol_adj * strategy_adj * iv_rank_adj
-                      * drawdown_adj * vix_adj)
+        scaler = lot_scaler(strategy, factors, sz)
         contracts = lots_for_budget(
             cost_per_contract, account_value, self._risk_config.max_position_risk_pct,
             max_lots=self._pos_config.max_contracts_per_trade, scaler=scaler)
         if contracts < 1:
             return PositionSize(0, 0.0, conf_adj, vol_adj,
                                 "single contract exceeds the per-trade budget "
-                                "(risk.max_position_risk_pct)")
+                                "(risk.max_position_risk_pct)", factors=factors, scaler=scaler)
 
         # Max risk: for spreads, risk is the net debit (option_price already is net debit).
         # For naked options, risk is the full premium paid.
@@ -208,4 +172,6 @@ class PositionSizer:
             confidence_adjustment=conf_adj,
             volatility_adjustment=vol_adj,
             reason=reason,
+            factors=factors,
+            scaler=scaler,
         )

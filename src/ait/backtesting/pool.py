@@ -162,7 +162,9 @@ def allocate_pool(
             # max loss for trades that do not carry it.
             gate_pc = float(t.get("budget_gate_risk_per_contract") or 0.0) or per_contract
             # W108: the ONE lot rule (ait.risk.lot_sizing), shared with live's PositionSizer.
-            afford = lots_for_budget(gate_pc, equity, pct)
+            # W114: the entry's scaler (the six live factors on this entry's inputs; absent = 1.0, i.e.
+            # scalers off) throttles the pool's count exactly as it did the engine's.
+            afford = lots_for_budget(gate_pc, equity, pct, scaler=float(t.get("size_scaler") or 1.0))
             contracts = min(engine_contracts, afford)
             if contracts < 1:
                 result.rejections["unaffordable"] += 1

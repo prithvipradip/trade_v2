@@ -16,8 +16,10 @@ The rule (operator decision 2026-10-27, "option A"):
 * **The count is the budget divided by the risk of one lot**, never below 1 once viable.
 * **A scaler (confidence, volatility, ...) only throttles the count.** It multiplies the budget
   in the count, never in the viability test, so it cannot turn a viable structure into a refusal.
-  ``scaler`` is 1.0 for every strategy not listed in ``position_sizing.scaled_strategies``
-  (the list is empty today).
+  It is clamped into [0, 1]: a product above 1 (the IV-rank and long-straddle factors reach 1.2)
+  never raises the count above floor(budget / risk), which is also all the per-trade gate would
+  allow live. ``scaler`` is 1.0 for every strategy not listed in ``position_sizing.scaled_strategies``
+  (the list is empty today); the factors live in ``ait.risk.scalers``.
 * ``max_lots`` (``positions.max_contracts_per_trade``) caps the result.
 """
 
@@ -51,7 +53,7 @@ def lots_for_budget(
         return 0
     if risk > budget:
         return 0
-    lots = max(1, int(math.floor(budget * max(0.0, float(scaler)) / risk)))
+    lots = max(1, int(math.floor(budget * min(1.0, max(0.0, float(scaler))) / risk)))
     if max_lots is not None:
         lots = min(lots, int(max_lots))
     return max(0, lots)

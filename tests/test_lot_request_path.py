@@ -245,6 +245,11 @@ class TestTheOrchestrator:
         r = seen[0]
         assert r.scale_to_budget is True and r.contracts == 1 and r.max_loss == 380.0
 
+    async def test_the_request_carries_the_signals_iv_rank(self, rig):
+        validate, seen = self._validator(1)
+        sig = await self._run(rig, validate)
+        assert seen[0].iv_rank == sig.iv_rank and seen[0].iv_rank is not None
+
     async def test_the_executor_gets_what_the_manager_approved(self, rig):
         validate, seen = self._validator(3)
         await self._run(rig, validate)

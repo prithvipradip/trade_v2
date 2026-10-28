@@ -209,6 +209,7 @@ Reporting authorities shared by every operator-facing surface.
 | `manager.py` | Portfolio-level risk management. |
 | `pdt_guard.py` | Pattern Day Trader (PDT) protection. |
 | `position_sizer.py` | Volatility-adjusted position sizing with Kelly criterion. |
+| `scalers.py` | The sizing scalers and the inputs they read: ONE implementation, called by live and by research. |
 
 ## `strategies/`
 
