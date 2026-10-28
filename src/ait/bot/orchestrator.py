@@ -3677,6 +3677,10 @@ class TradingOrchestrator:
             confidence=confidence,
             implied_vol=signal.contract.implied_vol if signal.contract else 0.30,
             max_loss=signal.max_loss if signal.is_defined_risk else None,
+            # W111: a signal is a ONE-lot description (quantity=1, max_loss per contract); the risk manager
+            # decides how many lots the budget and the gates carry. positions.max_contracts_per_trade is the
+            # switch: at 1 this changes nothing.
+            scale_to_budget=True,
             vix=current_vix,
             # R12-B5c: IV-percentile cap (VRP top bucket = -2.3 vol pts)
             iv_rank=signal.iv_rank if hasattr(signal, "iv_rank") else 0.0,
@@ -3721,7 +3725,10 @@ class TradingOrchestrator:
         # gate-approved size.
         strategy_mult = adaptor.get_strategy_multiplier(signal.strategy_name)
         adjusted_size = max(1, int(validation.position_size * strategy_mult))
-        if adjusted_size > request.contracts:
+        # W111: compare with the size the risk manager APPROVED, not with the request's one-lot floor: with
+        # lot scaling the approved size can exceed request.contracts without any multiplier. The block below
+        # is the multiplier's re-validation (it sends an explicit total, scale_to_budget off).
+        if adjusted_size > validation.position_size:
             scale = adjusted_size / max(1, request.contracts)
             revalidation = await self._risk_manager.validate_trade(TradeRequest(
                 symbol=request.symbol,

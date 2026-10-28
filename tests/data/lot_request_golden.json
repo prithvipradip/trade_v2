@@ -1,0 +1,992 @@
+{
+ "shipped|condor_11w|200000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_11w|200000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|200000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|200000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|200000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_11w|25000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|25000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|25000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|25000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 860.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_11w|5000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_11w|5000|cluster_open|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|cluster_open|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|5000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_11w|5000|empty|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|empty|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|same_symbol|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_11w|5000|same_symbol|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "position risk $860 exceeds 5% account limit $250"
+ },
+ "shipped|condor_3w|200000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_3w|200000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|200000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|200000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|200000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_3w|25000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|25000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|25000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|25000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "aggregate risk $1160 (open $950 + new $210) exceeds 20% portfolio cap $1000"
+ },
+ "shipped|condor_3w|5000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|condor_3w|5000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|5000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|condor_3w|5000|empty|vix16|conf0.45": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "confidence 0.45 < min 0.5"
+ },
+ "shipped|condor_3w|5000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|condor_3w|5000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|duplicate|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|duplicate|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|200000|same_symbol|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|debit_spread|200000|same_symbol|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|debit_spread|25000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|duplicate|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|duplicate|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|25000|same_symbol|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|debit_spread|25000|same_symbol|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|debit_spread|5000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "aggregate risk $1090 (open $950 + new $140) exceeds 20% portfolio cap $1000"
+ },
+ "shipped|debit_spread|5000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "aggregate risk $1090 (open $950 + new $140) exceeds 20% portfolio cap $1000"
+ },
+ "shipped|debit_spread|5000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|duplicate|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|duplicate|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|debit_spread|5000|same_symbol|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|debit_spread|5000|same_symbol|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "shipped|no_max_loss|200000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|no_max_loss|200000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|200000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|200000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|200000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|no_max_loss|25000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|25000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|25000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|25000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|aggregate_near_cap|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "aggregate risk $1070 (open $950 + new $120) exceeds 20% portfolio cap $1000"
+ },
+ "shipped|no_max_loss|5000|aggregate_near_cap|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "short-premium cap: 2/2 credit positions open (VIX 27.0 tier)"
+ },
+ "shipped|no_max_loss|5000|cluster_open|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|cluster_open|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|duplicate|vix16|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|5000|duplicate|vix27|conf0.7": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ iron_condor already open"
+ },
+ "shipped|no_max_loss|5000|empty|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|empty|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|same_symbol_heavy|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|same_symbol_heavy|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|same_symbol|vix16|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "shipped|no_max_loss|5000|same_symbol|vix27|conf0.7": {
+  "approved": true,
+  "max_risk": 120.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "tight_bp|condor_3w|25000": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "insufficient buying power"
+ },
+ "tight_bp|condor_3w|5000": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "insufficient buying power"
+ },
+ "tight_bp|debit_spread|25000": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "tight_bp|debit_spread|5000": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|25000|aggregate_near_cap": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|25000|empty": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|25000|same_symbol": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|25000|same_symbol_heavy": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|5000|aggregate_near_cap": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|5000|empty": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|5000|same_symbol": {
+  "approved": true,
+  "max_risk": 210.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|condor_3w|5000|same_symbol_heavy": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "symbol concentration: QQQ exposure $610 exceeds 10% of $5000"
+ },
+ "wide_caps|debit_spread|25000|aggregate_near_cap": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|debit_spread|25000|empty": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|debit_spread|25000|same_symbol": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "wide_caps|debit_spread|25000|same_symbol_heavy": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|debit_spread|5000|aggregate_near_cap": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|debit_spread|5000|empty": {
+  "approved": true,
+  "max_risk": 140.0,
+  "position_size": 1,
+  "reason": "all checks passed"
+ },
+ "wide_caps|debit_spread|5000|same_symbol": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "duplicate position: QQQ bull_call_spread already open"
+ },
+ "wide_caps|debit_spread|5000|same_symbol_heavy": {
+  "approved": false,
+  "max_risk": 0.0,
+  "position_size": 0,
+  "reason": "symbol concentration: QQQ exposure $540 exceeds 10% of $5000"
+ }
+}
