@@ -62,6 +62,11 @@ class TradeRequest:
     # the cap only fires on a real value (orchestrator must pass
     # signal.iv_rank; see gate 2c-iv below).
     iv_rank: float = 0.0
+    # W111: when True (with contracts == 1 and a positive per-LOT max_loss) the manager decides the number
+    # of lots: the sizer's count after the correlation haircut, then the largest count whose dollar gates
+    # all pass. Default False = the explicit-count semantics every other caller relies on (max_loss is then
+    # the total for ``contracts``). positions.max_contracts_per_trade is the switch: at 1 the count is 1.
+    scale_to_budget: bool = False
 
 
 class RiskManager:
@@ -513,68 +518,43 @@ class RiskManager:
         # strangles); debit trades still pay the premium up front.
         account_value = await self._account.get_net_liquidation()
         # (is_credit computed at gate 2c above)
-        if is_credit and getattr(request, "max_loss", None):
-            estimated_cost = float(request.max_loss)
+        # W111: the gates below (buying power, 6b, 6b-2, 6c) are _dollar_gates, so the SAME arithmetic judges
+        # the number of lots actually placed. An explicit-count request (the default) is judged once, as it
+        # always was; a scale_to_budget request is fitted down from the sizer's count to the largest count
+        # whose gates all pass, and is rejected with the one-lot gate's own text when none does.
+        scaling = bool(getattr(request, "scale_to_budget", False) and request.contracts == 1
+                       and getattr(request, "max_loss", None) and request.max_loss > 0)
+        lots = request.contracts
+        if scaling:
+            lots = max(1, self._target_lots(request, account_value, is_credit, open_symbols))
+            while True:
+                total_loss = float(request.max_loss) * lots
+                est = total_loss if is_credit else request.entry_price * lots * 100
+                rejection = await self._dollar_gates(request, account_value, total_loss, est)
+                # gate 7 (portfolio delta) also scales with the count, so it takes part in the fit; at one
+                # lot a breach is left to gate 7 below, which rejects with its own text
+                delta_breach = lots > 1 and self._delta_breach(request, lots, account_value)
+                if rejection is None and not delta_breach:
+                    break
+                if lots == 1:
+                    if rejection is not None:
+                        return rejection
+                    break
+                lots -= 1
         else:
-            estimated_cost = request.entry_price * request.contracts * 100
-        if not await self._account.can_afford(estimated_cost):
-            return TradeValidation(False, "insufficient buying power")
-
-        # 6b. Per-position max risk (config: risk.max_position_risk_pct)
-        _per_trade_pct = self._risk_config.max_position_risk_pct
-        max_risk_per_trade = account_value * _per_trade_pct
-        if hasattr(request, 'max_loss') and request.max_loss and request.max_loss > max_risk_per_trade:
-            return TradeValidation(
-                False,
-                f"position risk ${request.max_loss:.0f} exceeds "
-                f"{_per_trade_pct:.0%} account limit ${max_risk_per_trade:.0f}",
-            )
-
-        # 6b-2. AGGREGATE capital-at-risk — the sum of defined-risk across ALL
-        # open positions plus this one must stay under a portfolio cap. The
-        # per-trade 3% check alone lets the account stack many trades into a
-        # large concentrated bet; this bounds the whole book.
-        # Config-wired (audit item 3.3): positions.max_portfolio_risk_pct was
-        # a phantom knob while this literal ruled. Default 0.20 (2026-06-30).
-        PORTFOLIO_RISK_CAP_PCT = self._pos_config.max_portfolio_risk_pct
-        portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
-        # R16: was sum(p["max_loss"]) — blind to any position whose
-        # trade_maxloss_ KV never got written. See _aggregate_open_risk.
-        open_risk = self._aggregate_open_risk()
-        new_risk = request.max_loss if (getattr(request, "max_loss", None) and request.max_loss) else estimated_cost
-        if open_risk + new_risk > portfolio_cap:
-            return TradeValidation(
-                False,
-                f"aggregate risk ${open_risk + new_risk:.0f} (open ${open_risk:.0f} "
-                f"+ new ${new_risk:.0f}) exceeds {PORTFOLIO_RISK_CAP_PCT:.0%} "
-                f"portfolio cap ${portfolio_cap:.0f}",
-            )
-
-        # 6c. Concentration limit — no more than risk.max_symbol_concentration_pct
-        # of account in one symbol (config-backed, default 20%)
-        # R17: was summing market_value (credit collected for credit
-        # strategies, not real risk) -- now the same max_loss/backfill
-        # sourcing gate 6b-2's aggregate cap uses.
-        symbol_exposure = self._symbol_capital_at_risk(request.symbol)
-        if (symbol_exposure + estimated_cost) > account_value * self._risk_config.max_symbol_concentration_pct:
-            return TradeValidation(
-                False,
-                f"symbol concentration: {request.symbol} exposure "
-                f"${symbol_exposure + estimated_cost:.0f} exceeds "
-                # R20b review follow-up: was a hardcoded "20%" literal even
-                # though the threshold itself already reads the configured
-                # max_symbol_concentration_pct above -- the rejection reason
-                # (logged + persisted into counterfactual/skip records) would
-                # misreport the actual gate an operator configured.
-                f"{self._risk_config.max_symbol_concentration_pct:.0%} of "
-                f"${account_value:.0f}",
-            )
+            if is_credit and getattr(request, "max_loss", None):
+                estimated_cost = float(request.max_loss)
+            else:
+                estimated_cost = request.entry_price * request.contracts * 100
+            rejection = await self._dollar_gates(request, account_value, request.max_loss, estimated_cost)
+            if rejection is not None:
+                return rejection
 
         # 7. Portfolio delta limit
         if request.option:
             new_delta = abs(
                 self._portfolio_greeks.delta
-                + request.option.delta * request.contracts * 100
+                + request.option.delta * lots * 100
             )
             max_delta_value = account_value * self._pos_config.max_portfolio_delta
             if new_delta > max_delta_value:
@@ -648,6 +628,13 @@ class RiskManager:
         # that masking is incidental, not a design, and is registered separately.
         final_contracts = self._haircut_contracts(final_contracts, correlated_count)
 
+        max_risk = size.max_risk_dollars
+        if scaling:
+            # W111: the count was fitted to the dollar gates above (it can only have gone down from the
+            # sizer's haircut count); the risk is that many lots of the per-lot cost the sizer priced.
+            final_contracts = lots if final_contracts > 0 else 0
+            max_risk = lots * (float(request.max_loss) if is_credit else request.entry_price * 100)
+
         if final_contracts <= 0:
             return TradeValidation(False, "position sizer returned 0 contracts")
 
@@ -656,7 +643,7 @@ class RiskManager:
             symbol=request.symbol,
             strategy=request.strategy,
             contracts=final_contracts,
-            max_risk=size.max_risk_dollars,
+            max_risk=max_risk,
             confidence=request.confidence,
         )
 
@@ -664,8 +651,99 @@ class RiskManager:
             approved=True,
             reason="all checks passed",
             position_size=final_contracts,
-            max_risk=size.max_risk_dollars,
+            max_risk=max_risk,
         )
+
+    async def _dollar_gates(
+        self, request: TradeRequest, account_value: float, max_loss_total: float | None,
+        estimated_cost: float,
+    ) -> TradeValidation | None:
+        """W111: gates 6 (buying power), 6b (per-trade), 6b-2 (aggregate) and 6c (per-symbol) for ONE candidate
+        size, extracted verbatim from validate_trade. ``max_loss_total`` is the defined risk of the whole
+        candidate (None = undefined / unknown), ``estimated_cost`` the capital it consumes. Returns the
+        rejection, or None when every gate passes. A caller that fits a lot count calls it once per count."""
+        if not await self._account.can_afford(estimated_cost):
+            return TradeValidation(False, "insufficient buying power")
+
+        # 6b. Per-position max risk (config: risk.max_position_risk_pct)
+        _per_trade_pct = self._risk_config.max_position_risk_pct
+        max_risk_per_trade = account_value * _per_trade_pct
+        if max_loss_total and max_loss_total > max_risk_per_trade:
+            return TradeValidation(
+                False,
+                f"position risk ${max_loss_total:.0f} exceeds "
+                f"{_per_trade_pct:.0%} account limit ${max_risk_per_trade:.0f}",
+            )
+
+        # 6b-2. AGGREGATE capital-at-risk — the sum of defined-risk across ALL
+        # open positions plus this one must stay under a portfolio cap. The
+        # per-trade 3% check alone lets the account stack many trades into a
+        # large concentrated bet; this bounds the whole book.
+        # Config-wired (audit item 3.3): positions.max_portfolio_risk_pct was
+        # a phantom knob while this literal ruled. Default 0.20 (2026-06-30).
+        PORTFOLIO_RISK_CAP_PCT = self._pos_config.max_portfolio_risk_pct
+        portfolio_cap = account_value * PORTFOLIO_RISK_CAP_PCT
+        # R16: was sum(p["max_loss"]) — blind to any position whose
+        # trade_maxloss_ KV never got written. See _aggregate_open_risk.
+        open_risk = self._aggregate_open_risk()
+        new_risk = max_loss_total if max_loss_total else estimated_cost
+        if open_risk + new_risk > portfolio_cap:
+            return TradeValidation(
+                False,
+                f"aggregate risk ${open_risk + new_risk:.0f} (open ${open_risk:.0f} "
+                f"+ new ${new_risk:.0f}) exceeds {PORTFOLIO_RISK_CAP_PCT:.0%} "
+                f"portfolio cap ${portfolio_cap:.0f}",
+            )
+
+        # 6c. Concentration limit — no more than risk.max_symbol_concentration_pct
+        # of account in one symbol (config-backed, default 20%)
+        # R17: was summing market_value (credit collected for credit
+        # strategies, not real risk) -- now the same max_loss/backfill
+        # sourcing gate 6b-2's aggregate cap uses.
+        symbol_exposure = self._symbol_capital_at_risk(request.symbol)
+        if (symbol_exposure + estimated_cost) > account_value * self._risk_config.max_symbol_concentration_pct:
+            return TradeValidation(
+                False,
+                f"symbol concentration: {request.symbol} exposure "
+                f"${symbol_exposure + estimated_cost:.0f} exceeds "
+                # R20b review follow-up: was a hardcoded "20%" literal even
+                # though the threshold itself already reads the configured
+                # max_symbol_concentration_pct above -- the rejection reason
+                # (logged + persisted into counterfactual/skip records) would
+                # misreport the actual gate an operator configured.
+                f"{self._risk_config.max_symbol_concentration_pct:.0%} of "
+                f"${account_value:.0f}",
+            )
+        return None
+
+    def _delta_breach(self, request: TradeRequest, lots: int, account_value: float) -> bool:
+        """W111: would ``lots`` lots push the portfolio delta past the limit (gate 7's test, as a predicate)."""
+        if not request.option:
+            return False
+        new_delta = abs(self._portfolio_greeks.delta + request.option.delta * lots * 100)
+        return new_delta > account_value * self._pos_config.max_portfolio_delta
+
+    def _target_lots(self, request: TradeRequest, account_value: float, is_credit: bool,
+                     open_symbols: list) -> int:
+        """W111: the lot count the sizer would approve for a scale_to_budget request, after the correlation
+        haircut and BEFORE the dollar gates (which then fit it). The same ``calculate`` call, with the same
+        arguments, as step 9 of validate_trade, so the count the gates start from is the count step 9 sees."""
+        size = self._sizer.calculate(
+            account_value=account_value,
+            option_price=(
+                request.max_loss / (max(1, request.contracts) * 100)
+                if (is_credit and getattr(request, "max_loss", None))
+                else request.entry_price
+            ),
+            confidence=request.confidence,
+            implied_vol=request.implied_vol,
+            strategy=request.strategy,
+            underlying_price=0,
+            recent_losing_days=self._count_recent_losing_days(),
+            vix=request.vix,
+        )
+        return self._haircut_contracts(
+            size.contracts, self._count_correlated_positions(request.symbol, open_symbols))
 
     def _haircut_contracts(self, final_contracts: int, correlated_count: int) -> int:
         """Reduce an already-viable size by 30% per correlated open position.

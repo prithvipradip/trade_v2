@@ -315,14 +315,18 @@ Everything else (features and their switches and windows, labels and validation,
 9. **Per-trade max loss** as a fraction of net liquidation; **aggregate capital at risk** across all open positions; **per-symbol concentration**.
 10. **Portfolio delta** limit. The bot has no live greeks subscription, so this gate is largely inert; the aggregate-risk and concentration gates carry the load.
 11. **Daily loss** check.
-12. **Position sizing**, then the correlation haircut; a zero-contract verdict is a refusal.
+12. **Position sizing**, then the correlation haircut; a zero-contract verdict is a refusal. The number of lots is explained in 7.2: for an entry the risk manager sizes itself, steps 8 and 9 are judged for the lots actually placed.
 
 ### 7.2 Sizing
 
-[`PositionSizer`](../src/ait/risk/position_sizer.py) starts from a per-position cap and multiplies adjustments, all of them settings under `position_sizing` and `positions`:
-confidence, implied volatility (smoothly smaller in high-vol), IV rank (selling gets more room when IV is rich), a per-strategy risk fraction, recent losing days
-(drawdown throttle), VIX tiers, and a correlation haircut. Capital tiers (`risk/capital_tiers.py`) choose which universe is affordable at a given account size. The size
-of one trade is bounded again by the per-trade risk budget, which is also what the condor builder is handed to size the wings.
+[`PositionSizer`](../src/ait/risk/position_sizer.py) counts lots with one rule that the research engine shares ([`risk/lot_sizing.py`](../src/ait/risk/lot_sizing.py)): the per-trade budget
+(`risk.max_position_risk_pct` of net liquidation) divided by one lot's maximum loss, rounded down. A lot that does not fit the budget is refused; once one fits, the count is at least 1, and
+`positions.max_contracts_per_trade` caps it. The confidence, volatility, IV-rank, per-strategy, drawdown and VIX adjustments (`position_sizing`) lower the count only for the strategies listed in
+`position_sizing.scaled_strategies` (empty by default), and never below one lot. The condor builder is handed the same budget to size the wings.
+
+With the shipped cap of 1 every trade is one lot. When the cap is raised, a new entry is a one-lot description that the risk manager sizes: it takes the count above, applies the correlation
+haircut, and then judges buying power, the per-trade limit, the aggregate cap, the per-symbol cap and the portfolio delta for the lots actually placed, trimming the count to the largest that passes.
+A rejection at one lot reads exactly as it always has. Capital tiers (`risk/capital_tiers.py`) choose which universe is affordable at a given account size.
 
 ### 7.3 Brakes that act on the book
 
