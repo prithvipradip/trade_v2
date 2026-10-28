@@ -2154,8 +2154,9 @@ class TradingOrchestrator:
 
         # Incremental intraday fetch: only request bars not yet stored in SQLite.
         # On first run (no stored data) fetches a full 7-day seed window.
-        # Extends retention to 2 years so MFDFA and walk-forward VLMC analysis
-        # have the maximum available history.
+        # The stored bars are only ever ADDED to: the table is shared with research, whose windows
+        # need the bars from 2024 on, so nothing here (or anywhere) deletes 5-minute data. The 730
+        # days below is how much the bot LOADS for MFDFA / VLMC features, not how much is kept.
         try:
             last_ts = self._historical.get_latest_intraday_timestamp(symbol)
             if last_ts is None:
@@ -2166,10 +2167,9 @@ class TradingOrchestrator:
             log.debug("intraday_fetch_error", symbol=symbol, error=str(e))
             intraday = None
 
-        # Persist new bars; reload full 2-year window for fractal feature computation.
+        # Persist new bars; reload the 2-year window for fractal feature computation.
         if intraday is not None and not intraday.empty:
             self._historical.save_intraday(symbol, intraday)
-            self._historical.cleanup_old_intraday(keep_days=730)
         intraday_full = self._historical.load_intraday(symbol, days=730)
 
         # Data quality check on historical data

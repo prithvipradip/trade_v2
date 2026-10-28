@@ -1143,17 +1143,6 @@ class HistoricalDataStore:
             return pd.Timestamp(result[0], tz="UTC")
         return None
 
-    def cleanup_old_intraday(self, keep_days: int = 10) -> None:
-        """Delete intraday rows older than keep_days calendar days."""
-        from datetime import timedelta, timezone
-        cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=keep_days)).isoformat()
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
-                f"DELETE FROM {self._intraday_table} WHERE datetime < ?",
-                (cutoff,),
-            )
-        log.debug("intraday_cleanup_done", keep_days=keep_days)
-
     def intraday_day_count(self, symbol: str, start: date, end: date,
                            interval: str = "5m") -> int:
         """W65: number of distinct session days with stored intraday bars in
