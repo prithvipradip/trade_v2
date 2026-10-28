@@ -476,6 +476,16 @@ scripts/budget_ladder_study.py:
   explained: "-"
   stamp: "b8f73fa7710e"
 
+scripts/paper_checkpoint.py:
+  group: Study
+  what: "Read-only comparison of the paper account's real iron-condor closes since the paper restart with the walk-forward model: win rate, profit factor with an 80% interval, credit, wing, hold, friction share, exit-reason shares, entry slip, fill rate and pace, plus a data-capture audit (checkpoint 1) or a decision class (checkpoint 2)."
+  when: "At the pre-registered paper checkpoints (10 real closes or 12 weeks after the restart; 25 real closes or 26 weeks), or any time to read the paper record against the model."
+  needs_ib: "no"
+  writes: "reports/paper_checkpoint/<date>_<C1|C2>.md (statistics only); the state database is opened read-only."
+  example: "python scripts/paper_checkpoint.py [--checkpoint C1|C2] [--epoch-start <YYYY-MM-DD>]"
+  explained: "-"
+  stamp: "7da5a04f3bb9"
+
 scripts/probe_w53_roll_atomicity.py:
   group: IB paper probe
   what: "Probe of whether IB accepts and fills ONE four-leg cross-expiry order that closes a vertical at one expiry and opens one at another. The subcommands `open`, `roll` and `flatten` PLACE ORDERS."

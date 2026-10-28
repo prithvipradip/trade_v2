@@ -5,7 +5,7 @@ Not for: how the system works ([GUIDE.md](GUIDE.md)), installing and first run (
 Limits, timers and ceilings these procedures refer to are generated tables in [GUIDE.md](GUIDE.md) sections 7 and 8; every setting is in [reference/SETTINGS_LIVE.md](reference/SETTINGS_LIVE.md). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 **Contents:** [Kill switches](#kill-switches-no-kill--9-needed) · [Alert → action](#alert--action) · [Books versus broker](#resolving-a-books-versus-broker-break) · [Manual intervention](#manual-intervention-procedure-closingadjusting-any-tracked-position-yourself) ·
-[Daily routine](#daily-2-minute-routine) · [Deploy checklist](#deploy-checklist-every-deploy) · [Data catch-up](#data-catch-up-and-maintenance) · [Troubleshooting](#troubleshooting) ·
+[Daily routine](#daily-2-minute-routine) · [Paper checkpoints](#paper-checkpoints) · [Deploy checklist](#deploy-checklist-every-deploy) · [Data catch-up](#data-catch-up-and-maintenance) · [Troubleshooting](#troubleshooting) ·
 [Quarterly drills](#quarterly-drills-scheduled--first-week-of-jan--apr--jul--oct) · [Go-live checklist](#go-live-day-checklist-from-planmd-gates--do-not-skip)
 
 ## Kill switches (no `kill -9` needed)
@@ -154,6 +154,13 @@ The exit engine evaluates every tracked position every 30 seconds and does not k
 4. Reading the OTHER box's logs: the supervisor fetches `origin/shared-logs` itself every weekday at 16:50 ET (a fetch only; it never touches the checkout and does not need `AIT_LOG_OWNER`). Its log line
    `shared_logs_fetched` carries `latest_by_owner`: a stale date there means that box has stopped publishing. Read a day with
    `python scripts/read_shared_logs.py --owner <name> --date YYYY-MM-DD --no-fetch` (drop `--no-fetch` to force a fresh fetch). Publishing your OWN days additionally needs `AIT_LOG_OWNER=<name>` in this box's `.env` (the job is silent without it).
+
+## Paper checkpoints
+While the paper account runs the shipped configuration, `python scripts/paper_checkpoint.py --checkpoint C1` (or `C2`) compares its real iron-condor closes since the paper restart with the walk-forward model the studies used. It is read-only (the state database is opened `mode=ro`) and writes a statistics report to `reports/paper_checkpoint/`. Until a checkpoint is due the report says `NOT DUE`; running it early is harmless.
+- **C1, data-capture audit (no decision):** due at 10 real closes or 12 weeks after the restart, whichever comes first. It checks that every field the comparison needs is recorded and lists any exit reason the mapping does not recognise.
+- **C2, the decision:** due at 25 real closes or 26 weeks, whichever comes first. With fewer than 15 real closes it is extended to 15 closes or 52 weeks, and still fewer is reported as pace-limited. At 15 or more it prints one of three classes: the model is too pessimistic at a 3-wide, the model is consistent, or indeterminate (keep collecting toward the 50-close go-live read).
+
+Read the pace and fill section first: with few fills the question is why entries do not fill, not whether the model is right. The epoch, the model figures and the decision classes are fixed in PLAN.md (the entry that pre-registers the paper checkpoint); nothing here changes a go-live gate. Weekly is a sensible rhythm; the comparison only becomes informative as closes accumulate.
 
 ## Deploy checklist (EVERY deploy)
 A green test suite is not a safe deploy: unit tests once passed and the deployed code still killed the trading loop for a full session (stops/TPs unmanaged), found a day later. Do all five steps, in order:
