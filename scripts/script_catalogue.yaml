@@ -211,10 +211,10 @@ scripts/backfill_option_history.py:
   what: "Backfills historical option daily bars (with solved implied vol and greeks) for one symbol from Polygon."
   when: "To extend the option-bar history an IV surface needs. Slow (about 12.5 s per request by default)."
   needs_ib: "no"
-  writes: "option_daily_bars in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry."
+  writes: "option_daily_bars and option_fetch_log in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry; a contract fetched after it expired that came back empty is skipped on later runs unless --retry-empty."
   example: "python scripts/backfill_option_history.py --symbol QQQ [--dry-run | --since-last]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
-  stamp: "3efdece63675"
+  stamp: "db633763861c"
 
 scripts/backfill_risk_free_rate.py:
   group: Data
@@ -401,10 +401,10 @@ scripts/iv_rank_parity_probe.py:
   what: "Compares the research IV-rank rise veto with live's IV-rank level gates: how the two ranks relate and how many vetoed days live would have traded anyway."
   when: "To revisit whether the research veto belongs in research."
   needs_ib: "no"
-  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table."
-  example: "python scripts/iv_rank_parity_probe.py [--ab --workers 6]"
+  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the pre-W91 research table set (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone."
+  example: "python scripts/iv_rank_parity_probe.py [--research-prefix archive_w91_research_] [--ab --workers 6]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
-  stamp: "090ec11a0a69"
+  stamp: "0332d29ec3a7"
 
 scripts/range_horizon_study.py:
   group: Study

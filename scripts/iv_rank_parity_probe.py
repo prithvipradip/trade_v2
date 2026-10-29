@@ -33,7 +33,7 @@ DB = ROOT / "data" / "historical.db"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-def _series(symbol: str, db: Path):
+def _series(symbol: str, db: Path, prefix: str = "archive_w91_research_"):
     """(ohlcv+iv frame, research IV, live-store IV, feature rank, S_research, S_live)."""
     import pandas as pd
 
@@ -42,8 +42,9 @@ def _series(symbol: str, db: Path):
     from ait.ml.features import FeatureEngine
 
     # W91: this W71 probe compares the research_* table with the live one; after the tables were merged the two are
-    # identical by construction, so it only has meaning on a database that still has both sets.
-    frame = ResearchData(str(db), symbol, prefix="research_").daily_frame()
+    # identical by construction, so it only has meaning on a database that still has both sets. W106: after the W91
+    # archive the old set is `archive_w91_research_*` (the default); `--research-prefix research_` before it.
+    frame = ResearchData(str(db), symbol, prefix=prefix).daily_frame()
     research_iv = frame["implied_vol"]
     with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
         live = pd.read_sql_query(
@@ -61,7 +62,8 @@ def _fmt(x, nd=2):
     return "n/a" if x is None or x != x else f"{x:.{nd}f}"
 
 
-def compare(symbols: list[str], db: Path, threshold: float, since: str) -> None:
+def compare(symbols: list[str], db: Path, threshold: float, since: str,
+            prefix: str = "archive_w91_research_") -> None:
     import pandas as pd
 
     from ait.backtesting import iv_rank_compare as cmp
@@ -73,7 +75,7 @@ def compare(symbols: list[str], db: Path, threshold: float, since: str) -> None:
     print("|---|---|---|---|---|---|---|---|---|---|")
     rows2, rows3 = [], []
     for sym in symbols:
-        frame, riv, liv, f, s_res, s_live = _series(sym, db)
+        frame, riv, liv, f, s_res, s_live = _series(sym, db, prefix)
         for label, mask in (("full history", slice(None)), (f"{since}+", slice(since, None))):
             r = cmp.veto_vs_live(f.loc[mask], s_res.loc[mask], threshold)
             print(f"| {sym} | {label} | {r['n_days']} | {_fmt(r['spearman_feature_vs_stored'])} | "
@@ -155,9 +157,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ab-start", default="2024-01-02")
     ap.add_argument("--ab-end", default="2026-10-08")
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--db", type=Path, default=DB)
+    ap.add_argument("--research-prefix", default="archive_w91_research_",
+                    help="W106: the pre-W91 research table set to compare with the live one "
+                         "(archive_w91_research_ after the W91 archive, research_ before it)")
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
-    compare(args.symbols, DB, args.threshold, args.since)
+    table = f"{args.research_prefix}daily_prices"
+    with sqlite3.connect(f"file:{args.db}?mode=ro", uri=True) as c:
+        present = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if not present:
+        print(f"{table} is not in {args.db}: this probe compares the pre-W91 research tables with the live "
+              f"ones and needs a database that still has them (see --research-prefix).", file=sys.stderr)
+        return 2
+    compare(args.symbols, args.db, args.threshold, args.since, args.research_prefix)
     if args.ab:
         ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers)
     return 0

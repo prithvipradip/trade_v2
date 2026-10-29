@@ -159,12 +159,12 @@ class TestProbeScript:
         db = tmp_path / "h.db"
         _make_db(db)
         probe = _load_probe()
-        frame, riv, liv, f, s_res, s_live = probe._series("TST", db)
+        frame, riv, liv, f, s_res, s_live = probe._series("TST", db, "research_")
         assert len(riv.dropna()) == 420 and len(liv.dropna()) == 300
         assert f.between(0, 1).all()                         # the feature rank is a 0-1 quantity
         assert s_res.dropna().between(0, 100).all()          # the live rank is a 0-100 percentile
         assert s_live.notna().sum() > 0 and s_live.first_valid_index() > s_res.first_valid_index()
-        probe.compare(["TST"], db, 0.30, "2023-09-01")
+        probe.compare(["TST"], db, 0.30, "2023-09-01", "research_")
         out = capsys.readouterr().out
         for section in ("## 1.", "## 2.", "## 3.", "| TST | full history |", "| TST | 2023-09-01+ |"):
             assert section in out
@@ -185,7 +185,7 @@ class TestProbeScript:
         db = tmp_path / "h.db"
         _make_db(db)
         probe = _load_probe()
-        frame, _riv, _liv, f, _a, _b = probe._series("TST", db)
+        frame, _riv, _liv, f, _a, _b = probe._series("TST", db, "research_")
         full = FeatureEngine().compute(frame[probe.OHLCV])["iv_rank"].astype(float)
         common = full.index.intersection(f.index)
         assert len(common) > 100
@@ -195,7 +195,7 @@ class TestProbeScript:
         db = tmp_path / "h.db"
         _make_db(db)
         before = db.read_bytes()
-        _load_probe()._series("TST", db)
+        _load_probe()._series("TST", db, "research_")
         assert db.read_bytes() == before
 
 
