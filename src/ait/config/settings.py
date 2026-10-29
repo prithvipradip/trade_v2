@@ -57,8 +57,6 @@ class TradingConfig(_StrictModel):
         description="Seconds between entry scans, counted from when the previous scan finishes. Position protection runs on its own 30-second cadence whatever this is.")
     max_daily_trades: int = Field(default=5, ge=1, le=50,
         description="Upper bound on new positions opened per day; the time-of-day trade budget (first hour, midday, rest of the session) is bounded by it.")
-    trading_hours_only: bool = Field(default=True,
-        description="Not read by any code: regular trading hours are enforced unconditionally by the scheduler and by the executor (the executor override is the environment variable AIT_ALLOW_AFTER_HOURS=1).")
     no_new_entries_minutes_before_close: int = Field(default=15, ge=0, le=120,
         description="W35 (R26 entry-blackout-cutoff-900s-is-a-bare-literal): "
                     "no new entries inside this many minutes of the session "
@@ -518,8 +516,6 @@ DEFAULT_RISK_FREE_RATE = 0.05
 
 
 class OptionsConfig(_StrictModel):
-    delta_range: list[float] = Field(default=[0.20, 0.50],
-        description="Not read by any code: long-option strike targeting uses its own constant, and live trades iron condors only.")
     dte_range: list[int] = Field(default=[14, 45],
         description="Days-to-expiry band, [minimum, maximum], for new entries; the range model's horizon is derived from its minimum.")
     min_open_interest: int = Field(default=100, ge=0,
@@ -542,13 +538,6 @@ class OptionsConfig(_StrictModel):
         "iron_condor",
     ],
         description="Strategy names the selector may use. Enabling a structure is a recorded decision.")
-
-    @field_validator("delta_range")
-    @classmethod
-    def validate_delta_range(cls, v: list[float]) -> list[float]:
-        if len(v) != 2 or not (0 < v[0] < v[1] < 1):
-            raise ValueError("delta_range must be [low, high] where 0 < low < high < 1")
-        return v
 
     @field_validator("dte_range")
     @classmethod
@@ -2201,8 +2190,6 @@ class MetaLabelConfig(_StrictModel):
         description="Master switch for the meta-labeler gate (off today). The guards that apply before it can act are in docs/MODELS.md \"The models one by one\".")
     min_probability: float = Field(default=0.50, ge=0.30, le=0.80,
         description="Minimum predicted probability of profit for the meta-labeler to let a trade through, when it acts.")
-    retrain_with_primary: bool = Field(default=True,
-        description="Not read by any code: the live trainer has no meta-labeler retrain, and the gate itself is off.")  # Retrain when primary model retrains
     min_trades_for_training: int = Field(default=30, ge=10, le=1000,
         description="W92: the meta-labeler is not trained on fewer closed trades than this (it was the module constant "
                     "MIN_TRADES_FOR_TRAINING = 30). min_closes_to_enable below is the separate question of when its output is "
@@ -2597,8 +2584,6 @@ class ExitConfig(_StrictModel):
         description="Widens the stop for volatile underlyings (debit structures only).")
     initial_stop_loss_pct: float = Field(default=0.50, ge=0.15, le=0.75,
         description="Fixed stop, as a fraction of cost, before the breakeven trigger activates (debit structures).")
-    auto_hedge: bool = Field(default=False,
-        description="Not read by any code: no hedging code exists in the live tree.")
     # R14: staleness gate on exit inputs. The touch stop is the only exit rule
     # that acts DIRECTLY on the underlying's price, and it read that price with
     # no quality check at all — a frozen feed could fire it on a breach that had

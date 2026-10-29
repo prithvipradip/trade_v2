@@ -342,7 +342,6 @@ file from being armed.
 |---|---|---|---|
 | `meta_label.enabled` | false | - | Master switch for the meta-labeler gate (off today). |
 | `meta_label.min_probability` | 0.5 | 0.3 - 0.8 | Minimum predicted probability of profit for the meta-labeler to let a trade through, when it acts. |
-| `meta_label.retrain_with_primary` | true | - | Not read by any code: the live trainer has no meta-labeler retrain, and the gate itself is off. |
 | `meta_label.min_trades_for_training` | 30 | 10 - 1000 | The meta-labeler is not trained on fewer closed trades than this. min_closes_to_enable below is the separate question of when its output is TRUSTED for live entries. |
 | `meta_label.min_class_trades` | 5 | 2 - 500 | The meta-labeler also needs at least this many profitable and this many unprofitable closed trades. |
 | `meta_label.cv_max_splits` | 5 | 2 - 20 | Its training cross-validation uses at most this many folds. |

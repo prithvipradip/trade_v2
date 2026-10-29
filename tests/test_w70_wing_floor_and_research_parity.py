@@ -359,15 +359,8 @@ class TestEarningsWindowIsLives:
 # remain). Each is REGISTERED in PLAN.md W70 and decided later: do not "fix" by editing
 # this dict, either wire the key or delete it.
 EXEMPT: dict[str, str] = {
-    "trading.trading_hours_only":
-        "RTH is enforced unconditionally (scheduler is_market_open + executor refusal unless "
-        "env AIT_ALLOW_AFTER_HOURS=1); this yaml flag is a second, unconnected switch.",
-    "options.delta_range":
-        "long-option strike targeting (long_options.py uses a literal 0.40); live is IC-only.",
-    "meta_label.retrain_with_primary":
-        "the live trainer has no meta-labeler retrain; the gate itself is off (enabled: false).",
-    "exit.auto_hedge":
-        "no hedging code exists anywhere in src/; docs/archive/AUDIT_R12.md's 'one flip from live' is false.",
+    # W106: trading.trading_hours_only, options.delta_range, meta_label.retrain_with_primary
+    # and exit.auto_hedge were registered here (W70) and are deleted from the schema.
     # Read, but only inside settings.py through a derived property, which this scan skips:
     "trading.first_hour_end_et": "read via TradingConfig.first_hour_end_hour (property)",
     "trading.midday_end_et": "read via TradingConfig.midday_end_hour (property)",

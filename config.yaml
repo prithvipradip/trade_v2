@@ -38,7 +38,6 @@ trading:
   universe: [SPY, QQQ, IWM]
   scan_interval_seconds: 300           # 5 minutes between scans
   max_daily_trades: 12                  # Raised for higher trade volume / faster learning
-  trading_hours_only: true             # Only trade during RTH (9:30-16:00 ET)
   no_new_entries_minutes_before_close: 15   # W35: was a bare 900s in bot/scheduler.py
   # W69: the intraday trade-budget windows and the first-hour confidence gate
   # (were literals in bot/orchestrator.py). Cumulative caps, still bounded by
@@ -204,7 +203,6 @@ risk:
   weekend_gap_strategies: [short_strangle]
 
 options:
-  delta_range: [0.20, 0.50]            # Target delta for long options
   dte_range: [14, 30]                  # R12-B (cadence): min DTE 7 -> 14. 7-DTE entries were
                                        # 2-day churn (forced out by the DTE<=5 exit almost
                                        # immediately), best case ~60% cost-dominated — commissions
@@ -717,7 +715,6 @@ regime:
 meta_label:
   enabled: false                       # Disabled: trained on corrupted data, rejects everything. See min_closes_to_enable below before re-enabling.
   min_probability: 0.50                # Min P(profitable) to take a trade (0.30-0.80)
-  retrain_with_primary: true           # Retrain when primary model retrains
   min_feature_coverage: 15             # of the 20 inputs, this many must carry real data before a new model is armed (W90c)
   max_artifact_age_days: 45            # a saved model older than this is stale and refused at load (W90c)
   # W92 (explained in docs/MODELS.md "The models one by one"): the meta-labeler is disabled, these only make its numbers visible
@@ -851,7 +848,6 @@ exit:
       close_pct: 0.33
   time_decay_scaling: true            # Lower take-profit target as DTE decreases
   volatility_adjusted_stops: true     # Widen stops for high-vol underlyings (ATR-based)
-  auto_hedge: false                   # Auto-execute delta hedges (enable after paper testing)
   # W69: open-position thesis check (directional strategies only — iron condors
   # are exempt from the whole check). Were literals in bot/orchestrator.py.
   thesis_direction_flip_confidence: 0.70
