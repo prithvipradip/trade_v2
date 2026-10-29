@@ -473,6 +473,14 @@ funnel** (why days did not trade), a buy-and-hold benchmark, and per-window rows
 **How is Sharpe annualized?** By the square root of the trades per year the sample actually made, capped at 252 (one trade per trading day). The cap is a fixed convention (`SHARPE_ANNUALIZATION_CAP` in `backtesting/result.py`), not a setting:
 it decides how every reported Sharpe and Sortino is annualized, so a study that could change it would make reported numbers incomparable across runs.
 
+**How are total return and drawdown computed?** From one equity path: the starting pool (`account.capital`) plus every accepted trade's P&L, windows in order. Total return is the end of that path over its start; max drawdown
+and the equity curve walk the same path. Every window's out-of-sample run starts at the pool again, so the total return is the windows' dollars added on one account, not the product of the window returns.
+
+**What is the carried-equity estimate?** `WalkForwardConfig(carry_equity=True)` keeps the normal run as the result (the parameters, the window models and the learner are chosen from it) and replays each window's
+out-of-sample period a second time, starting at the previous window's ending equity, so the per-trade budget and the aggregate-risk and per-symbol caps follow the account as it grows or shrinks. The replay is reported as
+`carried_estimate` on the result and as a block at the end of the summary. It is an estimate because the parameters were tuned at the fresh budget, not at the carried equity. The windows must be replayed in order, so it
+needs `optimize_n_jobs=1`; with parallel window workers the configuration refuses to start.
+
 **Why can a default run look poor?** The default run is a smoke test, with a small pool, enforced ML gates and few windows. It is not evidence about the strategy.
 
 ---
