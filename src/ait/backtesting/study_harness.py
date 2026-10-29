@@ -73,7 +73,7 @@ def study_inputs(db_path: Path, symbol: str, start: str, end: str):
     return rd, data, features, iv_rank_series(frame["implied_vol"])
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+from ait.backtesting.run_record import REPO_ROOT  # noqa: E402  (stdlib-light; one definition of the repo root)
 RUNS_DIR = REPO_ROOT / "reports" / "runs"
 
 
