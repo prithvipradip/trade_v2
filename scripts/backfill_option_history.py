@@ -146,6 +146,8 @@ log = get_logger("scripts.backfill_option_history")
 
 BASE_URL = "https://api.polygon.io"
 AUTH_FAILURE_LIMIT = 3
+# W106: aggregate-response statuses that are a real answer (an empty one included); anything else is an error reply.
+ANSWER_OK_STATUSES = ("OK", "DELAYED")
 STATUS_FILE = Path("data") / "backfill_option_history_status.json"
 # Network-retry backoff (seconds); [0, ...] so the first attempt has no
 # extra delay. Patient enough to ride out a post-sleep WiFi reconnection,
@@ -280,6 +282,9 @@ class PolygonClient:
     def get_daily_bars(self, option_ticker: str, from_date: date, to_date: date) -> list[dict]:
         url = f"{BASE_URL}/v2/aggs/ticker/{option_ticker}/range/1/day/{from_date}/{to_date}"
         data = self._get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000})
+        # W106: whether this was a real answer. `_get` returns {} for a 401, a NOT_AUTHORIZED body or an
+        # unparseable reply, which must not be recorded as "this contract has no bars".
+        self.last_answer_ok = bool(data) and data.get("status") in ANSWER_OK_STATUSES
         return data.get("results", []) if data else []
 
 
@@ -375,7 +380,7 @@ def process_contract(
     if store.option_ticker_has_data(ticker):
         return 0
     # W106: an expired contract that already came back empty stays empty.
-    if not retry_empty and store.option_fetch_is_final(ticker):
+    if not retry_empty and store.option_fetch_is_final(ticker, start_date):
         return 0
 
     expiry = date.fromisoformat(contract["expiry"])
@@ -383,8 +388,11 @@ def process_contract(
     bars = client.get_daily_bars(ticker, start_date, fetch_to)
     saved = _store_bars(store, symbol, contract, bars or [], underlying_closes,
                         expiry, risk_free_rate)
-    store.record_option_fetch(symbol, ticker, contract["expiry"], today_et(),
-                              len(bars or []), saved)
+    if getattr(client, "last_answer_ok", True):      # an error reply is retried next run, never final
+        store.record_option_fetch(symbol, ticker, contract["expiry"], today_et(), start_date, fetch_to,
+                                  len(bars or []), saved)
+    else:
+        log.warning("option_fetch_not_recorded_error_reply", ticker=ticker)
     return saved
 
 

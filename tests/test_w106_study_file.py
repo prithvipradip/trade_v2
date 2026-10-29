@@ -25,6 +25,13 @@ STUDY = "name: w106_probe\nquestion: does the study reach the workers\nrule: exp
         "settings:\n  backtest:\n    slippage_pct: 0.02\n"
 
 
+@pytest.fixture(autouse=True)
+def _no_mlflow(monkeypatch):
+    """The run record must not log into the repository's data/mlflow.db when mlflow is installed."""
+    import ait.backtesting.run_record as rr
+    monkeypatch.setattr(rr, "log_to_mlflow", lambda *a, **k: None)
+
+
 def _study(tmp_path):
     p = tmp_path / "w106_probe.yaml"
     p.write_text(STUDY)
@@ -51,6 +58,7 @@ class _FakePool:
 
     def __init__(self, rows, seen):
         self._rows, self._seen = rows, seen
+        self.tasks: list = []
 
     def __call__(self, workers, study_file=None):
         self._seen.append(study_file)
@@ -63,7 +71,8 @@ class _FakePool:
         return False
 
     def map(self, fn, tasks):
-        return [dict(self._rows) for _ in tasks]
+        self.tasks = list(tasks)
+        return [dict(self._rows) for _ in self.tasks]
 
 
 ROWS = {
@@ -80,7 +89,8 @@ ROWS = {
 @pytest.mark.parametrize("name", list(ROWS))
 def test_each_script_hands_the_study_to_its_pool_and_records_the_run(name, tmp_path, monkeypatch):
     seen: list = []
-    monkeypatch.setattr(sh, "study_pool", _FakePool(ROWS[name], seen))
+    pool = _FakePool(ROWS[name], seen)
+    monkeypatch.setattr(sh, "study_pool", pool)
     monkeypatch.setattr(sh, "RUNS_DIR", tmp_path / "runs")
     m = _load_script(name)
     study = _study(tmp_path)
@@ -101,6 +111,8 @@ def test_each_script_hands_the_study_to_its_pool_and_records_the_run(name, tmp_p
     rec = json.loads(records[0].read_text())
     assert rec["study"]["name"] == "w106_probe" and rec["kind"] == "study"
     assert rec["settings"]["backtest"]["slippage_pct"] == pytest.approx(0.02)
+    if name == "iv_rank_parity_probe":                   # --db reaches the engine arms, not only the series
+        assert pool.tasks and all(t["db"] == str(db) for t in pool.tasks)
 
 
 def test_no_run_record_writes_nothing(tmp_path, monkeypatch):

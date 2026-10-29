@@ -116,10 +116,11 @@ def _arm(task: dict) -> dict:
     from ait.backtesting.study_harness import assert_friction_loaded, study_engine_kwargs, study_inputs
 
     # features from a year of warm-up before the window, as the walk-forward does per window
-    rd, data, features, ivr = study_inputs(DB, task["symbol"], task["start"], task["end"])
+    db = Path(task.get("db") or DB)                # W106: --db reaches the engine arms too
+    rd, data, features, ivr = study_inputs(db, task["symbol"], task["start"], task["end"])
     # W87a: the study engine block is defined once (backtesting/study_harness.py); entry DTE fixed at 14
     bt = Backtester(**study_engine_kwargs(
-        data=data, symbol=task["symbol"], db_path=DB, intraday_store=rd, entry_dte=14,
+        data=data, symbol=task["symbol"], db_path=db, intraday_store=rd, entry_dte=14,
         features_cache=features, iv_rank_series=ivr,
         iv_rank_rise_gate=bool(task["gate"]), iv_rank_rise_threshold=task["threshold"]))
     assert_friction_loaded(bt)
@@ -132,10 +133,11 @@ def _arm(task: dict) -> dict:
             "rank_cap_days": f.get("iv_rank_cap", 0), "days": f.get("days_evaluated", 0)}
 
 
-def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int, study_file=None) -> list:
+def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int, study_file=None,
+       db: Path = DB) -> list:
     from study_cli import study_pool
 
-    tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end}
+    tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end, "db": str(db)}
              for s in symbols for g in (True, False)]
     print(f"\n## 4. Realistic-engine A/B of the rise veto ({start}..{end}, entry DTE 14, 1 contract)\n")
     with study_pool(workers, study_file) as ex:
@@ -178,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     study = load_study_config(args.study_file)
     compare(args.symbols, args.db, args.threshold, args.since, args.research_prefix)
     if args.ab:            # the run record covers the engine A/B (the series comparison reads no settings)
-        res = ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers, args.study_file)
+        res = ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers, args.study_file, args.db)
         write_study_record("iv_rank_parity_probe", args, study, res, symbols=args.symbols)
     return 0
 

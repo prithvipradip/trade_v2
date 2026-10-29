@@ -436,6 +436,8 @@ class HistoricalDataStore:
                     underlying    TEXT NOT NULL,
                     expiry        TEXT NOT NULL,
                     fetched_on    TEXT NOT NULL,
+                    fetched_from  TEXT NOT NULL,
+                    fetched_to    TEXT NOT NULL,
                     bars          INTEGER NOT NULL,
                     rows_saved    INTEGER NOT NULL
                 )
@@ -1448,25 +1450,30 @@ class HistoricalDataStore:
             ).fetchone()
         return row is not None
 
-    def record_option_fetch(self, symbol: str, option_ticker: str, expiry: str,
-                            fetched_on: date, bars: int, rows_saved: int) -> None:
-        """W106: note a completed fetch (the latest one wins)."""
+    def record_option_fetch(self, symbol: str, option_ticker: str, expiry: str, fetched_on: date,
+                            fetched_from: date, fetched_to: date, bars: int, rows_saved: int) -> None:
+        """W106: note a completed fetch, a real answer from the provider, and the window it asked for
+        (the latest one wins)."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 f"INSERT OR REPLACE INTO {self._option_fetch_log_table} "
-                f"(option_ticker, underlying, expiry, fetched_on, bars, rows_saved) "
-                f"VALUES (?, ?, ?, ?, ?, ?)",
-                (option_ticker, symbol, expiry, fetched_on.isoformat(), int(bars), int(rows_saved)),
+                f"(option_ticker, underlying, expiry, fetched_on, fetched_from, fetched_to, bars, rows_saved) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (option_ticker, symbol, expiry, fetched_on.isoformat(), fetched_from.isoformat(),
+                 fetched_to.isoformat(), int(bars), int(rows_saved)),
             )
 
-    def option_fetch_is_final(self, option_ticker: str) -> bool:
-        """W106: was this contract fetched AFTER it expired? Then its history is complete
-        (an empty answer stays empty) and a plain run need not ask again."""
+    def option_fetch_is_final(self, option_ticker: str, start_date: date) -> bool:
+        """W106: is this contract's history already complete for a run starting at `start_date`?
+        True only when an earlier fetch was made AFTER the contract expired, reached its expiry, and
+        started no later than `start_date`: then an empty answer stays empty. A fetch over part of
+        the contract's life (a later --start-date, an --end-date before expiry) is not final."""
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
                 f"SELECT 1 FROM {self._option_fetch_log_table} "
-                f"WHERE option_ticker = ? AND fetched_on > expiry LIMIT 1",
-                (option_ticker,),
+                f"WHERE option_ticker = ? AND fetched_on > expiry AND fetched_to >= expiry "
+                f"AND fetched_from <= ? LIMIT 1",
+                (option_ticker, start_date.isoformat()),
             ).fetchone()
         return row is not None
 

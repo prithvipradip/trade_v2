@@ -214,7 +214,7 @@ scripts/backfill_option_history.py:
   writes: "option_daily_bars and option_fetch_log in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry; a contract fetched after it expired that came back empty is skipped on later runs unless --retry-empty."
   example: "python scripts/backfill_option_history.py --symbol QQQ [--dry-run | --since-last]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
-  stamp: "db633763861c"
+  stamp: "9adaad0e8615"
 
 scripts/backfill_risk_free_rate.py:
   group: Data
@@ -404,7 +404,7 @@ scripts/iv_rank_parity_probe.py:
   writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the pre-W91 research table set (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone. With --ab: A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/iv_rank_parity_probe.py [--research-prefix archive_w91_research_] [--ab --workers 6]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
-  stamp: "180f8b1f91a5"
+  stamp: "1630471f3d74"
 
 scripts/range_horizon_study.py:
   group: Study
