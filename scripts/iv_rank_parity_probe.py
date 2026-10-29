@@ -25,7 +25,6 @@ import argparse  # noqa: E402
 import sqlite3  # noqa: E402
 import sys  # noqa: E402
 import warnings  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,11 +132,13 @@ def _arm(task: dict) -> dict:
             "rank_cap_days": f.get("iv_rank_cap", 0), "days": f.get("days_evaluated", 0)}
 
 
-def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int) -> None:
+def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int, study_file=None) -> list:
+    from ait.backtesting.study_harness import study_pool
+
     tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end}
              for s in symbols for g in (True, False)]
     print(f"\n## 4. Realistic-engine A/B of the rise veto ({start}..{end}, entry DTE 14, 1 contract)\n")
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    with study_pool(workers, study_file) as ex:
         res = list(ex.map(_arm, tasks))
     print("| symbol | veto | trades | win % | total $ | days vetoed by the rise gate | days at live floor | days at live cap |")
     print("|---|---|---|---|---|---|---|---|")
@@ -146,9 +147,11 @@ def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int)
         print(f"| {r['symbol']} | {arm} | {r['n']} | {r['win']:.0%} | {r['total']:,.0f} | {r['rise_days']} | "
               f"{r['rank_floor_days']} | {r['rank_cap_days']} |")
     print("\nA difference of a few $k over ~60-120 trades per arm is inside the noise; the decision rests on parity.")
+    return res
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ait.backtesting.study_harness import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["QQQ", "SPY", "IWM"])
     ap.add_argument("--threshold", type=float, default=0.30)
@@ -161,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--research-prefix", default="archive_w91_research_",
                     help="W106: the pre-W91 research table set to compare with the live one "
                          "(archive_w91_research_ after the W91 archive, research_ before it)")
+    add_study_args(ap)
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
     table = f"{args.research_prefix}daily_prices"
@@ -170,9 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{table} is not in {args.db}: this probe compares the pre-W91 research tables with the live "
               f"ones and needs a database that still has them (see --research-prefix).", file=sys.stderr)
         return 2
+    study = load_study_config(args.study_file)
     compare(args.symbols, args.db, args.threshold, args.since, args.research_prefix)
-    if args.ab:
-        ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers)
+    if args.ab:            # the run record covers the engine A/B (the series comparison reads no settings)
+        res = ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers, args.study_file)
+        write_study_record("iv_rank_parity_probe", args, study, res, symbols=args.symbols)
     return 0
 
 
