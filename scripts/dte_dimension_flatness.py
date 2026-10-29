@@ -101,7 +101,8 @@ def _run_one(task: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from ait.backtesting.study_harness import add_study_args, load_study_config, study_pool, write_study_record
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbol", default="QQQ")
     ap.add_argument("--start", default="2025-04-01")

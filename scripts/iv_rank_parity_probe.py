@@ -133,7 +133,7 @@ def _arm(task: dict) -> dict:
 
 
 def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int, study_file=None) -> list:
-    from ait.backtesting.study_harness import study_pool
+    from study_cli import study_pool
 
     tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end}
              for s in symbols for g in (True, False)]
@@ -151,7 +151,8 @@ def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int,
 
 
 def main(argv: list[str] | None = None) -> int:
-    from ait.backtesting.study_harness import add_study_args, load_study_config, study_pool, write_study_record
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["QQQ", "SPY", "IWM"])
     ap.add_argument("--threshold", type=float, default=0.30)

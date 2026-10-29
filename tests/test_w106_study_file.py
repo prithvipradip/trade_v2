@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import json
 
+import sys
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
-import ait.backtesting.study_harness as sh
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import study_cli as sh  # noqa: E402  (scripts/ is on sys.path above)
 from tests.test_w71_iv_rank_parity import _make_db
 from tests.test_w87a_hygiene import _load_script
 

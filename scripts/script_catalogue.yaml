@@ -354,7 +354,7 @@ scripts/gate_parity_ab.py:
   writes: "nothing unless --dump FILE is given. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. VIX closes come from Yahoo (network). A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/gate_parity_ab.py --workers 3 [--entry-dte 14]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#111-one-sided-entry-gates)"
-  stamp: "c14119f2724d"
+  stamp: "08e51646803e"
 
 scripts/ex_div_gate_ab.py:
   group: Study
@@ -364,7 +364,7 @@ scripts/ex_div_gate_ab.py:
   writes: "a run record only (prints a table). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#113-the-ex-dividend-entry-block)"
-  stamp: "a9023469671e"
+  stamp: "0da93aed6516"
 
 scripts/gate_study.py:
   group: Study
@@ -394,7 +394,7 @@ scripts/dte_dimension_flatness.py:
   writes: "no files (prints a table). 5-minute bars are read with the database opened read-only; the engine runs it starts also open the history store, which creates any missing empty table in data/historical.db. A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/dte_dimension_flatness.py --symbol QQQ [--dtes 1 3 7 14] [--workers 3]"
   explained: "-"
-  stamp: "dbd34813dd7c"
+  stamp: "7d925c7d4a3c"
 
 scripts/iv_rank_parity_probe.py:
   group: Study
@@ -404,7 +404,7 @@ scripts/iv_rank_parity_probe.py:
   writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the pre-W91 research table set (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone. With --ab: A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/iv_rank_parity_probe.py [--research-prefix archive_w91_research_] [--ab --workers 6]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
-  stamp: "b3f61a43e4dd"
+  stamp: "180f8b1f91a5"
 
 scripts/range_horizon_study.py:
   group: Study
@@ -484,6 +484,15 @@ scripts/scaler_arms_study.py:
   example: "python scripts/scaler_arms_study.py [--entry-dtes 18,25] [--skip-stress]"
   explained: "-"
   stamp: "db4df27eb057"
+scripts/study_cli.py:
+  group: Developer
+  what: "Library module, not run directly: the --study-file / --no-run-record options, the study-aware process pool and the run record shared by gate_parity_ab, ex_div_gate_ab, dte_dimension_flatness and iv_rank_parity_probe."
+  when: "Never run by itself; read it to see how a study file reaches every worker of those four scripts."
+  needs_ib: "no"
+  writes: "nothing by itself (the scripts that import it write a run record in reports/runs/<run_id>/)."
+  example: "-"
+  explained: "-"
+  stamp: "ffc37462b995"
 
 scripts/paper_checkpoint.py:
   group: Study
