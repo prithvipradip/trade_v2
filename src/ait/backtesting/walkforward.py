@@ -1318,7 +1318,7 @@ class WalkForwardBacktester:
         # and are merged below).
         self._meta_status_by_window: dict[int, dict[str, str]] = {}
 
-        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in DB).
+        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in the store).
         # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
@@ -1327,6 +1327,7 @@ class WalkForwardBacktester:
             _vix_full: pd.DataFrame = _load_ohlcv(
                 "^VIX", days=_ctx_days, db_path=self._db_path,
                 table_prefix=self._table_prefix,
+                research=(self._db_path is not None),     # W106: the IB-stored VIX, as SPY below
             )
             # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
             if not _vix_full.empty and _vix_full.index.tz is not None:

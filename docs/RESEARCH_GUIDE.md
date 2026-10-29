@@ -36,9 +36,10 @@ Every row of history stored in `data/historical.db` carries a `source` tag sayin
 | Underlying daily OHLCV (SPY, QQQ, IWM) | `daily_prices` | `IB_TRADES_RTH` | daily retrain (append-only), `backfill_historical_data.py --mode daily` |
 | Daily implied vol (close) | `daily_prices.implied_vol` | `IB_OPTION_IV` | `ait.data.iv_refresh` (retrain, `--mode iv`), the bot for today |
 | Daily implied vol (OHLC) | `daily_iv` | `IB_OPTION_IV` | `ait.data.iv_refresh` |
-| VIX, VIX3M, VIX6M, VIX9D (/100) | `daily_iv` | `IB_INDEX_TRADES` | `ait.data.iv_refresh`, `--mode vix` |
+| VIX, VIX3M, VIX6M, VIX9D (/100; research reads `^VIX` from here on the index scale, Yahoo only when the store is short) | `daily_iv` | `IB_INDEX_TRADES` | `ait.data.iv_refresh`, `--mode vix` |
 | 5-minute bars | `intraday_prices` | `TRADES` | the bot (it only adds; no process deletes 5-minute bars, and the 730 days it reads for features is a load window, not a retention limit), `backfill_historical_data.py` |
 | Option daily bars + solved IV/greeks | `option_daily_bars` | Polygon | `backfill_option_history.py` |
+| Which option contracts were fetched, and how many bars came back | `option_fetch_log` | - | `backfill_option_history.py` |
 | Option bid/ask spreads | `option_spread_*`, `option_leg_spread_*` | `IB_BID_ASK_BARS` | `calibrate_option_spreads.py` |
 | Dividends | `dividends` | `YAHOO_DIVIDENDS` | `backfill_dividends.py` |
 | Earnings dates, QQQ holdings, econ schedule | `earnings_schedule`, `qqq_holdings`, `econ_schedule` | EDGAR / Fed / BLS tags | `build_research_calendars.py` |
