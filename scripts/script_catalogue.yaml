@@ -475,6 +475,15 @@ scripts/budget_ladder_study.py:
   example: "python scripts/budget_ladder_study.py [--entry-dtes 18,25] [--skip-stress]"
   explained: "-"
   stamp: "b8f73fa7710e"
+scripts/scaler_arms_study.py:
+  group: Study
+  what: "Walk-forward study of the condor's sizing scalers on a multi-lot book ($200,000 pool, 3% budget, lot cap 3, scalers on against off, with one-lot reference and sanity arms) under a pre-registered rule with a stressed-friction repeat."
+  when: "Before raising positions.max_contracts_per_trade on a large account, to decide whether position_sizing.scaled_strategies should list iron_condor (the pre-registered rule is in the script docstring and PLAN.md)."
+  needs_ib: "no"
+  writes: "reports/scaler_arms_study/entry_dte_<n>/ and stress_2x/ (per-arm .json), results.json, results.md; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/scaler_arms_study.py [--entry-dtes 18,25] [--skip-stress]"
+  explained: "-"
+  stamp: "db4df27eb057"
 
 scripts/paper_checkpoint.py:
   group: Study
