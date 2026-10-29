@@ -126,7 +126,10 @@ INVARIANTS: tuple[Invariant, ...] = (
         "A physical limit, not a preference: $1 is the narrowest wing the listed-strike "
         "grid offers. Lowering it asks for strikes that do not exist; raising it defeats "
         "the budget cap on small accounts. Live and the research engine share it.",
-        "strategies/iron_condor.py (_vol_scaled_width) and backtesting/engine.py"),
+        # W108 4b: + the credit verticals' budget-fitted wing (the text is published in GUIDE.md,
+        # where wave ids are not used).
+        "strategies/iron_condor.py (_vol_scaled_width), strategies/credit_spreads.py "
+        "(wing_width) and backtesting/engine.py"),
     Invariant(
         "PDT_MAX_DAY_TRADES", PDT_MAX_DAY_TRADES, "trades",
         "Day trades the bot allows itself inside PDT_WINDOW_DAYS trading days.",

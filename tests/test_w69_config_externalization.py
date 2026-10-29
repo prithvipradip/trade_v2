@@ -118,6 +118,9 @@ LEGACY = {
         "cash_secured_put": 0.5, "bull_call_spread": 0.6, "bear_put_spread": 0.6,
         "iron_condor": 0.4, "long_straddle": 1.2, "short_strangle": 0.8,
         "calendar_spread": 0.7, "event_straddle": 0.7,
+        # W108 4b: rows for the live credit verticals (not enabled; inert while
+        # position_sizing.scaled_strategies is empty). Not former literals.
+        "put_credit_spread": 0.6, "call_credit_spread": 0.6,
     },
     "learning.analyzer.strategy_poor_win_rate": 0.35,
     "learning.analyzer.strategy_strong_win_rate": 0.65,
