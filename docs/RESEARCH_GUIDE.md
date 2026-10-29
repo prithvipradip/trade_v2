@@ -477,7 +477,7 @@ it decides how every reported Sharpe and Sortino is annualized, so a study that 
 and the equity curve walk the same path. Every window's out-of-sample run starts at the pool again, so the total return is the windows' dollars added on one account, not the product of the window returns.
 
 **What is the carried-equity estimate?** `WalkForwardConfig(carry_equity=True)` keeps the normal run as the result (the parameters, the window models and the learner are chosen from it) and replays each window's
-out-of-sample period a second time, starting at the previous window's ending equity, so the per-trade budget and the aggregate-risk and per-symbol caps follow the account as it grows or shrinks. The replay is reported as
+out-of-sample period a second time, starting at the pool plus the P&L of every replayed trade closed before that window's first test day (a close on that day, or later in an overlapping window, never sizes its entries), so the per-trade budget and the aggregate-risk and per-symbol caps follow the account as it grows or shrinks. The replay is reported as
 `carried_estimate` on the result and as a block at the end of the summary. It is an estimate because the parameters were tuned at the fresh budget, not at the carried equity. The windows must be replayed in order, so it
 needs `optimize_n_jobs=1`; with parallel window workers the configuration refuses to start.
 

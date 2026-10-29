@@ -166,20 +166,28 @@ class TestCarriedEstimate:
         assert est.equity_basis == "carried_estimate" and est.carried_estimate is None
         assert est.initial_capital == gi.CAPITAL and est.windows
 
-    def test_each_carried_window_starts_at_the_previous_windows_ending_equity(self, on_run):
+    def test_each_carried_window_starts_with_only_the_pnl_closed_before_its_first_test_day(self, on_run):
+        """Review follow-up: not the previous window's ending equity (consecutive windows can share a boundary
+        day, and overlapping windows would size entries with P&L realised weeks later)."""
         est = on_run.carried_estimate
-        equity = gi.CAPITAL
+        earlier: list[dict] = []
         for w in est.windows:
             br = w.backtest_result
-            assert br.initial_capital == pytest.approx(equity), w.window_id
+            closed_before = sum(t["pnl"] for t in earlier
+                                if date.fromisoformat(str(t["exit_date"])[:10]) < w.test_start)
+            assert br.initial_capital == pytest.approx(gi.CAPITAL + closed_before), w.window_id
             assert br.final_capital == pytest.approx(br.initial_capital + sum(t["pnl"] for t in br.trades))
-            equity = br.final_capital
-        assert est.final_equity == pytest.approx(equity)
+            earlier.extend(br.trades)
 
-    def test_the_carried_total_return_is_both_the_chain_and_the_dollar_path(self, on_run):
+    def test_the_fixture_has_a_trade_closing_on_a_later_windows_first_test_day(self, on_run):
+        """So the test above is not vacuous: the old chain would have sized that morning with that close."""
         est = on_run.carried_estimate
-        chained = math.prod(1 + w.backtest_result.total_return for w in est.windows) - 1
-        assert est.total_return == pytest.approx(chained, rel=1e-9)
+        firsts = {w.test_start for w in est.windows}
+        assert any(date.fromisoformat(str(t["exit_date"])[:10]) in firsts
+                   for w in est.windows for t in w.backtest_result.trades)
+
+    def test_the_carried_total_return_is_the_dollar_path(self, on_run):
+        est = on_run.carried_estimate
         assert est.total_return == pytest.approx(_all_pnl(est) / gi.CAPITAL, rel=1e-9)
         assert est.total_return == pytest.approx(est.equity_curve()["equity"].iloc[-1] / gi.CAPITAL - 1, rel=1e-9)
 
@@ -196,6 +204,24 @@ class TestCarriedEstimate:
         assert "CARRIED-EQUITY ESTIMATE" not in off_run.summary()
         head = on_run.carried_estimate.summary()
         assert "CARRIED-EQUITY ESTIMATE" in head and "estimate" in head.lower()
+
+
+class TestCarriedEquityBefore:
+    """The rule itself, on hand-built trades."""
+
+    T = [{"exit_date": "2024-03-01", "pnl": -100.0}, {"exit_date": "2024-03-04", "pnl": 40.0},
+         {"exit_date": "2024-03-25", "pnl": 7.0}]
+
+    def test_a_close_on_the_first_test_day_does_not_size_that_day(self):
+        assert wf_mod.carried_equity_before(5000.0, self.T, date(2024, 3, 4)) == pytest.approx(4900.0)
+        assert wf_mod.carried_equity_before(5000.0, self.T, date(2024, 3, 5)) == pytest.approx(4940.0)
+
+    def test_overlapping_windows_see_only_what_closed_before_they_start(self):
+        assert wf_mod.carried_equity_before(5000.0, self.T, "2024-03-02") == pytest.approx(4900.0)
+        assert wf_mod.carried_equity_before(5000.0, self.T, "2024-04-01") == pytest.approx(4947.0)
+
+    def test_no_trades_is_the_pool(self):
+        assert wf_mod.carried_equity_before(5000.0, [], date(2024, 1, 2)) == 5000.0
 
 
 class _RecordingEngine(wf_mod.Backtester):

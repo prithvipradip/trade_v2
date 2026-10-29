@@ -1209,6 +1209,18 @@ def _isnan(v: object) -> bool:
         return False
 
 
+def carried_equity_before(initial_capital: float, carried_trades: list[dict], first_test_day) -> float:
+    """W108 S1: the equity a carried window starts with: `initial_capital` plus the realised P&L of the carried
+    trades that closed strictly before `first_test_day` (no P&L realised on or after it may size its entries)."""
+    cutoff = pd.Timestamp(str(first_test_day)).date()
+    realised = 0.0
+    for t in carried_trades:
+        exit_day = t.get("exit_date") or t.get("exit_time")
+        if exit_day and pd.Timestamp(str(exit_day)).date() < cutoff:
+            realised += float(t.get("pnl", 0.0) or 0.0)
+    return initial_capital + realised
+
+
 def _init_worker_settings(settings) -> None:
     """Pool initializer (W88a): make the PARENT's resolved settings this worker's configuration.
 
@@ -1486,11 +1498,16 @@ class WalkForwardBacktester:
             # Sequential: warm-starting and BacktestLearner adaptation are active.
             learner = BacktestLearner(base_confidence=self._config.min_confidence)
             prev_best_params: dict | None = None
-            # W108 S1: the carried equity entering the next window (carry_equity on): starts at the pool, then each
-            # carried window's ending equity (unchanged through a window with no carried candidates). Only the carried
-            # replay reads it; everything below that selects parameters reads the reset `wr`, as before.
-            _carried_equity = float(self._config.initial_capital)
+            # W108 S1: the carried equity entering the next window (carry_equity on): the pool plus the P&L of every
+            # carried trade CLOSED BEFORE that window's first test day. Not the previous window's ending equity: with
+            # the inclusive test ranges consecutive windows can share a boundary day (a trade closed at that day's
+            # close would size the same morning's entries) and overlapping windows (step_days < test_days) would size
+            # entries with P&L realised weeks later. Only the carried replay reads it; everything below that selects
+            # parameters reads the reset `wr`, as before.
+            _carried_trades: list[dict] = []
             for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
+                _carried_equity = carried_equity_before(
+                    float(self._config.initial_capital), _carried_trades, test_start)
                 prev_oos = window_results[-1].backtest_result if window_results else None
                 wr, curr_best_params, _meta_status = self._run_single_window(
                     window_id=i + 1,
@@ -1508,7 +1525,7 @@ class WalkForwardBacktester:
                 )
                 _cw = self._carried_by_window.get(i + 1)
                 if _cw is not None:
-                    _carried_equity = float(_cw.backtest_result.final_capital)
+                    _carried_trades.extend(_cw.backtest_result.trades)
                 if wr is not None:
                     window_results.append(wr)
                     if curr_best_params is not None:
