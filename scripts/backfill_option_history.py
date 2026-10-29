@@ -52,7 +52,9 @@ on each re-run (live, unexpired contracts are deliberately not fetched: that is
 one call per live contract per run). Cadence: roughly 1,550 new QQQ contracts a
 week, ~5.5h at the default pause.
   - First refresh: the plain command (full window) -- it also retries contracts
-    that failed or returned no bars last time.
+    that failed last time. A contract fetched AFTER it expired that came back empty
+    is recorded in option_fetch_log and skipped from then on (W106); --retry-empty
+    asks again.
   - Later refreshes: `--since-last` lists only expiries from the latest stored one
     onward (fast); run the plain command now and then to catch retries.
   - The run is capped at the underlying's last stored COMPLETED close in daily_prices
@@ -367,14 +369,28 @@ def process_contract(
     start_date: date,
     end_date: date,
     risk_free_rate: float,
+    retry_empty: bool = False,
 ) -> int:
     ticker = contract["option_ticker"]
     if store.option_ticker_has_data(ticker):
+        return 0
+    # W106: an expired contract that already came back empty stays empty.
+    if not retry_empty and store.option_fetch_is_final(ticker):
         return 0
 
     expiry = date.fromisoformat(contract["expiry"])
     fetch_to = min(expiry, end_date)
     bars = client.get_daily_bars(ticker, start_date, fetch_to)
+    saved = _store_bars(store, symbol, contract, bars or [], underlying_closes,
+                        expiry, risk_free_rate)
+    store.record_option_fetch(symbol, ticker, contract["expiry"], today_et(),
+                              len(bars or []), saved)
+    return saved
+
+
+def _store_bars(store, symbol, contract, bars, underlying_closes, expiry,
+                risk_free_rate) -> int:
+    ticker = contract["option_ticker"]
     if not bars:
         return 0
 
@@ -446,7 +462,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="W85: list only expiries from the latest one already "
                             "stored (inclusive) onward, instead of the whole window. "
                             "Fast weekly refresh; does NOT retry older contracts that "
-                            "failed or returned no bars -- run without it periodically.")
+                            "failed -- run without it periodically.")
+    parser.add_argument("--retry-empty", action="store_true",
+                       help="W106: also re-fetch contracts already fetched after they "
+                            "expired that came back empty (normally skipped: an expired "
+                            "contract's history cannot grow).")
     parser.add_argument("--dry-run", action="store_true",
                        help="Print the request plan without fetching or storing.")
     return parser.parse_args(argv)
@@ -553,7 +573,7 @@ def _run(argv: list[str] | None) -> int:
         try:
             rows = process_contract(
                 client, store, args.symbol, contract, underlying_closes,
-                start_date, end_date, r)
+                start_date, end_date, r, retry_empty=args.retry_empty)
         except Exception as e:  # noqa: BLE001 -- one bad contract must not kill the run
             log.warning("contract_fetch_failed", ticker=contract["option_ticker"],
                        error=str(e))

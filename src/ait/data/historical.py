@@ -116,6 +116,9 @@ class HistoricalDataStore:
         # run knows what is still owed without a state file (a row per capture, never updated).
         self._capture_log_table = f"{table_prefix}option_capture_log"
         self._option_daily_bars_table = f"{table_prefix}option_daily_bars"
+        # W106: one row per completed option-history fetch, so a contract that came back
+        # empty (never traded, or no underlying close) is not re-fetched on every run.
+        self._option_fetch_log_table = f"{table_prefix}option_fetch_log"
         self._risk_free_rates_table = f"{table_prefix}risk_free_rates"
         self._econ_events_table = f"{table_prefix}econ_events"
         # W84: past ex-dividend dates per symbol, for the research ex-dividend entry gate
@@ -426,6 +429,16 @@ class HistoricalDataStore:
             conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._option_daily_bars_table}_und_dt
                 ON {self._option_daily_bars_table}(underlying, date)
+            """)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._option_fetch_log_table} (
+                    option_ticker TEXT NOT NULL PRIMARY KEY,
+                    underlying    TEXT NOT NULL,
+                    expiry        TEXT NOT NULL,
+                    fetched_on    TEXT NOT NULL,
+                    bars          INTEGER NOT NULL,
+                    rows_saved    INTEGER NOT NULL
+                )
             """)
             # Historical risk-free-rate series (SOFR term structure) for
             # re-solving option_daily_bars' IV/greeks once real rates exist,
@@ -1431,6 +1444,28 @@ class HistoricalDataStore:
             row = conn.execute(
                 f"SELECT 1 FROM {self._option_daily_bars_table} "
                 f"WHERE option_ticker = ? LIMIT 1",
+                (option_ticker,),
+            ).fetchone()
+        return row is not None
+
+    def record_option_fetch(self, symbol: str, option_ticker: str, expiry: str,
+                            fetched_on: date, bars: int, rows_saved: int) -> None:
+        """W106: note a completed fetch (the latest one wins)."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {self._option_fetch_log_table} "
+                f"(option_ticker, underlying, expiry, fetched_on, bars, rows_saved) "
+                f"VALUES (?, ?, ?, ?, ?, ?)",
+                (option_ticker, symbol, expiry, fetched_on.isoformat(), int(bars), int(rows_saved)),
+            )
+
+    def option_fetch_is_final(self, option_ticker: str) -> bool:
+        """W106: was this contract fetched AFTER it expired? Then its history is complete
+        (an empty answer stays empty) and a plain run need not ask again."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM {self._option_fetch_log_table} "
+                f"WHERE option_ticker = ? AND fetched_on > expiry LIMIT 1",
                 (option_ticker,),
             ).fetchone()
         return row is not None
