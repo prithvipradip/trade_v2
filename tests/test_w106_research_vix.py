@@ -68,3 +68,43 @@ def test_the_walk_forward_asks_for_the_research_vix(tmp_path, monkeypatch):
     spy = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1.0}, index=idx)
     asyncio.run(wf.run(data={"SPY": spy}))
     assert seen["^VIX"].get("research") is True
+
+
+# --------------------------------------------------------------------------- review follow-up (2026-10-29)
+
+def _frame(end: str, close: float) -> pd.DataFrame:
+    idx = pd.bdate_range(end=end, periods=300)
+    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close, "Volume": 0.0}, index=idx)
+
+
+class _Loader:
+    def __init__(self, stored_end: str):
+        self.calls: list[bool] = []
+        self._stored_end = stored_end
+
+    def __call__(self, symbol, *, research, **kw):
+        self.calls.append(research)
+        return _frame(self._stored_end, 30.0) if research else _frame("2026-10-27", 18.0)
+
+
+def _wf(tmp_path):
+    return WalkForwardBacktester(["SPY"], ["iron_condor"], db_path=tmp_path / "h.db")
+
+
+DATA = {"SPY": _frame("2026-10-27", 1.0)}
+
+
+def test_a_stored_vix_that_stops_before_the_data_falls_back(tmp_path):
+    """The VIX family has its own writer and can lag the symbols (it ended 2026-08-25 once): a stale tail
+    would be forward-filled onto every later test day."""
+    loader = _Loader(stored_end="2026-08-25")
+    vix = _wf(tmp_path)._load_vix_context(loader, 400, DATA)
+    assert loader.calls == [True, False]
+    assert vix.index.max() == pd.Timestamp("2026-10-27") and vix["Close"].iloc[-1] == 18.0
+
+
+def test_a_current_stored_vix_is_used(tmp_path):
+    loader = _Loader(stored_end="2026-10-27")
+    vix = _wf(tmp_path)._load_vix_context(loader, 400, DATA)
+    assert loader.calls == [True]
+    assert vix["Close"].iloc[-1] == 30.0

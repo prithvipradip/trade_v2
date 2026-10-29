@@ -1402,14 +1402,7 @@ class WalkForwardBacktester:
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
         try:
             _ctx_days = self._context_days()
-            _vix_full: pd.DataFrame = _load_ohlcv(
-                "^VIX", days=_ctx_days, db_path=self._db_path,
-                table_prefix=self._table_prefix,
-                research=(self._db_path is not None),     # W106: the IB-stored VIX, as SPY below
-            )
-            # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
-            if not _vix_full.empty and _vix_full.index.tz is not None:
-                _vix_full.index = _vix_full.index.tz_localize(None)
+            _vix_full: pd.DataFrame = self._load_vix_context(_load_ohlcv, _ctx_days, data)
         except Exception:
             _vix_full = pd.DataFrame()
         try:
@@ -3564,6 +3557,30 @@ class WalkForwardBacktester:
         log.info("research_macro_calendar", event_types=list(cfg.macro_event_types),
                  span=span[:2], rows=span[2])
         return trimmed
+
+    def _load_vix_context(self, loader, ctx_days: int, data: "dict[str, pd.DataFrame]") -> pd.DataFrame:
+        """The ^VIX context frame: the IB-stored series on the research path (W106), the legacy path otherwise.
+
+        W106 review follow-up: the stored series is used only when it reaches the last day of the symbols'
+        data. The VIX family has its own writer and can fall behind them; the frame is forward-filled onto
+        every test day, so a stale store would hand every later day its last close, silently. A short
+        tail falls back to the legacy path (Yahoo, as before W106) with a warning."""
+        research = self._db_path is not None
+        vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
+                     research=research)
+        if research and not vix.empty:
+            ends = [df.index.max() for df in data.values() if df is not None and not df.empty]
+            data_last = max(ends) if ends else None
+            vix_last = vix.index.max()
+            if data_last is not None and pd.Timestamp(vix_last).tz_localize(None) < pd.Timestamp(data_last):
+                log.warning("research_vix_store_stale_yahoo_fallback", vix_last=str(vix_last),
+                            data_last=str(data_last))
+                vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
+                             research=False)
+        # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
+        if not vix.empty and vix.index.tz is not None:
+            vix.index = vix.index.tz_localize(None)
+        return vix
 
     def _ensure_iv_rank_series(self, data: "dict[str, pd.DataFrame]") -> None:
         """W68: IV rank over each symbol's FULL history, once per instance (the parallel path
