@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 import aiohttp
 
@@ -45,6 +45,15 @@ TICKER_TO_CIK = {
 # R5 audit: was a placeholder example.com address — SEC blocks non-compliant
 # UAs with persistent 403s, silently disabling the 8-K safety flatten.
 USER_AGENT = "AIT v2 Trading Bot prithvi.pradip@cluedigital.com"
+
+
+def _filing_time(filing_date: str, acceptance: str) -> datetime:
+    """When the filing became public, UTC: acceptanceDateTime when present, else
+    the END of filingDate (a bare date must not fall out of the window early)."""
+    if acceptance:
+        return datetime.fromisoformat(acceptance.replace("Z", "+00:00")).astimezone(timezone.utc)
+    d = datetime.strptime(filing_date, "%Y-%m-%d").date()
+    return datetime.combine(d, time.max, tzinfo=timezone.utc)
 
 
 @dataclass
@@ -111,14 +120,18 @@ class EDGARMonitor:
         recent = data.get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
         dates = recent.get("filingDate", [])
+        accepted = recent.get("acceptanceDateTime", [])
         accessions = recent.get("accessionNumber", [])
         primary_docs = recent.get("primaryDocument", [])
 
-        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        # W106: the window is measured on the acceptance time (UTC). filingDate is a
+        # bare date: read as midnight against a host-naive now - 24h it dropped a
+        # filing accepted late yesterday before the next morning's check.
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         filings = []
         for i in range(min(len(forms), 20)):  # last 20 filings only
             try:
-                filing_date = datetime.strptime(dates[i], "%Y-%m-%d")
+                filing_date = _filing_time(dates[i], accepted[i] if i < len(accepted) else "")
                 if filing_date < cutoff:
                     break  # filings are sorted desc; older = stop
                 filings.append(Filing(
