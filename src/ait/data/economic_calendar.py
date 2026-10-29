@@ -397,7 +397,14 @@ def derive_engine_event_types(df):
         if etype == "GDP":
             continue
         out[us & df["event"].eq(name)] = etype
-    gdp = df[us & df["event"].eq("U.S. Gross Domestic Product (GDP) QoQ")].copy()
+    # W106: a CPI release with no MoM headline row (2025-12-18, after the shutdown)
+    # is still a CPI date: tag its first headline-CPI row of any kind.
+    cpi_rows = us & df["event"].astype(str).str.startswith("U.S. Consumer Price Index (CPI)")
+    tagged_dates = set(df.loc[out.eq("CPI"), "event_date"])
+    for _d, grp in df[cpi_rows].groupby("event_date", sort=False):
+        if _d not in tagged_dates:
+            out[grp.index[0]] = "CPI"
+    gdp =df[us & df["event"].eq("U.S. Gross Domestic Product (GDP) QoQ")].copy()
     if not gdp.empty:
         gdp["_d"] = pd.to_datetime(gdp["event_date"])
         gdp = gdp.sort_values("_d")
