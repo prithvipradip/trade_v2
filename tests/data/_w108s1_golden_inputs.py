@@ -55,17 +55,25 @@ def _empty_context(*_a, **_k) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _no_earnings(*_a, **_k) -> set:
+    return set()
+
+
 def run(config=None, data=None):
-    """Run the REAL ``WalkForwardBacktester.run`` on the fixture (context loader stubbed; restored afterwards)."""
+    """Run the REAL ``WalkForwardBacktester.run`` on the fixture, offline: the VIX / SPY context loader returns an empty
+    frame and the engine's earnings-date lookup (a yfinance request; ETFs have none) an empty set. Both restored after."""
     import ait.data.market_data as md
+    from ait.backtesting.engine import Backtester
     from ait.backtesting.walkforward import WalkForwardBacktester
-    saved = md.load_daily_ohlcv
+    saved_loader, saved_earnings = md.load_daily_ohlcv, Backtester.__dict__["_load_earnings_dates"]
     md.load_daily_ohlcv = _empty_context
+    Backtester._load_earnings_dates = staticmethod(_no_earnings)
     try:
         bt = WalkForwardBacktester(list(SYMBOLS), ["iron_condor"], config=config or make_config())
         return asyncio.run(bt.run(data=data if data is not None else make_data()))
     finally:
-        md.load_daily_ohlcv = saved
+        md.load_daily_ohlcv = saved_loader
+        Backtester._load_earnings_dates = saved_earnings
 
 
 _TRADE_KEYS = ("symbol", "strategy", "entry_date", "exit_date", "exit_reason", "contracts", "pnl", "max_loss",
