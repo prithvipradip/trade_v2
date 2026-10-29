@@ -283,6 +283,11 @@ class PositionSizingConfig(_StrictModel):
             "short_strangle": 0.8,   # Undefined risk, margin required
             "calendar_spread": 0.7,  # Defined risk (debit), 2 expiries
             "event_straddle": 0.7,   # Defined risk (debit), capped at premium paid
+            # W108 4b: the live credit verticals (not enabled) take the other
+            # two-leg verticals' 0.6. Inert unless named in scaled_strategies;
+            # a study sets it before that, not this default.
+            "put_credit_spread": 0.6,   # Defined risk (max loss = width - credit)
+            "call_credit_spread": 0.6,
         },
         description="Per-strategy fraction of the position budget. A strategy "
                     "missing from this table is sized at 1.0 (the sizer's "
@@ -941,7 +946,9 @@ class SpreadTuningConfig(_StrictModel):
     ``wing_k``). RESEARCH ONLY: the live selector trades iron condors only, so these are for studies of the other structures
     before any of them is made live. Defaults = the pre-W90f literals. W108: the "open one lot anyway if it costs up to 25% of
     capital" fallback (``max_cost_fraction_of_capital``) is retired; every structure is sized by ait.risk.lot_sizing and a lot that
-    does not fit ``risk.max_position_risk_pct`` is refused, as live's gate 6b refuses it."""
+    does not fit ``risk.max_position_risk_pct`` is refused, as live's gate 6b refuses it. W108 4b: the live put / call credit
+    spread builders (``strategies/credit_spreads.py``, registered but not enabled) read ``wing_expected_move_fraction`` too;
+    this block may not appear in ``config.yaml``, so the live bot runs at the schema default."""
 
     wing_expected_move_fraction: float = Field(default=0.5, gt=0.0, le=5.0,
         description="Wing width of the iron butterfly, put / call credit spreads and jade lizard = wing_k x expected move x this "
