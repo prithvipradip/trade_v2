@@ -11,6 +11,7 @@ This is the single entry point for all trading logic.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import traceback
 from datetime import date, datetime, timedelta
@@ -362,7 +363,7 @@ class TradingOrchestrator:
         self._economic_cal = EconomicCalendar()
 
         # SEC EDGAR 8-K monitor — flatten positions on material events
-        self._edgar = EDGARMonitor(tracked_symbols=settings.trading.universe)
+        self._edgar = self._build_edgar_monitor(settings.trading.universe)
         self._edgar_check_count = 0
 
         # Trading
@@ -1521,6 +1522,27 @@ class TradingOrchestrator:
                 pass
             await self._note_loop_error("fast_monitor_error", str(e))
 
+    # W106: the 8-K accessions already acted on, persisted so a restart inside the 24 h look-back window
+    # does not flatten again (and close a position opened after the event was handled).
+    EDGAR_SEEN_KEY = "edgar_seen_accessions"
+    EDGAR_SEEN_KEEP = 500
+
+    def _build_edgar_monitor(self, universe: list[str]) -> EDGARMonitor:
+        seen: list[str] = []
+        try:
+            raw = self._state.get_state(self.EDGAR_SEEN_KEY)
+            seen = [str(a) for a in json.loads(raw)] if raw else []
+        except Exception as e:  # noqa: BLE001 - an unreadable record re-arms the window; say so
+            log.warning("edgar_seen_record_unreadable", error=str(e))
+        return EDGARMonitor(tracked_symbols=universe, seen=seen)
+
+    def _persist_edgar_seen(self) -> None:
+        try:
+            self._state.set_state(self.EDGAR_SEEN_KEY,
+                                  json.dumps(self._edgar.seen_accessions()[-self.EDGAR_SEEN_KEEP:]))
+        except Exception as e:  # noqa: BLE001 - never block the flatten; a restart may then repeat it
+            log.warning("edgar_seen_record_write_failed", error=str(e))
+
     async def _check_material_events(self) -> None:
         """Check for new SEC 8-K filings; flatten any held positions on the symbol."""
         try:
@@ -1545,6 +1567,10 @@ class TradingOrchestrator:
                 for pos in positions:
                     if pos.symbol == filing.symbol:
                         await self._execute_exit(pos)
+            if new_filings:
+                # W106: recorded AFTER the exits were sent: a crash mid-flatten re-fires on restart (the
+                # position is still open), a completed flatten does not fire again inside the window.
+                self._persist_edgar_seen()
         except Exception as e:
             # R5 audit: was log.debug — a permanently-failing 8-K check (e.g.
             # SEC blocking the UA) looked identical to "no filings" for months.
