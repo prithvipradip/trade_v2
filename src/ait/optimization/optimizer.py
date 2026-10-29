@@ -569,6 +569,14 @@ class StrategyOptimizer:
         cannot change any result (pure noise). Decided from the loaded data at the LOW
         end of IV (smallest expected move), so it only drops when the cap certainly
         binds; at a larger capital the cap stops binding and wing_k is searched again.
+
+        W108 S2: the exact condition, read off the engine's condor builder. The wing at
+        wing_k = k is ``free(k) = max(k x EM, wing_floor)``, replaced by the ceiling
+        ``max(1, round(affordable))`` whenever ``affordable < free(k)``. ``free`` never falls
+        as k rises, so the ceiling binds at EVERY k of [k_min, k_max] iff it binds at k_min:
+        ``affordable < max(k_min x EM, wing_floor)``. Below the floor that holds for every
+        entry whatever the market does. Only the symbol the trials trade is probed, and the
+        dimension is kept when another credit builder in the study reads the same wing_k.
         """
         self._dropped_params = set()
         # W67: with a condor-only strategy set the fractal gate's penalty cannot move any
@@ -601,12 +609,48 @@ class StrategyOptimizer:
         if not self._budget_aware_wings or "iron_condor" not in self._strategies:
             return
         spec = self._space("iron_condor").get("wing_k")
-        if not spec or not self._data:
+        if not spec:
+            return
+        # W108 S2: the dimension is SHARED. _run_backtest maps every `<strategy>__wing_k` onto the ONE engine
+        # wing_k, and every credit builder (the engine routes CREDIT_STRATEGIES to _build_credit_position, the
+        # only reader of wing_k) other than the condor reads it with NO budget cap: the butterfly, the wide /
+        # broken-wing condors, the credit spreads, the jade lizard. With one of them in the study the condor's
+        # cap does not make wing_k inert (measured: [iron_condor, iron_butterfly] at $5k / 5% built a
+        # 98/100/102 butterfly at k 0.3 and refused it at k 2.0, and the W65 rule dropped the dimension).
+        # Debit builders never read wing_k. The walk-forward runs one strategy per optimizer: unaffected.
+        from ait.strategies.base import CREDIT_STRATEGIES
+        _shared = sorted((set(self._strategies) - {"iron_condor"}) & CREDIT_STRATEGIES)
+        if _shared:
+            log.debug("optimizer_kept_shared_wing_k", param="iron_condor__wing_k", shared_with=_shared,
+                      note="another credit builder reads the same engine wing_k with no budget cap")
             return
         import math
         from ait.strategies.iron_condor import IronCondor
-        k_min = float(spec[1])
+        k_min, k_max = float(spec[1]), float(spec[2])
         affordable = IronCondor.affordable_width(self._initial_capital * self._position_size_pct)
+        # W108 S2: the engine's free wing is max(k x EM, wing_floor) (the floor the trials pass, bt_kwargs
+        # "wing_floor_dollars"). A ceiling below the floor binds at every k for every entry, with no market
+        # data needed: 3% of $5k = $150 -> ceiling 1.67 < $2 -> every condor is the same 2-wide at any k
+        # (measured with the builder: strikes 96/98/102/104 at k 0.3 and at k 2.0). The W65 test compared
+        # with k_min x EM only and kept searching whenever that fell under the ceiling (short DTE, a DTE
+        # study down to 1 day, a low-priced symbol). Like the W65 probe this reads the STARTING capital; the
+        # engine's budget follows in-sample equity, so a window that gains ~20% can lift a 1.67 ceiling to 2.
+        if affordable < self._wing_floor_dollars:
+            self._dropped_params |= {"iron_condor__wing_k"}
+            log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k", binds="wing_floor",
+                     affordable_wing=round(affordable, 2), wing_floor=round(self._wing_floor_dollars, 2),
+                     searched_range=[k_min, k_max],
+                     note="the per-trade budget's widest wing is below the wing floor, so every condor "
+                          "is built at the ceiling whatever wing_k is")
+            return
+        # W108 S2: probe ONLY the symbol the trials trade (_run_backtest backtests self._symbols[0]); the W65
+        # loop took the smallest expected move over every loaded symbol, so `--symbols SPY IWM` kept
+        # searching a dimension SPY's trials cannot see because of IWM. The frame is what run(data=) got:
+        # the walk-forward hands it {symbol: train_df}, the training slice only (no out-of-sample rows).
+        _symbol = self._symbols[0] if self._symbols else None
+        df = self._data.get(_symbol) if _symbol is not None else None
+        if df is None or df.empty:
+            return
         try:
             dte = int(self._settings.options.dte_range[0]) if self._settings else self._tuning.inert_probe_dte_fallback
         except Exception:  # noqa: BLE001
@@ -617,21 +661,20 @@ class StrategyOptimizer:
             dte = self._entry_dte
         if dte_search_space(self._dte_search):
             dte = max(1, int(self._dte_search.entry_dte[0]))
-        smallest_target = None
-        for df in self._data.values():
-            if df is None or df.empty:
-                return
-            spot = float(df["Close"].iloc[-1])
-            iv = self._tuning.inert_probe_iv_fallback
-            if "implied_vol" in df.columns and df["implied_vol"].notna().any():
-                iv = float(df["implied_vol"].dropna().quantile(self._tuning.inert_probe_iv_quantile))
-            target = k_min * spot * iv * math.sqrt(dte / 365.0)
-            smallest_target = target if smallest_target is None else min(smallest_target, target)
-        if smallest_target is not None and affordable < smallest_target:
+        spot = float(df["Close"].iloc[-1])
+        iv = self._tuning.inert_probe_iv_fallback
+        if "implied_vol" in df.columns and df["implied_vol"].notna().any():
+            iv = float(df["implied_vol"].dropna().quantile(self._tuning.inert_probe_iv_quantile))
+        smallest_target = k_min * spot * iv * math.sqrt(dte / 365.0)
+        # The floor branch returned above, so here max(k_min x EM, wing_floor) > affordable reduces to the
+        # expected-move term.
+        if affordable < smallest_target:
             self._dropped_params |= {"iron_condor__wing_k"}
-            log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k",
+            log.info("optimizer_dropped_inert_param", param="iron_condor__wing_k", binds="expected_move",
                      affordable_wing=round(affordable, 2),
                      smallest_searched_wing=round(smallest_target, 2),
+                     wing_floor=round(self._wing_floor_dollars, 2), symbol=_symbol, probe_dte=dte,
+                     probe_iv=round(iv, 4), searched_range=[k_min, k_max],
                      note="the per-trade budget caps the wing below every searched "
                           "wing_k, so the dimension cannot change any result")
 
