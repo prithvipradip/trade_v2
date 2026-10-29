@@ -26,7 +26,8 @@
 backtest:
   budget_aware_wings: true            # W64: research condor builder caps the wing to the budget like live
                                        # (IronCondor.affordable_width, $1 floor when capped) and rejects a
-                                       # structure whose max loss exceeds the budget.
+                                       # structure whose max loss exceeds the budget. W108 4a: also fits the
+                                       # credit-spread wing and the debit-spread width (ait.risk.width_sizing).
 
   # --- W65/W91: research history (stored IB history in the shared tables; the retrain only appends) ---
   history_start_date: 2024-01-01       # first day of the operator's economic-calendar CSV, so the research

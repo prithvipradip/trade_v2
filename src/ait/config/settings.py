@@ -1037,7 +1037,11 @@ class BacktestConfig(_StrictModel):
         description="W64: the walk-forward/optimizer condor builder caps the wing to "
                     "the per-trade budget exactly like live (IronCondor.affordable_"
                     "width, $1 floor when capped) and rejects a structure whose max "
-                    "loss exceeds the budget. False restores the old uncapped "
+                    "loss exceeds the budget. The same switch fits the put / call "
+                    "credit spread wing (widest $1 width at or below budget/100) and "
+                    "the bull call / bear put spread width (the widest whose debit "
+                    "fits, as live's spread builders do) with the shared rule in "
+                    "ait.risk.width_sizing (W108 4a). False restores the old uncapped "
                     "wing_k x expected-move wing for before/after comparisons only.")
     wing_floor_dollars: float = Field(default=2.0, ge=1.0, le=10.0,
         description="W70: THE minimum iron-condor wing, in dollars, for LIVE ENTRIES AND "
