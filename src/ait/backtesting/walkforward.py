@@ -1956,12 +1956,10 @@ class WalkForwardBacktester:
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
                 gates_mode=window_cfg.gates_mode,
-                iv_rank_gate=window_cfg.iv_rank_gate,
                 iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 regime_veto_gate=window_cfg.regime_veto_gate,            # W81
                 ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
                 ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
-                iv_rank_series=self._iv_rank_series.get(symbol),
                 fractal_veto_spread=window_cfg.fractal_veto_spread,
                 penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
@@ -2031,8 +2029,11 @@ class WalkForwardBacktester:
                 # independently re-reading + re-validating config.yaml.
                 settings=self._settings,
             )
-            # W52a / W66: symbol and store stay explicit at every construction (the W66 class guard reads the call).
-            bt = Backtester(symbol=symbol, db_path=self._db_path, **_oos_kwargs)  # W52a: the engine reads THIS store
+            # W52a / W66 / W68: symbol, store and the IV-rank inputs stay explicit at every construction (the W66 and
+            # W68 class guards read the call).
+            bt = Backtester(symbol=symbol, db_path=self._db_path,  # W52a: the engine reads THIS store
+                            iv_rank_gate=window_cfg.iv_rank_gate,
+                            iv_rank_series=self._iv_rank_series.get(symbol), **_oos_kwargs)
             result = bt.run()
             self._funnel_by_window.setdefault(window_id, {})[symbol] = dict(result.entry_funnel)
 
@@ -2092,6 +2093,8 @@ class WalkForwardBacktester:
                 # engine arguments, seeded with the carried equity: the engine's own budget (capital x size pct per
                 # lot, budget-aware wings) follows it. Nothing here feeds the learner, warm starts or best params.
                 _carried = Backtester(symbol=symbol, db_path=self._db_path,
+                                      iv_rank_gate=window_cfg.iv_rank_gate,
+                                      iv_rank_series=self._iv_rank_series.get(symbol),
                                       **{**_oos_kwargs, "initial_capital": float(carry_capital)}).run()
                 self._carried_funnel_by_window.setdefault(window_id, {})[symbol] = dict(_carried.entry_funnel)
                 for t in _carried.trades:
