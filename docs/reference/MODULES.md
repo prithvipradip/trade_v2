@@ -210,6 +210,7 @@ Reporting authorities shared by every operator-facing surface.
 | `pdt_guard.py` | Pattern Day Trader (PDT) protection. |
 | `position_sizer.py` | Volatility-adjusted position sizing with Kelly criterion. |
 | `scalers.py` | The sizing scalers and the inputs they read: ONE implementation, called by live and by research. |
+| `width_sizing.py` | The ONE budget-to-width rule for defined-risk verticals, shared by the live builders and the research engine. |
 
 ## `strategies/`
 

@@ -325,7 +325,8 @@ Everything else (features and their switches and windows, labels and validation,
 `position_sizing.scaled_strategies` (empty by default), and never below one lot; an adjustment above 1 never raises the count above what the budget allows. The adjustments are computed by
 one module ([`risk/scalers.py`](../src/ait/risk/scalers.py)) that the research engine calls too, on the same five inputs: the confidence the structure is sized on (a condor or strangle is sized on
 `ml.observe_mode_neutral_confidence` while the entry gates are off, on the range probability when they are on, other strategies on the direction confidence), implied volatility, IV rank (an unknown
-rank is neutral), the count of recent losing days, and VIX. The condor builder is handed the same budget to size the wings.
+rank is neutral), the count of recent losing days, and VIX. The condor builder is handed the same budget to size the wings; the debit-spread builders (not enabled) use it to narrow the
+spread until its debit fits, with the rule the research engine shares ([`risk/width_sizing.py`](../src/ait/risk/width_sizing.py)).
 
 With the shipped cap of 1 every trade is one lot. When the cap is raised, a new entry is a one-lot description that the risk manager sizes: it takes the count above, applies the correlation
 haircut, and then judges buying power, the per-trade limit, the aggregate cap, the per-symbol cap and the portfolio delta for the lots actually placed, trimming the count to the largest that passes.
