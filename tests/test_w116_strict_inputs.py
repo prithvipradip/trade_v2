@@ -229,7 +229,8 @@ class TestTheWalkForwardRefuses:
         assert asyncio.run(wf._fetch_data()) == {}
 
     def test_a_macro_gate_with_no_event_types_refuses_instead_of_using_the_hard_coded_list(self, tmp_path):
-        wf = _wf(tmp_path, macro_event_gate=True, macro_event_types=None)
+        wf = _wf(tmp_path, macro_event_gate=True)
+        wf._config.macro_event_types = None         # as if a caller cleared it after construction
         with pytest.raises(ResearchDataUnavailable) as e:
             wf._apply_research_calendar({"SPY": _bars()})
         assert "hard-coded" in e.value.gaps[0].found

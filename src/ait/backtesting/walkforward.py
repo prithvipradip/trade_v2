@@ -162,7 +162,7 @@ class WalkForwardConfig:
     history_days: int | None = None            # None -> legacy train+test+100
     vlmc_min_coverage: float | None = None     # 5-min day coverage needed for VLMC; W90b: None -> backtest.vlmc_min_coverage
     intraday_features: bool | None = None      # W116: None -> backtest.intraday_features (False = daily bars only, stated)
-    macro_event_types: "tuple[str, ...] | None" = None  # None -> hardcoded live calendar
+    macro_event_types: "tuple[str, ...] | None" = None  # W116: None -> backtest.macro_event_types (stored research calendar)
     max_windows: int | None = None             # keep only the LAST N windows (timing/pilot runs)
     wing_floor_dollars: float | None = None   # W70: None -> backtest.wing_floor_dollars (2.0; R6 parity: live iron_condor min wing is $2, not $5)
     # R20b (pre-registered PLAN 2026-08-21): was a hardcoded 1.0 — the frozen
@@ -437,6 +437,10 @@ class WalkForwardConfig:
             self.vlmc_min_coverage, "backtest", "vlmc_min_coverage", BacktestConfig, _settings))
         self.intraday_features = bool(resolve_config_value(      # W116
             self.intraday_features, "backtest", "intraday_features", BacktestConfig, _settings))
+        # W116: the macro gate reads the STORED research calendar by default (the hard-coded list has no date before
+        # 2026, so a study over earlier windows silently ran without a gate)
+        self.macro_event_types = tuple(resolve_config_value(
+            self.macro_event_types, "backtest", "macro_event_types", BacktestConfig, _settings))
         self.position_size_pct = resolve_position_size_pct(
             self.position_size_pct, _settings)
         self.max_contracts_per_trade = resolve_max_contracts_per_trade(
@@ -3572,7 +3576,9 @@ class WalkForwardBacktester:
         calendar's span with an ERROR rather than silently mixed. No table / no rows
         -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour)."""
         cfg = self._config
-        if self._strict and cfg.macro_event_gate and cfg.macro_event_types is None:
+        if not cfg.macro_event_gate:
+            return data                                   # W116: gate off (stated): no calendar to build, nothing trimmed
+        if self._strict and cfg.macro_event_types is None:
             from ait.data.research_inputs import DataGap, ResearchDataUnavailable
             raise ResearchDataUnavailable([DataGap(
                 "econ_events", None, "backtest.macro_event_types set, so the macro gate reads the stored calendar",

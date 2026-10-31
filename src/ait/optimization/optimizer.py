@@ -265,6 +265,8 @@ class StrategyOptimizer:
                 self._settings = _ls()
                 _bt_cfg = self._settings.backtest
             except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
+                if self._strict:                    # W116: a run on the model defaults is a different harness
+                    raise
                 self._settings = None
                 _bt_cfg = None
         if _bt_cfg is None:

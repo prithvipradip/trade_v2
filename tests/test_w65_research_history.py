@@ -226,7 +226,7 @@ class TestWalkForwardHistory:
         from ait.backtesting.walkforward import WalkForwardConfig
         c = WalkForwardConfig()
         assert c.history_start_date is None and c.history_days is None
-        assert c.macro_event_types is None and c.vlmc_min_coverage == pytest.approx(0.95)
+        assert c.macro_event_types == ('FOMC', 'CPI', 'NFP', 'PCE', 'GDP') and c.vlmc_min_coverage == pytest.approx(0.95)   # W116: the stored research calendar by default
 
 
 class TestVlmcConsistencyGuard:
