@@ -86,6 +86,9 @@ Comment-only edits in these files are still edits to a sensitive file: say so wh
 5. Regenerate the documentation tables: `python scripts/gen_docs.py` ([section 8](#8-maintaining-the-documentation)).
 6. Study it in research before turning it on: [MODELS.md](MODELS.md) "Changing a model setting".
 
+### Adding a research input
+If a study can read a new table or series, register it in `REGISTRY` in `data/research_inputs.py` (what applies, how it is checked against the stored window, the command that fixes a gap), read it through a loader that raises `ResearchDataUnavailable` instead of falling back, and list it in [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md) section 10.3. Never add a substitute for it: research does not mix sources. `tests/test_w116_preflight.py` fails when a research module reads a table nobody registered, and `tests/test_w116_data_policy.py` when a module imports `yfinance`, calls `resample_to_daily` or asks for daily bars without a window.
+
 ### Adding a strategy
 Subclass `Strategy` in `strategies/`, emit `Signal`s, register it in the selector, add its name to `CREDIT_STRATEGIES` or `UNDEFINED_RISK_STRATEGIES` if applicable (import these; do not copy them), give it a row in `position_sizing.strategy_risk`, decide which model gates it, and add an exit path in
 `exit_policy.py` if it differs. Enable it in `options.strategies` only by a recorded decision. Undefined-risk shapes additionally hit the executor's interlock.

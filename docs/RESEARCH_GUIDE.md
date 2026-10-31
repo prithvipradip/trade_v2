@@ -436,6 +436,8 @@ Fixed limits (not configurable, listed in [section 4](#4-configuration-where-eve
 
 **Declared models.** Two behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, and a window whose ML model fails to train trades ungated. They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
 
+**Known gap.** The nine macro features (the 2- and 10-year yields, their spread, the dollar index and their changes) are constants in research, while the live bot feeds real FRED values: research has no stored macro series to read. Until one exists, a model trained in research sees a different macro input than the one that trades. Storing the series and joining it with a one-day lag is recorded in PLAN.md as the open part of the data contract.
+
 ---
 
 ## 11. Research vs live
