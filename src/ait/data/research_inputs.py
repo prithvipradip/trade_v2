@@ -197,7 +197,8 @@ _BACKFILL = "python scripts/backfill_historical_data.py"
 
 def _years(req: ResearchRequest, win: "Window | None" = None) -> int:
     w = win or req.window
-    return max(1, -(-(date.today() - w.start).days // 365) + 1)
+    from ait.utils.time import today_et
+    return max(1, -(-(today_et() - w.start).days // 365) + 1)
 
 
 def _ro(db_path: "Path | str") -> sqlite3.Connection:
