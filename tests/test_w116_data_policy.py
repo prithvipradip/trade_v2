@@ -22,7 +22,6 @@ YFINANCE_ALLOWED = {
     "scripts/backfill_historical_data.py": "ingest tool",
     "scripts/calibrate_option_spreads.py": "ingest tool",
     # removed by later W116 packages (each deletes its entry from this list):
-    "scripts/gate_parity_ab.py": "WP5: its VIX closes",
 }
 # callers of HistoricalDataStore.resample_to_daily (the 5-minute -> daily stand-in); research code may not use it
 RESAMPLE_ALLOWED = {

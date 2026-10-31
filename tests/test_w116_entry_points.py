@@ -97,3 +97,26 @@ class TestTheScripts:
         report = json.loads(out[out.index('{\n  "window"'):])
         assert code == (0 if report["ok"] else 2) and report["window"] == ["2022-06-01", str(gi.LAST_SESSION)]
         assert "daily_prices" in report["checked"]
+
+
+class TestTheStudyScriptsPreflightTheirWindow:
+    def test_study_inputs_refuse_a_window_the_store_does_not_hold(self, tmp_path):
+        from ait.backtesting.study_harness import study_inputs
+        from ait.data.historical import HistoricalDataStore
+        db = tmp_path / "h.db"
+        HistoricalDataStore(db_path=db)
+        with pytest.raises(ResearchDataUnavailable) as e:
+            study_inputs(db, "QQQ", "2024-01-02", "2024-06-28")
+        assert {"daily_prices", "implied_vol", "friction_params"} <= {g.input for g in e.value.gaps}
+
+    def test_study_inputs_pass_on_a_complete_store(self, tmp_path):
+        import sqlite3
+        from ait.backtesting.study_harness import study_inputs
+        db = tmp_path / "h.db"
+        last = gi.seed(db)
+        with sqlite3.connect(db) as conn:
+            for table, extra in (("option_leg_spread_params", ""), ("option_leg_spread_band_params", ", '0-5'")):
+                cols = "(symbol, form, a, b, n, n_sessions, calibrated_on" + (", dte_band" if extra else "") + ")"
+                conn.execute(f"INSERT INTO {table} {cols} VALUES ('QQQ','linear',0.1,0.0,10,20,'2024-01-01'{extra})")
+        rd, data, features, ivr = study_inputs(db, "QQQ", "2022-06-01", str(last))
+        assert len(data) > 400 and "implied_vol" in data.columns

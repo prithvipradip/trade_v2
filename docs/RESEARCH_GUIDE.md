@@ -460,7 +460,7 @@ the research trending-down regime veto (`backtest.regime_veto_gate`), and live's
   live twin, a research-only gate (with its switch) or mechanics, and a test fails if the engine grows a reason without a row.
 - **The switch.** `backtest.regime_veto_gate` (schema default true). False skips the veto only; the day class is still recorded per entry (`regime_class`; a day the veto would have blocked is flagged `regime_veto_suppressed`). Its thresholds are
   `backtest.regime_down_threshold` and `regime_up_threshold`.
-- **Measure it:** `python scripts/gate_parity_ab.py --workers 3 [--entry-dte N]` (writes no rows, and a file only with `--dump`; the VIX closes come from Yahoo). Arms: baseline, regime veto off, vol cap off, both off; then live's VIX halt is applied after the fact (no slot
+- **Measure it:** `python scripts/gate_parity_ab.py --workers 3 [--entry-dte N]` (writes no rows, and a file only with `--dump`; the VIX closes are the IB-stored series). Arms: baseline, regime veto off, vol cap off, both off; then live's VIX halt is applied after the fact (no slot
   re-use). **Re-run it whenever the gate order, the IV-rank cap or the entry-DTE range changes: these gates only matter on the days that reach them.**
 - Research prices with `options.risk_free_rate`, the key live's Greeks read.
 

@@ -237,8 +237,12 @@ class _FakeBT:
 def fake_engine(monkeypatch):
     import ait.backtesting.engine as engine_mod
     import ait.backtesting.replay as replay_mod
+    import ait.data.research_inputs as inputs_mod
     monkeypatch.setattr(engine_mod, "Backtester", _FakeBT)
     monkeypatch.setattr(replay_mod, "ResearchData", _FakeRD)
+    # W116: study_inputs preflights the window against the real store; this fixture replaces the store's reader, so
+    # the preflight is replaced with it (it is tested on a seeded store in test_w116_entry_points)
+    monkeypatch.setattr(inputs_mod, "preflight_or_raise", lambda *a, **k: None)
     return _FakeBT
 
 

@@ -62,9 +62,22 @@ def study_engine_kwargs(*, data, symbol: str, db_path: Path, intraday_store, ent
 def study_inputs(db_path: Path, symbol: str, start: str, end: str):
     """(ResearchData, data slice, features, IV-rank series) for one symbol and window: the data-prep trio
     three of the scripts repeated. Imported lazily so ``apply_runtime_env_defaults()`` can run first."""
+    from datetime import date
+
     from ait.backtesting.replay import ResearchData
+    from ait.config.invariants_research import (
+        RESEARCH_MAX_DIVIDEND_GAP_DAYS, RESEARCH_MAX_EVENT_GAP_DAYS, RESEARCH_MAX_NULL_IV_RUN_SESSIONS)
     from ait.data.iv_rank import iv_rank_series
+    from ait.data.research_inputs import ResearchRequest, Window, preflight_or_raise
     from ait.ml.features import FeatureEngine
+
+    # W116: the window this study reads must be stored (bars, IV, the per-leg friction model and its bands) or the
+    # script does not start; the same check the walk-forward runs
+    preflight_or_raise(ResearchRequest(
+        window=Window(date.fromisoformat(start), date.fromisoformat(end)), symbols=(symbol,), db_path=db_path,
+        max_null_iv_run=RESEARCH_MAX_NULL_IV_RUN_SESSIONS, max_dividend_gap_days=RESEARCH_MAX_DIVIDEND_GAP_DAYS,
+        max_event_gap_days=RESEARCH_MAX_EVENT_GAP_DAYS, friction_per_leg=True, friction_bands=True),
+        context=f"study inputs {symbol}")
 
     rd = ResearchData(str(db_path), symbol)
     frame = rd.daily_frame()
