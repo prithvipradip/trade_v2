@@ -24,6 +24,7 @@ from typing import Any
 import optuna
 import pandas as pd
 
+from ait.backtesting.strict import resolve_strict  # W116
 from ait.optimization.objectives import OBJECTIVES
 from ait.optimization.param_spaces import (
     DTE_SEARCH_REPLACES, FRACTAL_GATE_SPACE, ML_SPACES, STRATEGY_SPACES, dte_search_space,
@@ -123,6 +124,7 @@ class StrategyOptimizer:
         table_prefix: str = "",         # W65: research table prefix for the standalone data fetch
         db_path: Any = None,             # W65: store holding the research tables
         history_start_date: Any = None,  # W65: trim the standalone fetch to this date
+        strict_inputs: bool | None = None,   # W116: None -> the module default (True); refuse, do not substitute
         wing_floor_dollars: float | None = None,   # W70: None -> backtest.wing_floor_dollars (was 5.0)
         # R20b review follow-up: was a hardcoded 1.0 that shadowed the
         # promoted live/config value (1.6) for any direct optimizer caller
@@ -232,6 +234,10 @@ class StrategyOptimizer:
         # self._wing_floor_dollars / _delta_iv_scale / _max_entry_vol_annual resolved below (W70)
         self._economic_calendar = economic_calendar
         self._table_prefix = table_prefix
+        self._strict = resolve_strict(strict_inputs)          # W116: refuse, do not substitute, for missing inputs
+        if db_path is None and self._strict:
+            from ait.data.historical import DB_PATH
+            db_path = DB_PATH                                 # W116: research reads the history database, always
         self._db_path = db_path
         self._history_start_date = history_start_date
         # W65: params removed from the search because they cannot affect the result
@@ -259,6 +265,8 @@ class StrategyOptimizer:
                 self._settings = _ls()
                 _bt_cfg = self._settings.backtest
             except Exception:  # noqa: BLE001 — no config.yaml -> field defaults
+                if self._strict:                    # W116: a run on the model defaults is a different harness
+                    raise
                 self._settings = None
                 _bt_cfg = None
         if _bt_cfg is None:
@@ -865,6 +873,7 @@ class StrategyOptimizer:
         # H2: pass full df for feature warmup; eval_start_date restricts new entries
         # to the val slice. In non-val_split mode eval_start_date is None (no restriction).
         bt = Backtester(
+            strict_inputs=self._strict,
             data=df,
             strategies=self._strategies,
             features_cache=self._features_cache,
@@ -910,9 +919,7 @@ class StrategyOptimizer:
             try:
                 df = load_daily_ohlcv(
                     symbol, days=fetch_days, db_path=self._db_path,
-                    table_prefix=self._table_prefix, start_date=self._history_start_date,
-                    research=True,
-                ) if self._db_path is not None else load_daily_ohlcv(symbol, days=fetch_days)   # W91: research = a db_path was given
+                    table_prefix=self._table_prefix, start_date=self._history_start_date)
                 if len(df) > 0:
                     df = df.tail(requested_days)
                     if len(df) >= self._tuning.min_backtest_rows:
@@ -924,5 +931,7 @@ class StrategyOptimizer:
                             requested_days=requested_days,
                         )
             except Exception as e:
+                if self._strict:
+                    raise                                     # W116: a symbol that cannot be loaded stops the study
                 log.warning("data_fetch_failed", symbol=symbol, error=str(e))
         return data

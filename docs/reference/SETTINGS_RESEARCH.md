@@ -4,7 +4,7 @@
 
 Every setting under `backtest` and `parity`: the research engine, learner, optimizer and parity tools. The sections research shares with the live bot (`ml`, `regime`, `meta_label`, `exit`, `options`, ...) are in [SETTINGS_LIVE.md](SETTINGS_LIVE.md); research reads them from `config.yaml`, and a study or `config_research.yaml` overrides only the keys it names. The *Shipped* column is the value research runs with: the overlay's value when `config_research.yaml` sets the key, else `config.yaml`'s, else the schema default. How the layers combine: [RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#4-configuration-where-every-value-lives).
 
-191 settings; 0 have no description in the schema yet (shown as `-`).
+193 settings; 0 have no description in the schema yet (shown as `-`).
 
 ## Backtest and research (`backtest`)
 
@@ -17,6 +17,8 @@ Every setting under `backtest` and `parity`: the research engine, learner, optim
 | `backtest.history_end_date` | `datetime.date \| None` | - | null | null | neither (schema default) | Research only. |
 | `backtest.default_symbols` | `list[str]` | - | [QQQ] | [QQQ] | config.yaml | The symbols a research entry point (run_backtest.py, run_optimizer.py) runs when --symbols is not given. |
 | `backtest.vlmc_min_coverage` | `float` | 0.5 - 1.0 | 0.95 | 0.95 | config_research.yaml | Minimum fraction of trading days that must have 5-min bars before the walk-forward trains with VLMC/intraday-fractal features. |
+| `backtest.intraday_features` | `bool` | - | true | true | neither (schema default) | Whether the walk-forward uses the stored 5-minute bars (the VLMC / intraday-fractal features and the engine's entry-window gate, limit fills and intraday exits). |
+| `backtest.earnings_exempt_symbols` | `list[str]` | - | [SPY, QQQ, IWM] | [SPY, QQQ, IWM] | neither (schema default) | Symbols that have no earnings (index ETFs), so the earnings entry gate does not apply to them. |
 | `backtest.macro_event_types` | `list[str]` | - | [FOMC, CPI, NFP, PCE, GDP] | [FOMC, CPI, NFP, PCE, GDP] | config_research.yaml | Which release types the RESEARCH macro-event gate blocks around (default = the five the live gate uses). |
 | `backtest.condor_any_direction` | `bool` | - | false | false | config_research.yaml | Research selects an iron-condor-only strategy set on ANY market direction, like live (live's IronCondor ignores market_direction; the engine only selected it on NEUTRAL days, ~81% of days removed on the 2024-2026 span). |
 | `backtest.friction_model` | `str` | - | per_leg_usd | per_leg_usd | config_research.yaml | Research option-friction model for iron condors. per_leg_usd = the fitted per-leg DOLLAR half-spread (option_leg_spread_params, from IB BID/ASK bars) paid on all four legs at entry AND exit; legacy = half_spread_pct x leg mid at entry and the same % on the net value at exit, which overcharged a $0.95-credit QQQ condor $0.669 vs ~$0.085 measured. |

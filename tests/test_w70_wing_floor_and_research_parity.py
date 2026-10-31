@@ -310,6 +310,9 @@ def fake_yfinance(monkeypatch):
 
 
 class TestEarningsWindowIsLives:
+    """The window arithmetic (live's 2 before / 1 after) on the STORED earnings schedule (W116: it used to be fetched
+    from Yahoo at the start of every engine)."""
+
     ED = date(2026, 10, 15)
 
     def _live_blocked(self, before, after):
@@ -317,32 +320,63 @@ class TestEarningsWindowIsLives:
         return {self.ED + timedelta(days=d) for d in range(-before, after + 1)
                 if -after <= (self.ED - (self.ED + timedelta(days=d))).days <= before}
 
-    def test_default_window_is_live_two_before_one_after(self, fake_yfinance):
+    @pytest.fixture
+    def store(self, tmp_path):
+        import sqlite3
+        from ait.data.historical import HistoricalDataStore
+        db = tmp_path / "h.db"
+        HistoricalDataStore(db_path=db)
+        with sqlite3.connect(db) as conn:
+            conn.execute("INSERT INTO earnings_schedule (accession, company_key, cik, filing_date, accepted_et, "
+                         "event_session, source) VALUES ('a1', 'XYZ', 1, '2026-10-14', '2026-10-14T16:30:00', ?, 'EDGAR')",
+                         (str(self.ED),))
+        return db
+
+    def _engine(self, db, strict=False):
         from ait.backtesting.engine import Backtester
-        got = Backtester._load_earnings_dates("XYZ", 2, 1)
-        assert got == {date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15),
-                       date(2026, 10, 16)}
+        eng = Backtester.__new__(Backtester)
+        eng._db_path, eng._research_table_prefix = db, ""
+        eng._earnings_exempt, eng._strict = frozenset({"SPY", "QQQ", "IWM"}), strict
+        return eng
+
+    def test_default_window_is_live_two_before_one_after(self, store):
+        got = self._engine(store)._load_earnings_dates("XYZ", 2, 1)
+        assert got == {date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)}
         assert got == self._live_blocked(2, 1)
 
-    def test_not_the_old_mirror_image(self, fake_yfinance):
+    def test_not_the_old_mirror_image(self, store):
         """The pre-W70 engine blocked [-1, +2] (10-14 .. 10-17)."""
-        from ait.backtesting.engine import Backtester
-        got = Backtester._load_earnings_dates("XYZ", 2, 1)
+        got = self._engine(store)._load_earnings_dates("XYZ", 2, 1)
         assert date(2026, 10, 17) not in got and date(2026, 10, 13) in got
 
-    def test_both_zero_is_off_and_blank_symbol_is_empty(self, fake_yfinance):
-        from ait.backtesting.engine import Backtester
-        assert Backtester._load_earnings_dates("XYZ", 0, 0) == set()
-        assert Backtester._load_earnings_dates(None, 2, 1) == set()
+    def test_both_zero_is_off_and_blank_symbol_is_empty(self, store):
+        eng = self._engine(store)
+        assert eng._load_earnings_dates("XYZ", 0, 0) == set()
+        assert eng._load_earnings_dates(None, 2, 1) == set()
 
-    def test_engine_reads_the_live_config_keys(self, fake_yfinance, clean_contract):
+    def test_engine_reads_the_live_config_keys(self, store, clean_contract):
         from ait.backtesting.engine import Backtester
         idx = pd.bdate_range("2024-01-02", periods=60)
         df = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
                            "volume": 1_000_000, "implied_vol": 0.2}, index=idx)
         s = Settings(earnings=EarningsConfig(buffer_days_before=3, buffer_days_after=0))
-        bt = Backtester(data=df, strategies=[IronCondor()], symbol="XYZ", settings=s)
+        bt = Backtester(data=df, strategies=[IronCondor()], symbol="XYZ", settings=s, db_path=store)
         assert bt._earnings_dates == {self.ED + timedelta(days=d) for d in (-3, -2, -1, 0)}
+
+    def test_an_etf_in_the_exempt_list_has_no_earnings_gate(self, store):
+        assert self._engine(store)._load_earnings_dates("SPY", 2, 1) == set()
+
+    def test_a_symbol_with_neither_a_schedule_nor_an_exemption_refuses_when_strict(self, store):
+        from ait.data.research_inputs import ResearchDataUnavailable
+        with pytest.raises(ResearchDataUnavailable) as e:
+            self._engine(store, strict=True)._load_earnings_dates("NOPE", 2, 1)
+        assert e.value.gaps[0].input == "earnings" and "earnings_exempt_symbols" in e.value.gaps[0].remedy
+        assert self._engine(store, strict=False)._load_earnings_dates("NOPE", 2, 1) == set()
+
+    def test_yahoo_is_never_asked_for_earnings(self, store, monkeypatch):
+        import yfinance
+        monkeypatch.setattr(yfinance, "Ticker", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Yahoo asked")))
+        assert self._engine(store)._load_earnings_dates("XYZ", 2, 1)
 
     def test_the_private_skip_days_parameter_is_gone(self):
         from ait.backtesting.engine import Backtester
@@ -368,6 +402,10 @@ EXEMPT: dict[str, str] = {
         "the live trainer has no meta-labeler retrain; the gate itself is off (enabled: false).",
     "exit.auto_hedge":
         "no hedging code exists anywhere in src/; docs/archive/AUDIT_R12.md's 'one flip from live' is false.",
+    "backtest.research_history":
+        "W116: run_backtest / run_optimizer read it to choose between the stored history and the legacy loader; the "
+        "legacy loader is gone (research always reads the stored history), so nothing reads it. Registered in PLAN.md "
+        "W116; whether to delete it is decided with the other unread settings, not here.",
     # Read, but only inside settings.py through a derived property, which this scan skips:
     "trading.first_hour_end_et": "read via TradingConfig.first_hour_end_hour (property)",
     "trading.midday_end_et": "read via TradingConfig.midday_end_hour (property)",

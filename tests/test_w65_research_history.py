@@ -115,10 +115,13 @@ class TestProvenanceColumns:
 # B. Loader: research tables first, legacy path unchanged
 # =========================================================================
 class TestResearchLoader:
-    def _seed(self, db: Path, n: int = 400, symbol: str = "SPY") -> None:
-        st = HistoricalDataStore(db_path=db, table_prefix="research_")
-        end = today_et() - timedelta(days=5)
-        idx = pd.bdate_range(end=end, periods=n)
+    """W116: the loader reads the stored history of the research tables or refuses (no legacy path to fall to)."""
+
+    def _seed(self, db: Path, n: int = 400, symbol: str = "SPY", prefix: str = "research_") -> pd.DatetimeIndex:
+        from ait.data.research_inputs import last_completed_session, sessions_between
+        st = HistoricalDataStore(db_path=db, table_prefix=prefix)
+        end = last_completed_session(today_et())
+        idx = pd.DatetimeIndex(pd.to_datetime(sessions_between(end - timedelta(days=int(n * 1.6)), end)[-n:]))
         df = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5,
                            "Volume": 5_000}, index=idx)
         st.save(symbol, df, source=SOURCE_IB_TRADES_RTH)
@@ -127,13 +130,14 @@ class TestResearchLoader:
         st.save_daily_iv(symbol, pd.Series([0.3], index=[pd.Timestamp(end) + pd.Timedelta(days=1)]))
         st.save(symbol, df.tail(1).set_axis([pd.Timestamp(today_et())]),
                 source=SOURCE_IB_TRADES_RTH)
+        return idx
 
     def test_sufficient_research_history_is_used_with_real_iv(self, tmp_path):
         from ait.data.market_data import load_daily_ohlcv
         db = tmp_path / "h.db"
-        self._seed(db)
+        idx = self._seed(db)
         with capture_logs() as logs:
-            df = load_daily_ohlcv("SPY", days=700, db_path=db, table_prefix="research_")
+            df = load_daily_ohlcv("SPY", db_path=db, table_prefix="research_", start_date=idx[0].date())
         assert len(df) == 400
         assert df["Close"].notna().all()                       # skeleton row dropped
         assert df.index.max() < pd.Timestamp(today_et())       # today's partial dropped
@@ -150,34 +154,26 @@ class TestResearchLoader:
         assert df.index.min() >= pd.Timestamp(start)
         assert 100 < len(df) < 160
 
-    def test_short_research_history_warns_and_falls_through(self, tmp_path, monkeypatch):
+    def test_short_research_history_refuses(self, tmp_path, monkeypatch):
         import ait.data.market_data as md
+        from ait.data.research_inputs import ResearchDataUnavailable
         db = tmp_path / "h.db"
         HistoricalDataStore(db_path=db, table_prefix="research_").save(
             "SPY", _ohlcv("2025-01-02", 30), source=SOURCE_IB_TRADES_RTH)
-        monkeypatch.setattr(HistoricalDataStore, "resample_to_daily",
-                            lambda self, symbol, days=730: pd.DataFrame())
-        monkeypatch.setattr(md, "yf", SimpleNamespace(Ticker=lambda s: SimpleNamespace(
-            history=lambda **k: pd.DataFrame())))
-        with capture_logs() as logs:
-            df = md.load_daily_ohlcv("SPY", days=400, db_path=db, table_prefix="research_")
-        assert df.empty
-        assert any(e["event"] == "research_store_short" and e["log_level"] == "warning"
-                   for e in logs)
+        asked = {"n": 0}
+        monkeypatch.setattr(md, "yf", SimpleNamespace(Ticker=lambda s: asked.update(n=asked["n"] + 1)))
+        with pytest.raises(ResearchDataUnavailable) as e:
+            md.load_daily_ohlcv("SPY", days=400, db_path=db, table_prefix="research_")
+        assert asked["n"] == 0 and e.value.gaps[0].input == "daily_prices"
 
-    def test_empty_prefix_and_index_symbols_never_touch_the_research_path(self, tmp_path, monkeypatch):
+    def test_the_prefix_selects_the_tables_and_the_other_set_is_never_read(self, tmp_path):
         import ait.data.market_data as md
-
-        def _boom(*a, **k):
-            raise AssertionError("research path must not run")
-
-        monkeypatch.setattr(md, "_load_research_daily", _boom)
-        monkeypatch.setattr(HistoricalDataStore, "resample_to_daily",
-                            lambda self, symbol, days=730: pd.DataFrame())
-        monkeypatch.setattr(md, "yf", SimpleNamespace(Ticker=lambda s: SimpleNamespace(
-            history=lambda **k: pd.DataFrame())))
-        md.load_daily_ohlcv("SPY", days=100, db_path=tmp_path / "h.db")                    # prefix ""
-        md.load_daily_ohlcv("^VIX", days=100, db_path=tmp_path / "h.db", table_prefix="research_")
+        from ait.data.research_inputs import ResearchDataUnavailable
+        db = tmp_path / "h.db"
+        idx = self._seed(db, prefix="")                         # data only in the shared (unprefixed) tables
+        assert len(md.load_daily_ohlcv("SPY", db_path=db, start_date=idx[0].date())) == 400
+        with pytest.raises(ResearchDataUnavailable):
+            md.load_daily_ohlcv("SPY", db_path=db, table_prefix="research_", start_date=idx[0].date())
 
 
 # =========================================================================
@@ -203,10 +199,10 @@ class TestWalkForwardHistory:
         import ait.data.market_data as md
         calls = []
 
-        def _fake(symbol, days=730, db_path=None, table_prefix="", start_date=None,
-                  end_date=None, research=None):
+        def _fake(symbol, days=None, db_path=None, table_prefix="", start_date=None,
+                  end_date=None):
             calls.append(dict(symbol=symbol, days=days, table_prefix=table_prefix,
-                              start_date=start_date, research=research))
+                              start_date=start_date, end_date=end_date))
             return _ohlcv("2023-06-01", 700)
 
         monkeypatch.setattr(md, "load_daily_ohlcv", _fake)
@@ -214,7 +210,7 @@ class TestWalkForwardHistory:
         bt = _wf(tmp_path, history_start_date=start)
         data = await bt._fetch_data()
         assert {c["table_prefix"] for c in calls} == {"research_"}
-        assert {c["research"] for c in calls if c["symbol"] != "^VIX"} == {True}     # W91: a db_path = research
+        assert {c["end_date"] for c in calls} == {None}                              # unpinned: no end passed
         assert all(c["start_date"] == start for c in calls)
         assert all(c["days"] >= (today_et() - start).days + 30 for c in calls)
         assert all(df.index[0] >= pd.Timestamp(start) for df in data.values())  # trimmed
@@ -230,7 +226,7 @@ class TestWalkForwardHistory:
         from ait.backtesting.walkforward import WalkForwardConfig
         c = WalkForwardConfig()
         assert c.history_start_date is None and c.history_days is None
-        assert c.macro_event_types is None and c.vlmc_min_coverage == pytest.approx(0.95)
+        assert c.macro_event_types == ('FOMC', 'CPI', 'NFP', 'PCE', 'GDP') and c.vlmc_min_coverage == pytest.approx(0.95)   # W116: the stored research calendar by default
 
 
 class TestVlmcConsistencyGuard:

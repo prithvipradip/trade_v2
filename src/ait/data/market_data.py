@@ -9,9 +9,11 @@ Data source priority: IBKR → Yahoo Finance
 Each source has proper error handling — if one fails, the next is tried.
 NO mock/fake data is ever returned.
 
-For daily OHLCV used in ML training and backtesting, use load_daily_ohlcv()
-which reads from the IB SQLite store (resampled from 5-min bars) and falls
-back to Yahoo Finance only when insufficient IB data is available.
+For daily OHLCV used in research and backtesting, use load_daily_ohlcv(), which
+reads the IB-stored history ONLY and refuses (ResearchDataUnavailable) when the
+store is missing anything: research never falls back to Yahoo or to resampled
+5-minute bars (W116). The live MarketDataService below keeps its IBKR -> Yahoo
+chain.
 """
 
 from __future__ import annotations
@@ -63,166 +65,63 @@ class Quote:
 
 def load_daily_ohlcv(
     symbol: str,
-    days: int = 730,
-    db_path: "Path | None" = None,
+    days: int | None = None,
+    db_path=None,
     table_prefix: str = "",
     start_date: "date | None" = None,
     end_date: "date | None" = None,
-    research: bool | None = None,
 ) -> pd.DataFrame:
-    """Load daily OHLCV — IB SQLite store first, Yahoo Finance fallback.
+    """Daily OHLCV for research, from the IB-stored history ONLY.
 
-    Tries to resample stored 5-min bars to daily OHLCV. Falls back to
-    Yahoo Finance when the store cannot cover the REQUESTED window.
+    W116: research never substitutes or mixes data sources. This reads ``daily_prices`` (and the VIX family from
+    ``daily_iv``) of the history database and nothing else: no resampled 5-minute bars, no Yahoo. If the store does not
+    hold every NYSE session of the window, or a row carries a source tag other than the IB one, it raises
+    ``ResearchDataUnavailable`` listing what is missing and the backfill command that closes each gap (the same check
+    the study preflight runs, so the two cannot disagree).
 
-    research-to-live-01 (R23 register; materialized 2026-08-31): the
-    sufficiency test used to be a fixed ``len(df) < 60``, independent of how
-    much history the caller asked for. The intraday store crossed 60 trading
-    days around 2026-08-26, so from then on every research entry point asking
-    for 730 days silently received ~63 — and the nightly backtest died with a
-    misattributed "No data fetched. Check internet connection." (reports/
-    backtest_20260831_164000.json, exit_code 1). Sufficiency is now measured
-    against the request.
-
-    Also left-joins stored IBKR implied_vol snapshots (from daily IV backfill)
-    onto the returned DataFrame as an `implied_vol` column. Rows without stored
-    IV have NaN in that column; callers should check before using.
-
-    W65: with a non-empty `table_prefix` (research runs: config
-    backtest.research_table_prefix) the IB-sourced `{prefix}daily_prices` table is
-    read FIRST — one consistent provider with real volume and real IV, written by
-    scripts/backfill_historical_data.py --mode daily/iv — and only a short result
-    falls through to the legacy path below with a WARNING. `start_date` (config
-    backtest.history_start_date) trims the frame and replaces `days` as the
-    requested span. An empty prefix is byte-identical to the pre-W65 behaviour.
+    The window is the run's own: ``start_date`` (else ``days`` back from the end, or from today when unpinned) to
+    ``end_date`` (else the last completed session). See ``ait.data.research_inputs.required_window``.
 
     Args:
-        symbol:  Ticker symbol.
-        days:    Calendar days of history requested (default 2 years).
-        db_path: Path to SQLite DB; uses production DB_PATH if None.
-        table_prefix: Research table prefix ("" = live tables, legacy path).
-        start_date:   Earliest date to return (research path only).
-        end_date:     W91: latest date to return (research path only; backtest.history_end_date).
-        research:     W91: read the stored-history path. None keeps the pre-W91 rule (a non-empty
-                      table_prefix); the tables are shared now, so callers pass it explicitly.
+        symbol:       Ticker (or ``^VIX`` / ``^VIX3M`` / ``^VIX6M`` / ``^VIX9D``, read from ``daily_iv`` on the index
+                      scale, VIX 15.3 and not 0.153).
+        days:         Calendar days of history when no ``start_date`` is given.
+        db_path:      History database; the production ``data/historical.db`` when None.
+        table_prefix: Research table prefix ("" = the shared tables).
+        start_date:   Earliest session needed (config ``backtest.history_start_date``).
+        end_date:     Latest session needed (config ``backtest.history_end_date``); a study pinned to it keeps its
+                      inputs while the shared tables grow.
 
     Returns:
-        DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol].
+        DataFrame with DatetimeIndex and [Open, High, Low, Close, Volume, implied_vol] (implied_vol is NaN on a
+        session with no stored value; the engine treats such a session as a no-entry day).
     """
-    from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
+    from ait.data.historical import DB_PATH as _DEFAULT_DB
+    from ait.data.research_inputs import required_window
 
-    _research_path = bool(table_prefix) if research is None else research
-    if _research_path and symbol in STORED_INDEX_SYMBOLS:
-        # W106: the VIX family is stored from IB since W91 (daily_iv, /100); Yahoo only as a fallback
-        _index = _load_stored_index_daily(
-            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date, end_date)
-        if _index is not None:
-            return _index
-    if _research_path and not symbol.startswith("^"):
-        # indices (^VIX) are not in the research store
-        _research = _load_research_daily(
-            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date, end_date)
-        if _research is not None:
-            return _research
-        # fall through to the legacy path (WARNING already logged)
-        if start_date is not None:
-            days = max(days, (today_et() - start_date).days + 30)
-
-    store = HistoricalDataStore(db_path=db_path or _DEFAULT_DB)
-    df = store.resample_to_daily(symbol, days=days)
-
-    # research-to-live-01: coverage is judged against what was ASKED FOR.
-    # ~252 trading days per calendar year; require 80% of the expected span
-    # (weekends/holidays//partial backfills make an exact match unrealistic)
-    # and keep the original absolute floor for short requests.
-    _expected = max(1, int(days * 252 / 365))
-    _needed = max(60, int(_expected * 0.8))
-    if len(df) < _needed:
-        if len(df) == 0:
-            # W52a: an EMPTY store is not "short coverage" — it is a run on
-            # a store that holds nothing for this symbol (no bars, no stored
-            # IBKR implied vol, no spread calibration), which the 2026-09-22
-            # post-FOMC study found reports a different harness (n 87 /
-            # PF 0.83 vs n 50 / PF 0.45, same code). Say so at WARNING.
-            log.warning("daily_ohlcv_store_empty_yahoo_only", symbol=symbol,
-                        db_path=str(getattr(store, "_db_path", db_path or _DEFAULT_DB)),
-                        requested_days=days,
-                        note="Yahoo is the only source for this frame; no "
-                             "stored implied vol will be joined")
-        else:
-            log.info("daily_ohlcv_yahoo_fallback", symbol=symbol, ib_rows=len(df),
-                     requested_days=days, expected_trading_days=_expected,
-                     needed=_needed)
-        try:
-            start = (today_et() - timedelta(days=days + 30)).isoformat()
-            ydf = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=False)
-            if not ydf.empty:
-                df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
-        except Exception as exc:
-            log.warning("yahoo_fallback_failed", symbol=symbol, error=str(exc))
-            if df.empty:
-                return pd.DataFrame()
-        # research-to-live-01: a SHORT result must never look like a healthy
-        # one — a study silently run on 63 days of history is worse than a
-        # study that refuses to run.
-        if len(df) < _needed:
-            log.warning("daily_ohlcv_coverage_short", symbol=symbol,
-                        rows=len(df), requested_days=days, needed=_needed,
-                        note="both the IB store and Yahoo came up short; "
-                             "research results on this frame are not "
-                             "representative of the requested window")
-    else:
-        log.info("daily_ohlcv_from_ib_store", symbol=symbol, rows=len(df),
-                 requested_days=days)
-
-    if df.empty:
-        return df
-
-    # Left-join stored IBKR implied_vol snapshots (NaN where not available)
-    try:
-        iv_series = store.load_daily_iv(symbol, days=days)
-        if not iv_series.empty:
-            # Align index timezone: df may be tz-naive or tz-aware
-            iv_idx = iv_series.index
-            df_idx = df.index
-            df_tz = getattr(df_idx, "tz", None)
-            iv_tz = getattr(iv_idx, "tz", None)
-            if df_tz is not None and iv_tz is None:
-                iv_idx = iv_idx.tz_localize(df_tz)
-            elif df_tz is None and iv_tz is not None:
-                iv_idx = iv_idx.tz_localize(None)
-            elif df_tz is not None and iv_tz is not None and str(iv_tz) != str(df_tz):
-                iv_idx = iv_idx.tz_convert(df_tz)
-            iv_aligned = pd.Series(iv_series.values, index=iv_idx, name="implied_vol")
-            df = df.join(iv_aligned, how="left")
-        else:
-            df["implied_vol"] = float("nan")
-    except Exception as exc:
-        log.debug("iv_join_failed", symbol=symbol, error=str(exc))
-        df["implied_vol"] = float("nan")
-
-    return df
+    db = db_path or _DEFAULT_DB
+    window = required_window(today=today_et(), days=days, start_date=start_date, end_date=end_date)
+    if symbol in STORED_INDEX_SYMBOLS:
+        return _load_stored_index_daily(symbol, window, db, table_prefix)
+    return _load_research_daily(symbol, window, db, table_prefix)
 
 
 # W106: research index symbols -> their `daily_iv` symbol (IB daily TRADES of the CBOE index, stored /100).
 STORED_INDEX_SYMBOLS = {"^VIX": "VIX", "^VIX3M": "VIX3M", "^VIX6M": "VIX6M", "^VIX9D": "VIX9D"}
 
 
-def _load_stored_index_daily(symbol, days, db_path, table_prefix, start_date, end_date):
-    """The stored IB series of an index on its own scale (VIX 15.3, not 0.153), or None when the store is
-    short (the caller then falls through to the legacy path, which ends at Yahoo)."""
+def _load_stored_index_daily(symbol, window, db_path, table_prefix) -> pd.DataFrame:
+    """The stored IB series of an index on its own scale (VIX 15.3, not 0.153) over ``window``; raises
+    ``ResearchDataUnavailable`` when the store does not hold every session of it."""
     from ait.data.historical import HistoricalDataStore
+    from ait.data.research_inputs import ResearchDataUnavailable, check_research_inputs, index_request
 
-    # The window ends where the query ends: end_date when the run is pinned, else today.
-    end = end_date or today_et()
-    start = start_date or (end - timedelta(days=days + 30))
-    span_days = max(1, (end - start_date).days) if start_date else days
-    needed = max(60, int(max(1, int(span_days * 252 / 365)) * 0.8))
+    db_symbol = STORED_INDEX_SYMBOLS[symbol]
+    report = check_research_inputs(index_request(db_symbol, window, db_path, table_prefix))
+    if not report.ok:
+        raise ResearchDataUnavailable(report.gaps, context=f"load_daily_ohlcv({symbol})")
     bars = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix).load_daily_iv_bars(
-        STORED_INDEX_SYMBOLS[symbol], start, end_date)
-    if len(bars) < needed:
-        log.warning("index_daily_store_short_yahoo_fallback", symbol=symbol, rows=len(bars), needed=needed)
-        return None
+        db_symbol, window.start, window.end)
     df = bars[["Open", "High", "Low", "Close"]].astype(float) * 100.0
     df["Volume"] = 0.0
     df["implied_vol"] = float("nan")
@@ -230,59 +129,26 @@ def _load_stored_index_daily(symbol, days, db_path, table_prefix, start_date, en
     return df
 
 
-def _load_research_daily(
-    symbol: str,
-    days: int,
-    db_path,
-    table_prefix: str,
-    start_date,
-    end_date=None,
-) -> "pd.DataFrame | None":
-    """W65: the stored-history path of load_daily_ohlcv. None = not sufficient.
-
-    W91: `end_date` (backtest.history_end_date) pins the last day returned, so a registered study keeps
-    its inputs while the shared tables keep growing."""
+def _load_research_daily(symbol, window, db_path, table_prefix) -> pd.DataFrame:
+    """One symbol's stored daily bars over ``window`` with its stored implied vol joined (NaN where absent); raises
+    ``ResearchDataUnavailable`` when the store does not hold every session of the window."""
     from ait.data.historical import HistoricalDataStore
+    from ait.data.research_inputs import ResearchDataUnavailable, check_research_inputs, prices_request
 
+    report = check_research_inputs(prices_request(symbol, window, db_path, table_prefix))
+    if not report.ok:
+        raise ResearchDataUnavailable(report.gaps, context=f"load_daily_ohlcv({symbol})")
     store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
-    today = today_et()
-    # The window ends where the query ends: end_date when the run is pinned, else today.
-    end = end_date or today
-    if start_date is not None:
-        start = start_date
-        span_days = max(1, (end - start_date).days)
-    else:
-        span_days = days
-        start = end - timedelta(days=days + 30)
-    df = store.load(symbol, start_date=start, end_date=end_date)
-    if not df.empty:
-        # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.
-        df = df.dropna(subset=["Close"])
-        # Drop today's partial session — same rule as resample_to_daily (A9).
-        df = df[df.index < pd.Timestamp(today)]
-    _expected = max(1, int(span_days * 252 / 365))
-    _needed = max(60, int(_expected * 0.8))
-    if len(df) < _needed:
-        log.warning("research_store_short", symbol=symbol, rows=len(df),
-                    needed=_needed, table_prefix=table_prefix,
-                    start=str(start),
-                    note="IB research history is short for this request; falling back "
-                         "to the legacy loader (5-min resample, then Yahoo). Run "
-                         "scripts/backfill_historical_data.py --mode daily"
-                         + (f" --table-prefix {table_prefix}" if table_prefix else ""))
-        return None
+    df = store.load(symbol, start_date=window.start, end_date=window.end)
+    # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.
+    df = df.dropna(subset=["Close"])
     df.index.name = "Date"
-    # Real IBKR implied vol from the same research prefix (NaN where absent).
-    try:
-        iv_series = store.load_daily_iv(symbol, days=span_days + 30)
-        df = df.join(iv_series.rename("implied_vol"), how="left") if not iv_series.empty \
-            else df.assign(implied_vol=float("nan"))
-    except Exception as exc:  # noqa: BLE001
-        log.debug("research_iv_join_failed", symbol=symbol, error=str(exc))
-        df = df.assign(implied_vol=float("nan"))
+    # The stored implied vol over the SAME window (NaN where a session has none).
+    iv_series = store.load_daily_iv(symbol, start_date=window.start, end_date=window.end)
+    df = df.join(iv_series.rename("implied_vol"), how="left") if not iv_series.empty \
+        else df.assign(implied_vol=float("nan"))
     log.info("daily_ohlcv_from_research_store", symbol=symbol, rows=len(df),
-             first=str(df.index[0].date()), last=str(df.index[-1].date()),
-             table_prefix=table_prefix)
+             first=str(df.index[0].date()), last=str(df.index[-1].date()), table_prefix=table_prefix)
     return df
 
 

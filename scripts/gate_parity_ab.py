@@ -20,7 +20,7 @@ arm's P&L sits on days live would have refused.
 
     python scripts/gate_parity_ab.py --workers 3                 # QQQ SPY IWM, 2024-01-02..2026-10-08
 
-Read-only: ``data/historical.db`` is opened ``mode=ro``; VIX closes come from Yahoo (network).
+Read-only: ``data/historical.db`` is opened ``mode=ro``; the VIX closes are the IB-stored series (W116: no Yahoo).
 Prints statistics only. Setup (fixed so the table is reproducible, as in
 ``iv_rank_parity_probe.py --ab``): ``bs_legacy`` pricing, per-leg friction with the short-DTE
 floor ASSERTED loaded, 1 contract, ``--entry-dte`` (default 14), ``condor_any_direction``,
@@ -74,15 +74,16 @@ def run_arm(task: dict) -> dict:
 
 
 def vix_prev_close(start: str, end: str):
-    """Series: previous session's VIX close, indexed by session date (Yahoo)."""
+    """Series: previous session's VIX close, indexed by session date (the IB-stored series; W116: no Yahoo)."""
     import pandas as pd
-    import yfinance as yf
+    from datetime import date
 
-    lo = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-    hi = (pd.Timestamp(end) + pd.Timedelta(days=3)).strftime("%Y-%m-%d")
-    df = yf.download("^VIX", start=lo, end=hi, progress=False, auto_adjust=False)
-    s = df["Close"]
-    s = s.iloc[:, 0] if hasattr(s, "columns") else s
+    from ait.data.market_data import load_daily_ohlcv
+
+    lo = (pd.Timestamp(start) - pd.Timedelta(days=10)).date()
+    hi = (pd.Timestamp(end) + pd.Timedelta(days=3)).date()
+    df = load_daily_ohlcv("^VIX", db_path=DB, start_date=lo, end_date=hi)       # raises if the store lacks it
+    s = df["Close"].copy()
     s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
     return s.astype(float).shift(1)
 

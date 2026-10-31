@@ -27,12 +27,14 @@ Backtesting engine for strategy validation before live trading.
 | `iv_surface.py` | An implied-vol surface fitted from REAL option bars (research only). |
 | `learner.py` | In-backtest self-learning adapter. |
 | `pool.py` | Shared-capital allocator for walk-forward. |
+| `preflight.py` | The research preflight for a walk-forward study: the run's resolved settings in, a ResearchRequest out. |
 | `pricing.py` | Black-Scholes pricing primitives for the backtest engine. |
 | `range_bank.py` | Per-horizon range models for ONE (window, symbol). |
 | `replay.py` | Research-vs-reality PARITY REPLAY (read-only). |
 | `result.py` | Backtest result container with performance metrics. |
 | `run_record.py` | The per-run record of a research run (what produced this number?). |
 | `settlement.py` | What happens to an option structure that reaches its expiry bell. |
+| `strict.py` | ONE switch for whether the research engine may substitute for a missing input. |
 | `study_harness.py` | The research "study harness" engine setup, defined once. |
 | `walkforward.py` | Walk-forward backtester with multi-symbol support. |
 
@@ -87,12 +89,14 @@ Backtesting engine for strategy validation before live trading.
 | `iv_rank.py` | The ONE definition of IV rank, shared by the live orchestrator and the research engine. |
 | `iv_refresh.py` | The one IB implied-vol refresh (script backfill and the daily retrain share it). |
 | `macro.py` | Macro / cross-asset data fetcher. |
+| `macro_store.py` | Stored macro series (the FRED yields and the dollar index) for research. |
 | `market_data.py` | Unified market data service with fallback chain. |
 | `multi_timeframe.py` | Multi-timeframe analysis — combines 5-min, daily, and weekly signals. |
 | `option_spread_sampler.py` | Pure helpers for sampling option bid/ask spreads from IB historical BID/ASK bars. |
 | `options_chain.py` | Options chain service — fetch, filter, and price options with Greeks. |
 | `quality.py` | Data quality validation — prevents trading on bad data. |
 | `research_calendars.py` | Parsers for the event calendars of the strike-aware range study (research only). |
+| `research_inputs.py` | The research data contract: what a study needs, whether the store has it, and what to run when it does not. |
 | `short_dte_collector.py` | Collect and fit 0-6 DTE option bid/ask friction from IB hourly BID/ASK bars. |
 | `synthetic_chain.py` | A deterministic Black-Scholes option chain for the sizing self-test. |
 

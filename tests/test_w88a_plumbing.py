@@ -40,10 +40,13 @@ def _engine(**kw):
 class TestResearchInvariants:
     def test_the_registry_is_complete_and_unique(self):
         names = [i.name for i in ri.RESEARCH_INVARIANTS]
-        assert len(names) == len(set(names)) == 6
+        assert len(names) == len(set(names)) == 11
         assert ri.research_invariant_values() == {
             "RESEARCH_DELTA_MIN": 0.05, "RESEARCH_DELTA_MAX": 0.45, "IV_SCALE_MIN": 0.5, "IV_SCALE_MAX": 1.5,
-            "SETTLEMENT_LOSS_TOLERANCE": 1e-6, "PROB_CLIP_EPS": 1e-7}
+            "SETTLEMENT_LOSS_TOLERANCE": 1e-6, "PROB_CLIP_EPS": 1e-7,
+            "RESEARCH_MAX_NULL_IV_RUN_SESSIONS": 3, "RESEARCH_MAX_DIVIDEND_GAP_DAYS": 100,
+            "RESEARCH_MAX_EVENT_GAP_DAYS": 120,
+            "RESEARCH_MAX_MACRO_GAP_DAYS": 5, "RESEARCH_MAX_MACRO_TAIL_DAYS": 10}   # W116: the data contract
         for i in ri.RESEARCH_INVARIANTS:
             assert i.what and i.why_fixed and i.enforced_in and len(i.why_fixed) > 20, i.name
 
@@ -103,7 +106,7 @@ class TestResearchInvariants:
         monkeypatch.setattr(ulog, "get_logger", lambda name: Log())
         rs.use_research_config()
         ev = [kw for e, kw in events if e == "research_fixed_limits_in_effect"]
-        assert len(ev) == 1 and ev[0]["limits"] == ri.research_invariant_values() and ev[0]["count"] == 6
+        assert len(ev) == 1 and ev[0]["limits"] == ri.research_invariant_values() and ev[0]["count"] == len(ri.RESEARCH_INVARIANTS)
 
     def test_the_run_record_carries_them(self):
         rec = rr.build_run_record(kind="backtest", name="x", settings=None, config_path=ROOT / "config.yaml",

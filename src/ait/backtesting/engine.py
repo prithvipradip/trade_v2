@@ -40,6 +40,7 @@ from ait.config.invariants_research import (  # W88a: fixed research limits, one
     SETTLEMENT_LOSS_TOLERANCE,
 )
 from ait.backtesting.result import BacktestResult
+from ait.backtesting.strict import resolve_strict  # W116: refuse, do not substitute, for missing inputs
 from ait.backtesting.ex_div import ex_div_blocks, sells_a_call  # W84: live's ex-div entry block
 # R20 #5a: credit TP ladder / DTE close / macro-flatten windows come from the
 # shared exit-policy module (pure, import-light) instead of a hand copy of
@@ -428,7 +429,11 @@ class Backtester:
         # via WalkForwardConfig.credit_tp_ladder). None = the shared live
         # ladder in exit_policy.CREDIT_TP_LADDER; live never sets this.
         credit_tp_ladder: Any = None,
+        # W116: None -> ait.backtesting.strict.STRICT_INPUTS_DEFAULT (True in production). When on, every input the
+        # engine used to invent for itself (IV, calendar, earnings, friction, the settings file) is a refusal.
+        strict_inputs: bool | None = None,
     ) -> None:
+        self._strict = resolve_strict(strict_inputs)
         # W70: load settings FIRST. Constructor knobs that have a config twin are None by
         # default and resolve here with the project-wide precedence explicit arg > loaded
         # settings.<section>.<field> > the config model's own default (resolve_config_value).
@@ -442,6 +447,10 @@ class Backtester:
                 from ait.config.settings import load_settings as _ls
                 _settings = _ls()
             except Exception as _e:  # noqa: BLE001 — no config.yaml -> per-field defaults
+                if self._strict:
+                    raise RuntimeError(
+                        f"research engine: settings could not be loaded from {os.getcwd()} ({_e}); a run on the "
+                        f"model defaults is a different harness. Run from the repository root.") from _e
                 _settings = None
                 # W52a: this used to be silent. A run from the wrong cwd is
                 # a different harness (every settings-backed knob at its
@@ -551,6 +560,7 @@ class Backtester:
         self._leg_spread_model = None  # set by _load_leg_spread_model() when per_leg_usd
         # W66: entry-funnel counters (see _reject / BacktestResult.entry_funnel)
         self._funnel: Counter = Counter()
+        self._declared: Counter = Counter()      # W116: counts of the declared modelling behaviours (see BacktestResult)
         self._max_contracts_per_trade = (
             int(max_contracts_per_trade) if max_contracts_per_trade else None)
         self._stop_loss_pct = stop_loss_pct
@@ -644,6 +654,7 @@ class Backtester:
             self._load_calibrated_spreads()
         if self._friction_model == "per_leg_usd":
             self._load_leg_spread_model()
+        self._earnings_exempt = {str(x).upper() for x in _bt(None, "earnings_exempt_symbols")}   # W116
         self._earnings_dates: set[date] = self._load_earnings_dates(
             symbol, earnings_buffer_days_before, earnings_buffer_days_after)
         self._ex_dates: list[date] | None = self._load_ex_dates()   # W84: after _symbol/_db_path
@@ -800,12 +811,21 @@ class Backtester:
         )
         self._macro_event_gate = macro_event_gate
         self._economic_cal = None
+        if macro_event_gate and economic_calendar is None and self._strict:
+            from ait.data.research_inputs import DataGap, ResearchDataUnavailable
+            raise ResearchDataUnavailable([DataGap(
+                "econ_events", None, "a stored research calendar passed to the engine (the hard-coded live list "
+                "has no dates before 2026)", "none passed",
+                "set backtest.macro_event_types and load the events with scripts/load_econ_calendar_csv.py, or "
+                "switch the macro gate off explicitly (macro_event_gate=false)")], context="Backtester")
         if macro_event_gate:
             try:
                 from ait.data.economic_calendar import EconomicCalendar
                 self._economic_cal = (economic_calendar if economic_calendar is not None
                                       else EconomicCalendar())
             except Exception:  # noqa: BLE001 — gate is best-effort, never fatal
+                if self._strict:
+                    raise
                 self._economic_cal = None
 
         # R16 #7: resolve the macro blackout window ONCE, from the same source
@@ -860,6 +880,11 @@ class Backtester:
         the labeler's ``min_probability`` was; it now reports the labeler's own cut, else ``meta_label.min_probability``."""
         mp = getattr(self._meta_labeler, "min_probability", None)
         return float(mp if mp is not None else self._meta_min_probability)
+
+    def _count_declared(self, name: str) -> None:
+        """W116: count one use of a declared modelling behaviour (partial engines built with __new__ count nothing)."""
+        if self._declared is not None:
+            self._declared[name] += 1
 
     def _reject(self, reason: str) -> None:
         """W66: record that an evaluated day ended in this entry rejection.
@@ -1656,6 +1681,8 @@ class Backtester:
             start_date=dates[0].date() if hasattr(dates[0], "date") else dates[0],
             end_date=last_date,
             entry_funnel=dict(self._funnel),
+            declared_models={**{k: int(v) for k, v in self._declared.items()},
+                             **{f"surface_legs_{k}": int(v) for k, v in self._surface_stats.items() if v}},
         )
 
         log.info(
@@ -1792,40 +1819,48 @@ class Backtester:
                  first=str(dates[0]), last=str(dates[-1]), mode=self._ex_div_mode)
         return dates
 
-    @staticmethod
-    def _load_earnings_dates(symbol: str | None, before_days: int,
-                             after_days: int) -> set[date]:
-        """Pre-fetch historical earnings dates from yfinance (Gap Z4).
+    def _load_earnings_dates(self, symbol: "str | None", before_days: int, after_days: int) -> set[date]:
+        """The days on which live's EarningsCalendar refuses entries, from the STORED earnings schedule.
 
-        Returns every calendar date inside the earnings danger window of any
-        announcement, so the main loop can do an O(1) membership test: the window
-        is live's — [earnings - before_days, earnings + after_days] — i.e. the
-        days on which live's EarningsCalendar refuses entries
-        (`-buffer_after <= days_until <= buffer_before`). W70: this used to build
-        `range(-1, skip_days + 1)` around each date, i.e. 1 day before to
-        `skip_days` AFTER — the mirror image of live's 2-before / 1-after.
-        Returns an empty set if symbol is None, both buffers are 0, or yfinance
-        is unavailable.
+        The window is live's: [earnings - before_days, earnings + after_days] around each event session
+        (`-buffer_after <= days_until <= buffer_before`). W70: this used to build `range(-1, skip_days + 1)`, the
+        mirror image of live's 2-before / 1-after.
+
+        W116: this used to ask Yahoo at the start of every Backtester and turn any failure into "no earnings" (at
+        debug level; it needed the optional lxml package, so it did nothing on a box without it). Now: an empty set
+        for a symbol with no earnings (``backtest.earnings_exempt_symbols``, the index ETFs) or when both buffers are
+        0; otherwise the dates of the stored ``earnings_schedule``; a symbol with neither raises.
         """
         if not symbol or (before_days <= 0 and after_days <= 0):
             return set()
-        try:
-            import yfinance as yf
-            from datetime import timedelta
-            ticker = yf.Ticker(symbol)
-            eds = getattr(ticker, "earnings_dates", None)
-            if eds is None or (hasattr(eds, "empty") and eds.empty):
-                return set()
-            danger_dates: set[date] = set()
-            for idx_val in eds.index:
-                ed = idx_val.date() if hasattr(idx_val, "date") else idx_val
-                for delta in range(-int(before_days), int(after_days) + 1):
-                    danger_dates.add(ed + timedelta(days=delta))
-            log.debug("earnings_dates_loaded", symbol=symbol, count=len(danger_dates))
-            return danger_dates
-        except Exception as e:
-            log.debug("earnings_dates_load_failed", symbol=symbol, error=str(e))
+        if symbol.upper() in self._earnings_exempt:
             return set()
+        from datetime import timedelta
+        from ait.data.historical import HistoricalDataStore
+        rows = []
+        if self._db_path is not None:
+            try:
+                rows = HistoricalDataStore(db_path=self._db_path, table_prefix=self._research_table_prefix) \
+                    .load_earnings_sessions(symbol.upper())
+            except Exception as e:  # noqa: BLE001
+                if self._strict:
+                    raise
+                log.warning("earnings_schedule_unreadable", symbol=symbol, error=str(e))
+        if not rows:
+            if self._strict:
+                from ait.data.research_inputs import DataGap, ResearchDataUnavailable
+                raise ResearchDataUnavailable([DataGap(
+                    "earnings", symbol, f"stored earnings dates for {symbol}, or {symbol} listed in "
+                    f"backtest.earnings_exempt_symbols", "no rows",
+                    f"python scripts/build_research_calendars.py --what earnings, or list {symbol} in "
+                    f"backtest.earnings_exempt_symbols if it has no earnings")], context="Backtester")
+            return set()
+        danger: set[date] = set()
+        for ed in rows:
+            for delta in range(-int(before_days), int(after_days) + 1):
+                danger.add(ed + timedelta(days=delta))
+        log.debug("earnings_dates_loaded", symbol=symbol, count=len(danger))
+        return danger
 
     def _parse_et_time(self, time_str: str):
         """Parse an HH:MM Eastern Time string into a datetime.time object."""
@@ -2030,6 +2065,7 @@ class Backtester:
                     return pred.direction, pred.confidence, features_df
             except Exception:
                 pass
+        self._count_declared("direction_fallback_days")      # W116: declared: no model direction this day
         direction, confidence = self._simple_direction(hist)
         return direction, confidence, features_df
 
@@ -2176,8 +2212,9 @@ class Backtester:
         dte_term = self._spread_dte_sensitivity * max(0.0, iv_model.HALF_SPREAD_REF_DTE - dte)
         return min(self._spread_cap, self._spread_base + iv_term + dte_term)
 
-    def _get_iv(self, hist: pd.DataFrame, market_context: dict | None = None) -> float:
-        """Return IV for the current bar, in priority order:
+    def _get_iv(self, hist: pd.DataFrame, market_context: dict | None = None) -> "float | None":
+        """Return IV for the current bar, in priority order (W116: with ``strict_inputs`` only the first applies and
+        a session with no stored IV returns None):
 
         1. Stored IBKR daily implied_vol from the backfill (most realistic).
         2. VIX proxy from market_context — accepts scalar or full DataFrame.
@@ -2188,6 +2225,16 @@ class Backtester:
         (iv < iv_floor → no trade) is enforced separately in _build_position so
         that _get_iv remains a pure estimation function.
         """
+        if self._strict:
+            # W116: the stored IV of the LAST session in ``hist`` (the previous session when entries are priced at a
+            # later fill time), or none. A session without it is a no-entry day, counted by the caller; no VIX proxy,
+            # no realized-vol stand-in, no value carried over from an earlier session.
+            if "implied_vol" in hist.columns and len(hist):
+                last = hist["implied_vol"].iloc[-1]
+                if pd.notna(last) and float(last) > 0:
+                    return float(last)
+            return None
+
         # Priority 1: stored IBKR IV
         if "implied_vol" in hist.columns:
             last_iv = hist["implied_vol"].dropna()
@@ -2235,6 +2282,9 @@ class Backtester:
     # knobs. Tests (and any harness) build partial engines with ``Backtester.__new__``
     # and set only what they need; those instances must stay on LEGACY semantics
     # (the same idiom as the W70 executor durations). __init__ overwrites all four.
+    _earnings_exempt: frozenset = frozenset()   # W116: set from backtest.earnings_exempt_symbols by __init__
+    _declared = None                        # W116: a Counter set by __init__; partial engines count nothing
+    _strict: bool = False                   # W116: partial engines (Backtester.__new__) keep the synthetic-inputs behaviour
     _engine_model: str = "legacy"
     _friction_short_dte: bool = False       # W76
     _friction_bands = None                  # W76: BandedFriction when friction_short_dte
@@ -2329,9 +2379,17 @@ class Backtester:
                 _store = (HistoricalDataStore(db_path=self._db_path)
                           if self._db_path is not None else HistoricalDataStore())
                 row = _store.load_leg_spread_model(sym)
-            except Exception as e:  # noqa: BLE001 — reported below, never blocks a run
+            except Exception as e:  # noqa: BLE001 — reported below
+                if self._strict:
+                    raise
                 log.warning("friction_params_unreadable", symbol=sym, error=str(e))
         if not row:
+            if self._strict:
+                from ait.data.research_inputs import DataGap, ResearchDataUnavailable
+                raise ResearchDataUnavailable([DataGap(
+                    "friction_params", sym, f"a fitted per-leg friction model for {sym} (friction_model=per_leg_usd)",
+                    "none stored", f"python scripts/calibrate_option_spreads.py --source ib-bars --symbols {sym} "
+                    f"--dte-targets 10 21 35 --client-id 91")], context="Backtester")
             log.warning("friction_params_absent", symbol=sym,
                         note="friction_model=per_leg_usd requested but no fitted model; "
                              "using the LEGACY % model for this symbol")
@@ -2350,7 +2408,9 @@ class Backtester:
         from ait.backtesting.friction import BandedFriction, LegSpreadModel
         try:
             rows = store.load_leg_spread_band_models(sym)
-        except Exception as e:  # noqa: BLE001 - reported, never blocks a run
+        except Exception as e:  # noqa: BLE001 - reported
+            if self._strict:
+                raise
             log.warning("friction_bands_unreadable", symbol=sym, error=str(e))
             rows = {}
         usable, short = {}, []
@@ -2456,6 +2516,9 @@ class Backtester:
                                                   close=_session_close(expiry_override))
                 iv_hist = fill_ctx["iv_hist"]
         iv = self._get_iv(iv_hist, market_context=market_context)
+        if iv is None:                                   # W116: no stored IV for the session -> a counted no-entry day
+            self._reject("builder:iv_missing")
+            return None
         if self._surface is not None:
             # W75: strike selection and the expected move use the TARGET EXPIRY's
             # at-the-money IV (live reads the chain's ATM IV for that expiry), not
@@ -3289,10 +3352,22 @@ class Backtester:
     # Exit logic — handles both debit and credit positions
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _surface_refusal(sym: str, found: str) -> None:
+        """W116: pricing_source=surface was asked for and cannot be served: the study does not silently price from
+        the legacy model instead."""
+        from ait.data.research_inputs import DataGap, ResearchDataUnavailable
+        raise ResearchDataUnavailable([DataGap(
+            "option_daily_bars", sym or None, "a fitted IV surface from the stored option bars", found,
+            f"python scripts/backfill_option_history.py --symbol {sym or '<SYMBOL>'}, or set "
+            f"backtest.pricing_source to bs_legacy")], context="Backtester")
+
     def _load_surface(self):
         """Build/load the real-bar IV surface for this symbol, or None (with a WARNING)."""
         sym = (self._symbol or "").upper()
         if not sym:
+            if self._strict:
+                self._surface_refusal(sym, "the engine has no symbol")
             log.warning("surface_pricing_unavailable", reason="engine has no symbol",
                         fallback="bs_legacy")
             return None
@@ -3306,10 +3381,14 @@ class Backtester:
             surf = build_or_load(db, sym, db.parent / "research_cache",
                                  **fit_params(self._surf), **lookup_params(self._surf))
         except Exception as exc:  # noqa: BLE001 - research must degrade loudly, not crash
+            if self._strict:
+                self._surface_refusal(sym, f"the surface could not be built ({exc})")
             log.warning("surface_pricing_unavailable", symbol=sym, error=str(exc),
                         fallback="bs_legacy")
             return None
         if len(surf) == 0:
+            if self._strict:
+                self._surface_refusal(sym, "no smiles in the stored option bars")
             log.warning("surface_pricing_unavailable", symbol=sym, reason="no smiles in the bars",
                         fallback="bs_legacy")
             return None
@@ -3363,6 +3442,7 @@ class Backtester:
         entry_iv = pos.get("entry_iv") or pos.get("iv", self._iv_floor)
         if hist is None:
             return entry_iv
+        self._count_declared("iv_blend_remarks")             # W116: declared model: entry IV blended with realized vol
         return iv_model.remark_iv(entry_iv, hist["Close"].values, self._iv_floor)
 
     def _eod(self, d: date) -> datetime:

@@ -525,7 +525,7 @@ The offline backtest has its own, separate learner that adapts between walk-forw
 |---|---|---|
 | Quotes, option chains, option marks, account, positions, orders | Interactive Brokers | The only source for option chains and the only broker. Market-data type is an entitlement setting (delayed vs live) |
 | Daily bars (training, features) | IB history stored in `historical.db` | The daily retrain takes IB bars only and stores nothing if any series is missing |
-| Fallback for quotes and bars | Yahoo Finance, after IB | The market-data service tries IB, then Yahoo, with explicit price-basis rules (unadjusted for dividends) so bars from different sources are not mixed silently. Never mock data |
+| Fallback for quotes and bars | Yahoo Finance, after IB | The market-data service tries IB, then Yahoo, with explicit price-basis rules (unadjusted for dividends) so bars from different sources are not mixed silently. Never mock data. Research does not use this chain: it reads the stored IB history only and refuses to start when an input is missing ([RESEARCH_GUIDE.md](RESEARCH_GUIDE.md) section 10.3) |
 | Historical option bars | Polygon | Used only by the option-history backfill script for research, not by the live bot |
 | Macro (yield curve, dollar) | FRED CSV | Cross-asset features |
 | Calendars | Hard-coded economic calendar, earnings and dividend services with last-known-good caches, SEC EDGAR 8-K feed | Unknown data refuses entries rather than allowing them |
@@ -623,7 +623,7 @@ never logged, and are never copied into reports.
 | `position_sizing` | The position sizer's multiplier curves (confidence, volatility, IV rank, per-strategy risk, drawdown, VIX tiers) | 10 | `config.yaml` | [GUIDE.md](GUIDE.md#72-sizing) |
 | `risk` | Risk-manager gates: per-trade and aggregate risk, concentration, VIX and IV-rank limits, the circuit breaker and the daily-loss brake | 21 | `config.yaml` | [GUIDE.md](GUIDE.md#7-risk-management) |
 | `options` | Option-chain liquidity filters, the entry expiry band and which strategies are enabled | 7 | `config.yaml` | [GUIDE.md](GUIDE.md#4-entry-pipeline), [GUIDE.md](GUIDE.md#5-strategies) |
-| `backtest` | The research engine, walk-forward, learner, optimiser, friction and data settings (research only; a few are shared with live) | 187 | `config_research.yaml` | [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md#4-configuration-where-every-value-lives) |
+| `backtest` | The research engine, walk-forward, learner, optimiser, friction and data settings (research only; a few are shared with live) | 189 | `config_research.yaml` | [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md#4-configuration-where-every-value-lives) |
 | `ml` | Models: labels, validation, hyperparameters, features with their switches and windows, the retrain, drift and the entry-gate mode | 158 | `config.yaml` | [MODELS.md](MODELS.md) |
 | `regime` | The rule-based regime classifier's thresholds | 29 | `config.yaml` | [MODELS.md](MODELS.md#8-the-regime-classifier) |
 | `meta_label` | The meta-labeler gate and the guards before it can act | 10 | `config.yaml` | [MODELS.md](MODELS.md#7-the-models-one-by-one) |

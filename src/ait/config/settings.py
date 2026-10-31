@@ -1024,6 +1024,16 @@ class BacktestConfig(_StrictModel):
                     "walk-forward trains with VLMC/intraday-fractal features. Below it the run "
                     "falls back to daily-only features with a WARNING instead of mixing windows "
                     "with and without VLMC inside one run.")
+    intraday_features: bool = Field(default=True,
+        description="W116: whether the walk-forward uses the stored 5-minute bars (the VLMC / intraday-fractal "
+                    "features and the engine's entry-window gate, limit fills and intraday exits). True: the bars "
+                    "must cover vlmc_min_coverage of every symbol's sessions or the study refuses to start. False: "
+                    "the study runs on daily bars only, stated here and stamped in the run record. It is never "
+                    "switched off silently.")
+    earnings_exempt_symbols: list[str] = Field(default=["SPY", "QQQ", "IWM"],
+        description="W116: symbols that have no earnings (index ETFs), so the earnings entry gate does not apply to "
+                    "them. A symbol that is neither listed here nor covered by the stored earnings_schedule refuses "
+                    "the study; the earnings dates are no longer fetched from Yahoo at the start of every run.")
     macro_event_types: list[str] = Field(default=["FOMC", "CPI", "NFP", "PCE", "GDP"],
         description="W65: which release types the RESEARCH macro-event gate blocks around "
                     "(default = the five the live gate uses). Subset of FOMC, CPI, NFP, GDP, PCE.")

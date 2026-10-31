@@ -656,6 +656,14 @@ class HistoricalDataStore:
                 f"ORDER BY ex_date", (symbol,)).fetchall()
         return [(date.fromisoformat(d), a) for d, a in rows]
 
+    def load_earnings_sessions(self, company_key: str) -> "list[date]":
+        """W116: the first session that can react to each stored earnings release of ``company_key``, ascending."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT event_session FROM {self._earnings_schedule_table} WHERE company_key=? "
+                f"ORDER BY event_session", (company_key,)).fetchall()
+        return [date.fromisoformat(d) for (d,) in rows]
+
     def dividends_span(self, symbol: str) -> "tuple[str, str, int] | None":
         """(first_ex_date, last_ex_date, rows) for a symbol, or None when it has none."""
         with sqlite3.connect(self._db_path) as conn:
@@ -785,24 +793,34 @@ class HistoricalDataStore:
         self,
         symbol: str,
         days: int = 504,
+        start_date: "date | None" = None,
+        end_date: "date | None" = None,
     ) -> "pd.Series":
         """Load stored implied_vol values for a symbol.
 
         Returns a Series with DatetimeIndex, values are float IV (or NaN where
         implied_vol was not stored).  Only rows with non-NULL implied_vol are
         returned — callers should left-join against the OHLCV index.
+
+        W116: with ``start_date`` the window is explicit (``start_date`` .. ``end_date``). Without it the cutoff is
+        ``days + 30`` back from NOW, which is wrong for any window that does not end today: a study pinned in the past
+        silently lost the IV at the start of its window (the live callers keep this form).
         """
         from datetime import timedelta, timezone
-        cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days + 30)).date().isoformat()
+        if start_date is not None:
+            cutoff = str(start_date)
+        else:
+            cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days + 30)).date().isoformat()
+        query = (f"SELECT date, implied_vol FROM {self._daily_table} "
+                 f"WHERE symbol = ? AND date >= ? AND implied_vol IS NOT NULL")
+        params: list = [symbol, cutoff]
+        if end_date is not None:
+            query += " AND date <= ?"
+            params.append(str(end_date))
+        query += " ORDER BY date"
 
         with sqlite3.connect(self._db_path) as conn:
-            df = pd.read_sql_query(
-                f"""SELECT date, implied_vol FROM {self._daily_table}
-                   WHERE symbol = ? AND date >= ? AND implied_vol IS NOT NULL
-                   ORDER BY date""",
-                conn,
-                params=(symbol, cutoff),
-            )
+            df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
             return pd.Series(dtype=float, name="implied_vol")

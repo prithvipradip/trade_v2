@@ -65,6 +65,20 @@ class TestFractalReportSmoke:
         fig = plot_ic_analysis(df, pd.Series(df["fwd_return_5d"].values, index=df.index))
         assert fig is not None
 
+    @staticmethod
+    def _seeded_db(tmp_path: Path) -> str:
+        """W116: the report reads the stored IB history only (it used to fall back to Yahoo, i.e. the network)."""
+        import numpy as np
+        from ait.data.historical import SOURCE_IB_TRADES_RTH, HistoricalDataStore
+        idx = pd.bdate_range("2022-06-01", "2023-12-29")
+        rng = np.random.default_rng(3)
+        close = 400.0 * np.cumprod(1 + rng.normal(0.0003, 0.01, len(idx)))
+        frame = pd.DataFrame({"Open": close, "High": close * 1.005, "Low": close * 0.995, "Close": close,
+                              "Volume": 5_000_000.0}, index=idx)
+        db = tmp_path / "h.db"
+        HistoricalDataStore(db_path=db).save("SPY", frame, source=SOURCE_IB_TRADES_RTH)
+        return str(db)
+
     def test_generate_report_creates_html(self, tmp_path: Path) -> None:
         from ait.diagnostics.report import generate_report
         generate_report(
@@ -73,6 +87,7 @@ class TestFractalReportSmoke:
             end="2023-12-31",
             output_dir=str(tmp_path),
             fmt="html",
+            db_path=self._seeded_db(tmp_path),
         )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1, "generate_report must produce at least one .html file"
@@ -85,6 +100,7 @@ class TestFractalReportSmoke:
             end="2023-12-31",
             output_dir=str(tmp_path),
             fmt="html",
+            db_path=self._seeded_db(tmp_path),
         )
         csv_files = list(tmp_path.glob("ic_summary.csv"))
         assert len(csv_files) == 1, "generate_report must produce ic_summary.csv"

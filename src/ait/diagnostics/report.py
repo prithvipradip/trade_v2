@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 try:
     _PLOTLY = True
@@ -55,9 +54,8 @@ def generate_report(
 ) -> None:
     """Generate fractal + VLMC diagnostic report for each symbol.
 
-    Fetches daily data via the IB SQLite store (``load_daily_ohlcv``), falling
-    back to Yahoo Finance when fewer than 50 trading days are available in the
-    store.  Computes fractal features, loads intraday data from SQLite for VLMC
+    Fetches daily data via the IB SQLite store (``load_daily_ohlcv``; it raises
+    when the store does not hold the window, there is no Yahoo fallback).  Computes fractal features, loads intraday data from SQLite for VLMC
     plots, and writes one HTML file per symbol plus ic_summary.csv.
 
     Args:
@@ -91,20 +89,11 @@ def generate_report(
 
         try:
             from datetime import date as _date
-            # Fetch enough history to cover start date from today
-            days = (today_et() - _date.fromisoformat(start)).days + 30
-            df = load_daily_ohlcv(symbol, days=days, db_path=store_path)
+            # W116: the IB-stored history over the requested range, or ResearchDataUnavailable (no Yahoo fallback)
+            df = load_daily_ohlcv(symbol, db_path=store_path, start_date=_date.fromisoformat(start),
+                                  end_date=_date.fromisoformat(end))
             if df is not None and not df.empty:
-                df = df.loc[start:end]
                 df.index.name = "Date"
-
-            # If IB store doesn't cover the requested date range, fetch from Yahoo directly
-            if df is None or len(df) < 50:
-                import yfinance as _yf
-                ydf = _yf.Ticker(symbol).history(start=start, end=end, interval="1d")
-                if ydf is not None and not ydf.empty:
-                    df = ydf[["Open", "High", "Low", "Close", "Volume"]].copy()
-                    df.index.name = "Date"
 
             if df is None or df.empty:
                 log.warning("no_data_for_symbol", symbol=symbol)
@@ -133,11 +122,11 @@ def generate_report(
 
         vix_df = None
         try:
-            vix_df = yf.Ticker("^VIX").history(start=start, end=end, interval="1d")
-            if vix_df is not None and not vix_df.empty:
-                vix_df = vix_df[["Close"]].copy()
-        except Exception:
-            pass
+            # W116: the IB-stored VIX over the same range; a store that lacks it leaves the VIX panel out, said in the log
+            vix_df = load_daily_ohlcv("^VIX", db_path=store_path, start_date=_date.fromisoformat(start),
+                                      end_date=_date.fromisoformat(end))[["Close"]].copy()
+        except Exception as exc:
+            log.warning("vix_unavailable_for_report", symbol=symbol, error=str(exc))
 
         intraday_df: pd.DataFrame | None = None
         if intraday_store is not None:

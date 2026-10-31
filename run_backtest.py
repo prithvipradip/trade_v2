@@ -488,9 +488,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--table-prefix", default=None,
                    help="History table prefix (default: config backtest.research_table_prefix, '' = the one "
                         "shared set of tables since W91).")
-    p.add_argument("--legacy-history", action="store_true",
-                   help="W91: ignore the stored history and use the legacy loader (5-min resample / Yahoo) for "
-                        "this run (the old `--table-prefix ''`).")
     p.add_argument("--db-path", default="data/historical.db",
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--max-windows", type=int, default=None,
@@ -540,7 +537,7 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
             search_space_hash=space_hash(spaces) if spaces else None,
             seeds={"optimize_seed": getattr(cfg, "optimize_seed", None)},
             metrics={k: v for k, v in metrics.items() if v is not None},
-            extra={"parity_manifest": manifest})
+            extra={"parity_manifest": manifest, "data_contract": getattr(result, "data_contract", None)})
         print(f"\n  Run record: {run_dir}" + (f"  (MLflow run {mlflow_id})" if mlflow_id else ""))
     except Exception as exc:  # noqa: BLE001 - a record failure must never fail the research run
         print(f"\n  ! run record not written ({type(exc).__name__}: {exc})")
@@ -620,24 +617,18 @@ async def run_backtest(args: argparse.Namespace) -> None:
         from ait.config.settings import load_settings
         _bcfg = load_settings().backtest
     except Exception as _exc:  # noqa: BLE001
-        print(f"  ! config unavailable ({_exc}); research defaults off")
-        _bcfg = None
+        print(f"  ! config unavailable ({_exc}): a run on the model defaults is a different harness. "
+              f"Run from the repository root.", file=sys.stderr)
+        sys.exit(2)
     _prefix = (args.table_prefix if args.table_prefix is not None
                else (_bcfg.research_table_prefix if _bcfg else ""))
-    # W91: the tables are shared, so "research" is its own switch (backtest.research_history), not an empty prefix;
-    # an explicit non-empty --table-prefix still means research on that set.
-    _research = (not args.legacy_history) and (bool(_prefix) or bool(_bcfg and _bcfg.research_history))
-    _start = (None if args.history_days is not None
-              else (_bcfg.history_start_date if (_bcfg and _research) else None))
-    _end = (_bcfg.history_end_date if (_bcfg and _research) else None)
-    _hist_days = (args.history_days if args.history_days is not None
-                  else (_bcfg.history_days if (_bcfg and _research) else None))
-    if _research:
-        print(f"  History:    stored history tables '{_prefix}*' in {args.db_path} | "
-              f"{'from ' + str(_start) if _start else str(_hist_days) + ' days'}"
-              f"{' | pinned end ' + str(_end) if _end else ''}")
-    else:
-        print("  History:    legacy loader (5-min resample / Yahoo), live tables")
+    # W116: research reads the stored history, always (there is no legacy loader to choose instead)
+    _start = None if args.history_days is not None else _bcfg.history_start_date
+    _end = _bcfg.history_end_date
+    _hist_days = args.history_days if args.history_days is not None else _bcfg.history_days
+    print(f"  History:    stored history tables '{_prefix}*' in {args.db_path} | "
+          f"{'from ' + str(_start) if _start else str(_hist_days) + ' days'}"
+          f"{' | pinned end ' + str(_end) if _end else ''}")
 
     cfg = WalkForwardConfig(
         gates_mode=args.gates_mode,
@@ -645,8 +636,8 @@ async def run_backtest(args: argparse.Namespace) -> None:
         history_start_date=_start,
         history_end_date=_end,
         history_days=_hist_days,
-        vlmc_min_coverage=(_bcfg.vlmc_min_coverage if _bcfg else BacktestConfig().vlmc_min_coverage),   # W90a: schema default
-        macro_event_types=(tuple(_bcfg.macro_event_types) if (_bcfg and _research) else None),
+        vlmc_min_coverage=_bcfg.vlmc_min_coverage,
+        macro_event_types=tuple(_bcfg.macro_event_types),
         train_days=args.train_days,
         test_days=args.test_days,
         step_days=args.step_days,
@@ -675,18 +666,23 @@ async def run_backtest(args: argparse.Namespace) -> None:
         symbols=args.symbols,
         strategies=args.strategies,
         config=cfg,
-        db_path=(Path(args.db_path) if _research else None),
+        db_path=Path(args.db_path),
         table_prefix=_prefix,
     )
 
+    # W116: every input the study needs, checked together before anything is loaded
+    from ait.data.research_inputs import format_report, preflight_or_raise
+    print(f"\n[0/3] Research data preflight...")
+    print(format_report(preflight_or_raise(bt.research_request(), context="run_backtest")))
+
     # Fetch data
-    print(f"\n[1/3] Fetching historical data ({'IB research tables' if _research else 'IB store / Yahoo'})...")
+    print(f"\n[1/3] Fetching historical data (IB-stored history)...")
     t0 = time.time()
     data = await bt._fetch_data()
     fetch_time = time.time() - t0
 
     if not data:
-        print("ERROR: No data fetched. Check internet connection.")
+        print("ERROR: No data fetched: the history database holds nothing for these symbols.")
         sys.exit(1)
 
     # Normalize to tz-naive: Yahoo/IB can return tz-aware (America/New_York)
@@ -810,7 +806,13 @@ async def run_backtest(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    asyncio.run(run_backtest(args))
+    from ait.data.research_inputs import ResearchDataUnavailable
+    try:
+        asyncio.run(run_backtest(args))
+    except ResearchDataUnavailable as exc:
+        # W116: a study whose inputs are not stored does not start; exit 2 (the weekly job records it)
+        print(f"\nREFUSED: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

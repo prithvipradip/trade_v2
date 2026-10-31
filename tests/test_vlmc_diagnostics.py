@@ -10,6 +10,17 @@ import numpy as np
 import pandas as pd
 
 
+
+def _seed_daily_bars(store, intraday: pd.DataFrame) -> None:
+    """Store one IB-tagged daily bar per intraday session (the stored history the report reads)."""
+    from ait.data.historical import SOURCE_IB_TRADES_RTH
+    idx = pd.DatetimeIndex(intraday.index)
+    day = idx.tz_localize(None).normalize() if idx.tz is None else idx.tz_convert("America/New_York").tz_localize(None).normalize()
+    daily = intraday.groupby(day).agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
+                                      Close=("Close", "last"), Volume=("Volume", "sum"))
+    store.save("SPY", daily, source=SOURCE_IB_TRADES_RTH)
+
+
 class TestVLMCReportImport:
 
     def test_module_importable(self) -> None:
@@ -129,9 +140,10 @@ class TestVLMCDiagnosticPlots:
     def test_generate_report_with_intraday_db_creates_html(self, tmp_path: Path) -> None:
         """generate_report() produces HTML when IB intraday data is in the DB.
 
-        Seeds 120 intraday sessions (~120 daily bars after resampling) so that
-        load_daily_ohlcv() uses IB data rather than falling back to yfinance.
-        This mirrors real run conditions where an IB backfill has been completed.
+        Seeds 120 intraday sessions and the matching IB-tagged daily bars, because
+        load_daily_ohlcv() reads the stored daily history only (no resample, no
+        yfinance since W116). This mirrors real run conditions where an IB
+        backfill has been completed.
         """
         from ait.data.historical import HistoricalDataStore
         from ait.diagnostics.report import generate_report
@@ -139,6 +151,7 @@ class TestVLMCDiagnosticPlots:
         store = HistoricalDataStore(db_path=tmp_path / "test.db")
         intraday = self._make_intraday_multi_session(n_sessions=120, days_ago=200)
         store.save_intraday("SPY", intraday, interval="5m")
+        _seed_daily_bars(store, intraday)
 
         # Derive date range from the seeded data; leave 30 sessions as warm-up
         daily_idx = pd.to_datetime(
@@ -147,18 +160,14 @@ class TestVLMCDiagnosticPlots:
         start = daily_idx[30].date().isoformat()
         end   = daily_idx[-1].date().isoformat()
 
-        mock_ticker = MagicMock()
-        mock_ticker.history.return_value = pd.DataFrame()
-        with patch("ait.diagnostics.report.yf") as mock_yf:
-            mock_yf.Ticker.return_value = mock_ticker
-            generate_report(
-                symbols=["SPY"],
-                start=start,
-                end=end,
-                output_dir=str(tmp_path),
-                fmt="html",
-                db_path=str(tmp_path / "test.db"),
-            )
+        generate_report(
+            symbols=["SPY"],
+            start=start,
+            end=end,
+            output_dir=str(tmp_path),
+            fmt="html",
+            db_path=str(tmp_path / "test.db"),
+        )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1
 
@@ -170,6 +179,7 @@ class TestVLMCDiagnosticPlots:
         store = HistoricalDataStore(db_path=tmp_path / "test.db")
         intraday = self._make_intraday_multi_session(n_sessions=120, days_ago=200)
         store.save_intraday("SPY", intraday, interval="5m")
+        _seed_daily_bars(store, intraday)
 
         daily_idx = pd.to_datetime(
             intraday.index.normalize().unique().sort_values()
@@ -177,18 +187,14 @@ class TestVLMCDiagnosticPlots:
         start = daily_idx[30].date().isoformat()
         end   = daily_idx[-1].date().isoformat()
 
-        mock_ticker = MagicMock()
-        mock_ticker.history.return_value = pd.DataFrame()
-        with patch("ait.diagnostics.report.yf") as mock_yf:
-            mock_yf.Ticker.return_value = mock_ticker
-            generate_report(
-                symbols=["SPY"],
-                start=start,
-                end=end,
-                output_dir=str(tmp_path),
-                fmt="html",
-                db_path=str(tmp_path / "test.db"),
-            )
+        generate_report(
+            symbols=["SPY"],
+            start=start,
+            end=end,
+            output_dir=str(tmp_path),
+            fmt="html",
+            db_path=str(tmp_path / "test.db"),
+        )
         html_files = list(tmp_path.glob("*.html"))
         assert len(html_files) >= 1
         content = html_files[0].read_text()
