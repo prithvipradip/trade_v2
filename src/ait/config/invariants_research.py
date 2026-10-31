@@ -46,6 +46,12 @@ RESEARCH_MAX_DIVIDEND_GAP_DAYS = 100
 # The longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current
 # at the end of a window (the quarterly GDP release is the sparsest type in use).
 RESEARCH_MAX_EVENT_GAP_DAYS = 120
+# The longest stretch of calendar days inside a window (and at its end) without a stored observation of a FRED macro
+# series (FRED skips weekends and bank holidays; the longest regular gap is four days over a long weekend).
+RESEARCH_MAX_MACRO_GAP_DAYS = 5
+# How far before the end of a window the newest stored macro observation may be: the broad dollar index is published
+# about a week late, so the tail tolerance is wider than the gap tolerance inside a window.
+RESEARCH_MAX_MACRO_TAIL_DAYS = 10
 
 RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
     Invariant(
@@ -83,6 +89,18 @@ RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
         "current at the end of a window.",
         "Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window.",
         "data/research_inputs.py (the econ_events check); backtesting/preflight.py"),
+    Invariant(
+        "RESEARCH_MAX_MACRO_GAP_DAYS", RESEARCH_MAX_MACRO_GAP_DAYS, "days",
+        "Longest stretch of calendar days inside a window, or at its end, without a stored observation of a macro series.",
+        "FRED publishes on business days; a longer hole means missing data, which would otherwise be carried forward "
+        "as if it were the market.",
+        "data/research_inputs.py (the macro_series check); data/macro_store.py"),
+    Invariant(
+        "RESEARCH_MAX_MACRO_TAIL_DAYS", RESEARCH_MAX_MACRO_TAIL_DAYS, "days",
+        "How far before the end of a window the newest stored observation of a macro series may be.",
+        "The broad dollar index is published about a week late, so a window ending today legitimately lags it; a "
+        "longer lag means the backfill is stale.",
+        "data/research_inputs.py (the macro_series check); data/macro_store.py"),
     Invariant(
         "IV_SCALE_MAX", IV_SCALE_MAX, "ratio",
         "Upper clamp of the same scaling.",

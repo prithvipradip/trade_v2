@@ -297,7 +297,9 @@ class TestRegistry:
         HistoricalDataStore(db_path=path)
         with sqlite3.connect(path) as conn:
             names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert ri.registered_tables() <= names
+        # macro_series is created by its own backfill script (not by the store's constructor, which the live process also
+        # runs); the registry check reports a missing table as a gap
+        assert ri.registered_tables() - {"macro_series"} <= names
 
     def test_input_names_are_unique(self):
         names = [e.name for e in ri.REGISTRY]

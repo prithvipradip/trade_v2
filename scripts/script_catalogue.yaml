@@ -743,3 +743,13 @@ scripts/research_preflight.py:
   example: "python scripts/research_preflight.py [--study-file studies/<name>.yaml] [--symbols QQQ] [--json]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#103-the-research-data-contract-stored-inputs-or-no-study)"
   stamp: "dfe8b16740d1"
+
+scripts/backfill_macro_series.py:
+  group: Historical
+  what: "Stores the four FRED series the macro features read (2- and 10-year yields, 10Y-2Y spread, broad dollar index) in the history database, so research sees what live sees."
+  when: "Once before the first study after the research data contract, then now and then so the tail reaches the last days of any window."
+  needs_ib: "no"
+  writes: "rows in the macro_series table of data/historical.db (creates the table); --dry-run downloads and reports and writes nothing. Network: fred.stlouisfed.org only."
+  example: "python scripts/backfill_macro_series.py [--db-path data/historical.db] [--dry-run]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#103-the-research-data-contract-stored-inputs-or-no-study)"
+  stamp: "c9248ae6a3d3"

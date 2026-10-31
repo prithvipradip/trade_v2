@@ -13,8 +13,19 @@ from datetime import date
 from pathlib import Path
 
 from ait.config.invariants_research import (
-    RESEARCH_MAX_DIVIDEND_GAP_DAYS, RESEARCH_MAX_EVENT_GAP_DAYS, RESEARCH_MAX_NULL_IV_RUN_SESSIONS)
+    RESEARCH_MAX_DIVIDEND_GAP_DAYS, RESEARCH_MAX_EVENT_GAP_DAYS, RESEARCH_MAX_MACRO_GAP_DAYS,
+    RESEARCH_MAX_MACRO_TAIL_DAYS, RESEARCH_MAX_NULL_IV_RUN_SESSIONS)
+from ait.data.macro_store import SERIES_IDS
 from ait.data.research_inputs import ResearchRequest, required_window
+
+
+def macro_features_used(settings) -> bool:
+    """True when the model's feature list (the ``ml.features.<group>.use`` switches applied) contains a macro column."""
+    from ait.config.feature_names import CATALOGUE
+    from ait.ml.feature_spec import spec_from_config
+    spec = spec_from_config(getattr(getattr(settings, "ml", None), "features", None))
+    macro_columns = {spec.names.get(role, role) for role in CATALOGUE["macro"]}
+    return bool(macro_columns & set(spec.feature_names([])))
 
 
 def build_request(*, symbols, db_path: "Path | str", table_prefix: str, today: date,
@@ -35,7 +46,8 @@ def build_request(*, symbols, db_path: "Path | str", table_prefix: str, today: d
     return ResearchRequest(
         window=window, symbols=symbols, db_path=db_path, table_prefix=table_prefix,
         max_null_iv_run=RESEARCH_MAX_NULL_IV_RUN_SESSIONS, max_dividend_gap_days=RESEARCH_MAX_DIVIDEND_GAP_DAYS,
-        max_event_gap_days=RESEARCH_MAX_EVENT_GAP_DAYS,
+        max_event_gap_days=RESEARCH_MAX_EVENT_GAP_DAYS, max_macro_gap_days=RESEARCH_MAX_MACRO_GAP_DAYS,
+        max_macro_tail_days=RESEARCH_MAX_MACRO_TAIL_DAYS,
         context_window=spy_window, vix_window=vix_window,
         context_symbols=(() if "SPY" in symbols else ("SPY",)), vix_symbols=("VIX",),
         needs_iv=True, ex_div_gate=ex_div_entry_gate != "off",
@@ -44,4 +56,5 @@ def build_request(*, symbols, db_path: "Path | str", table_prefix: str, today: d
         earnings_exempt=tuple(str(s).upper() for s in bt.earnings_exempt_symbols),
         friction_per_leg=friction_model == "per_leg_usd", friction_bands=bool(bt.friction_short_dte),
         intraday=bool(intraday_features), intraday_min_coverage=float(vlmc_min_coverage),
-        surface=bt.pricing_source == "surface")
+        surface=bt.pricing_source == "surface",
+        macro_series=(SERIES_IDS if macro_features_used(settings) else ()))

@@ -89,6 +89,7 @@ Backtesting engine for strategy validation before live trading.
 | `iv_rank.py` | The ONE definition of IV rank, shared by the live orchestrator and the research engine. |
 | `iv_refresh.py` | The one IB implied-vol refresh (script backfill and the daily retrain share it). |
 | `macro.py` | Macro / cross-asset data fetcher. |
+| `macro_store.py` | Stored macro series (the FRED yields and the dollar index) for research. |
 | `market_data.py` | Unified market data service with fallback chain. |
 | `multi_timeframe.py` | Multi-timeframe analysis — combines 5-min, daily, and weekly signals. |
 | `option_spread_sampler.py` | Pure helpers for sampling option bid/ask spreads from IB historical BID/ASK bars. |

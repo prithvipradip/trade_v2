@@ -171,6 +171,8 @@ class ResearchRequest:
     max_null_iv_run: int
     max_dividend_gap_days: int
     max_event_gap_days: int = 0
+    max_macro_gap_days: int = 0
+    max_macro_tail_days: int = 0
     table_prefix: str = ""
     context_window: "Window | None" = None
     vix_window: "Window | None" = None
@@ -188,6 +190,7 @@ class ResearchRequest:
     intraday_min_coverage: float = 1.0
     surface: bool = False
     surface_min_coverage: float = 1.0
+    macro_series: tuple[str, ...] = ()          # FRED series ids the macro features read (empty = not needed)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -441,6 +444,41 @@ def _check_option_bars(conn, req, notes) -> list[DataGap]:
     return out
 
 
+def _check_macro_series(conn, req, notes) -> list[DataGap]:
+    from datetime import timedelta
+    t = f"{req.table_prefix}macro_series"
+    win = req.vix_window or req.context_window or req.window
+    remedy = "python scripts/backfill_macro_series.py"
+    if not _has_table(conn, t):
+        return [_no_table("macro_series", t, None, "the stored FRED macro series", remedy)]
+    out = []
+    lo = str(win.start - timedelta(days=31))
+    for sid in req.macro_series:
+        required = (f"{sid} observations from on or before {win.start} to within {req.max_macro_tail_days} days of "
+                    f"{win.end}, never more than {req.max_macro_gap_days} days apart, tagged FRED_CSV")
+        rows = conn.execute(f"SELECT date, source FROM {t} WHERE series_id=? AND date>=? AND date<=? "
+                            f"AND value IS NOT NULL ORDER BY date", (sid, lo, str(win.end))).fetchall()
+        if not rows:
+            out.append(DataGap("macro_series", sid, required, "no rows", remedy))
+            continue
+        dates = [date.fromisoformat(d) for d, _ in rows]
+        problems = []
+        if dates[0] > win.start:
+            problems.append(f"the first observation is {dates[0]}")
+        if (win.end - dates[-1]).days > req.max_macro_tail_days:
+            problems.append(f"the last observation is {dates[-1]}")
+        inside = [d for d in dates if d >= win.start] or dates[-1:]
+        gaps = [(a, b) for a, b in zip(inside, inside[1:]) if (b - a).days > req.max_macro_gap_days]
+        if gaps:
+            problems.append(f"{len(gaps)} gap(s) longer than {req.max_macro_gap_days} days, first {gaps[0][0]}..{gaps[0][1]}")
+        foreign = sorted({s or "UNRECORDED" for _, s in rows} - {"FRED_CSV"})
+        if foreign:
+            problems.append("rows tagged " + ", ".join(foreign))
+        if problems:
+            out.append(DataGap("macro_series", sid, required, "; ".join(problems), remedy))
+    return out
+
+
 @dataclass(frozen=True)
 class ResearchInput:
     """One registered input: the tables it reads (and whether the research prefix applies to them), when a
@@ -464,6 +502,7 @@ REGISTRY: tuple[ResearchInput, ...] = (
                   lambda r: r.friction_per_leg, _check_friction),
     ResearchInput("intraday_prices", (("intraday_prices", True),), lambda r: r.intraday, _check_intraday),
     ResearchInput("option_daily_bars", (("option_daily_bars", False),), lambda r: r.surface, _check_option_bars),
+    ResearchInput("macro_series", (("macro_series", True),), lambda r: bool(r.macro_series), _check_macro_series),
 )
 
 

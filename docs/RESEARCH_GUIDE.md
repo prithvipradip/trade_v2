@@ -42,6 +42,7 @@ Every row of history stored in `data/historical.db` carries a `source` tag sayin
 | Which option contracts were fetched, and how many bars came back | `option_fetch_log` | - | `backfill_option_history.py` |
 | Option bid/ask spreads | `option_spread_*`, `option_leg_spread_*` | `IB_BID_ASK_BARS` | `calibrate_option_spreads.py` |
 | Dividends | `dividends` | `YAHOO_DIVIDENDS` | `backfill_dividends.py` |
+| Macro series (2- and 10-year yields, 10Y-2Y spread, broad dollar index) | `macro_series` | `FRED_CSV` | `backfill_macro_series.py` |
 | Earnings dates, QQQ holdings, econ schedule | `earnings_schedule`, `qqq_holdings`, `econ_schedule` | EDGAR / Fed / BLS tags | `build_research_calendars.py` |
 | Economic events | `econ_events` | `INVESTING_CSV` | `load_econ_calendar_csv.py` |
 
@@ -129,6 +130,8 @@ module, run `python scripts/gen_docs.py`, and record the decision in `PLAN.md`; 
 | `RESEARCH_MAX_NULL_IV_RUN_SESSIONS` | 3 | sessions | Longest run of consecutive sessions with no stored implied vol that a study may contain; an isolated gap is a counted no-entry day, a longer run (or a symbol with no stored IV) refuses the study. It is the line the stored history is checked AGAINST: if a study file could raise it, a study could be told to run on weeks of invented IV, which is the substitution the data contract exists to stop. | data/research_inputs.py (the implied-vol check); backtesting/preflight.py |
 | `RESEARCH_MAX_DIVIDEND_GAP_DAYS` | 100 | days | Longest gap after a symbol's last stored ex-dividend date for which the stored dividends still count as current for a window. Same reason: a stale dividend table silently turns the ex-dividend gate off at the tail of the window. | data/research_inputs.py (the dividends check); backtesting/preflight.py |
 | `RESEARCH_MAX_EVENT_GAP_DAYS` | 120 | days | Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current at the end of a window. Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window. | data/research_inputs.py (the econ_events check); backtesting/preflight.py |
+| `RESEARCH_MAX_MACRO_GAP_DAYS` | 5 | days | Longest stretch of calendar days inside a window, or at its end, without a stored observation of a macro series. FRED publishes on business days; a longer hole means missing data, which would otherwise be carried forward as if it were the market. | data/research_inputs.py (the macro_series check); data/macro_store.py |
+| `RESEARCH_MAX_MACRO_TAIL_DAYS` | 10 | days | How far before the end of a window the newest stored observation of a macro series may be. The broad dollar index is published about a week late, so a window ending today legitimately lags it; a longer lag means the backfill is stale. | data/research_inputs.py (the macro_series check); data/macro_store.py |
 | `IV_SCALE_MAX` | 1.5 | ratio | Upper clamp of the same scaling. Same reason, other direction. | backtesting/engine.py |
 | `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | dollars | How far a settled gross loss may exceed the defined max loss before it is counted as over_max_loss. A floating-point tolerance, not a modelling choice; loosening it would hide a pricing bug. | backtesting/engine.py (_finish_settlement) |
 | `PROB_CLIP_EPS` | 0.0000001 | probability | Probabilities are clipped to [eps, 1 - eps] before log-loss. Numerical safety (log 0); not a modelling choice. | backtesting/walkforward.py (_prob_score_metrics) |
@@ -429,14 +432,15 @@ The walk-forward runs the same check first thing, `run_backtest.py` prints it, a
 | Economic events (when the macro gate is on) | An export that starts on or before the window, and events of every configured type inside it. No hard-coded list. | `scripts/load_econ_calendar_csv.py --csv <export>` |
 | Earnings | `earnings_schedule` rows for the symbol, or the symbol listed in `backtest.earnings_exempt_symbols` (the index ETFs have none). | `scripts/build_research_calendars.py --what earnings` |
 | Per-leg friction (`friction_model: per_leg_usd`) | A fitted model for each symbol. | `scripts/calibrate_option_spreads.py --source ib-bars --symbols <SYM> ...` |
+| Macro series (the nine macro features are in the model) | The four FRED series, tagged `FRED_CSV`, from before the window to within a few days of its end, with no hole of more than a few days; joined with **one session of lag** (the value dated D-1 or earlier is the one known at D's open), as live's inference sees them. The broad dollar index is published about a week late, which the tail tolerance allows. | `scripts/backfill_macro_series.py` |
 | 5-minute bars (`backtest.intraday_features: true`) | Bars on at least `vlmc_min_coverage` of the sessions. Set the feature false to run on daily bars only; the choice is stated and logged, never made silently. | `... --mode intraday` |
 | Option bars (`pricing_source: surface`) | Bars for the symbol over the window; a leg the surface cannot price is counted in the run. | `scripts/backfill_option_history.py` |
 
-Fixed limits (not configurable, listed in [section 4](#4-configuration-where-every-value-lives) under the fixed research limits): the longest run of sessions without IV, the longest dividend and macro-event gaps.
+Fixed limits (not configurable, listed in [section 4](#4-configuration-where-every-value-lives) under the fixed research limits): the longest run of sessions without IV, the longest dividend, macro-event and macro-series gaps.
 
 **Declared models.** Two behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, and a window whose ML model fails to train trades ungated. They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
 
-**Known gap.** The nine macro features (the 2- and 10-year yields, their spread, the dollar index and their changes) are constants in research, while the live bot feeds real FRED values: research has no stored macro series to read. Until one exists, a model trained in research sees a different macro input than the one that trades. Storing the series and joining it with a one-day lag is recorded in PLAN.md as the open part of the data contract.
+**Macro features.** A research model sees the same nine macro inputs (yields, their spread, the dollar index and their changes) as the one that trades: real values, from the stored series, never constants. A model trained before this existed saw constants, so its results are not comparable (the before / after is in PLAN.md).
 
 ---
 

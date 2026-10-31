@@ -72,6 +72,13 @@ def seed(db_path: Path) -> date:
     vix = pd.Series(np.clip(0.17 + np.cumsum(rng.normal(0, 0.003, len(idx))) * 0.3, 0.10, 0.40), index=idx)
     store.save_daily_iv_bars("VIX", pd.DataFrame({"Open": vix, "High": vix * 1.02, "Low": vix * 0.98, "Close": vix}),
                              source=SOURCE_IB_VIX_INDEX)
+    # the four FRED macro series the model's macro features read (a smooth seeded path each), over the context span
+    from ait.data.macro_store import SERIES_IDS, save_macro_series
+    macro_days = pd.bdate_range(end=frames["SPY"].index[-1], periods=VIX_SESSIONS + 40)
+    for k, series_id in enumerate(SERIES_IDS):
+        walk = np.random.default_rng(900 + k).normal(0, 0.02, len(macro_days)).cumsum()
+        base = {"DGS2": 3.5, "DGS10": 4.0, "T10Y2Y": 0.4, "DTWEXBGS": 120.0}[series_id]
+        save_macro_series(db_path, series_id, pd.Series(base + walk, index=macro_days), "2024-06-03T00:00:00")
     return frames["SPY"].index[-1].date()
 
 

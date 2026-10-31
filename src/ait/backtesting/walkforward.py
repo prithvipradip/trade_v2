@@ -1261,7 +1261,7 @@ def _window_task_mp(args: tuple) -> tuple:
     """
     (window_id, train_start, train_end, test_start, test_end,
      data, vix_full, spy_full, config, symbols, strategies, db_path, progress_dir,
-     pretrained_range, table_prefix, vlmc_enabled, research_calendar, strict_inputs) = args
+     pretrained_range, table_prefix, vlmc_enabled, research_calendar, strict_inputs, macros_full) = args
 
     bt = WalkForwardBacktester(
         symbols=symbols,
@@ -1273,6 +1273,7 @@ def _window_task_mp(args: tuple) -> tuple:
         strict_inputs=strict_inputs,  # W116: a worker is a new process; it takes the parent's decision
     )
     bt._vlmc_enabled = vlmc_enabled
+    bt._macros_full = macros_full
     bt._research_calendar = research_calendar
     wr, best_params, meta_status = bt._run_single_window(
         window_id=window_id,
@@ -1339,6 +1340,7 @@ class WalkForwardBacktester:
         # funnel explains the emptiness).
         self._funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
         self._declared_by_window: dict[int, dict[str, dict[str, int]]] = {}    # W116: declared-model counts
+        self._macros_full: "dict[str, pd.Series] | None" = None                # W116: stored FRED series (lagged)
         self._preflight_report = None                                          # W116: set by run() under strict inputs
         # W67: {window_id: {symbol: {"usable": bool, "best_value": float, "best_n_trades": int}}}
         # for every per-window Optuna study, so a run whose studies never found a trading
@@ -1399,7 +1401,14 @@ class WalkForwardBacktester:
             # W116: every input the study needs, checked together, BEFORE anything is loaded or trained: one refusal
             # that lists every gap and the command that closes each, not the first loader error
             from ait.data.research_inputs import preflight_or_raise
-            self._preflight_report = preflight_or_raise(self.research_request(), context="walk-forward")
+            _request = self.research_request()
+            self._preflight_report = preflight_or_raise(_request, context="walk-forward")
+            if _request.macro_series:
+                # W116: the macro features see the stored FRED series (one session of lag), as live's do
+                from ait.data.macro_store import load_macro_series
+                self._macros_full = load_macro_series(
+                    self._db_path, _request.vix_window or _request.context_window or _request.window,
+                    self._table_prefix)
         if data is None:
             data = await self._fetch_data()
 
@@ -1499,6 +1508,7 @@ class WalkForwardBacktester:
                     self._db_path, self._progress_dir,
                     pretrained_range_by_window[i],
                     self._table_prefix, self._vlmc_enabled, self._research_calendar, self._strict,
+                    self._macros_full,
                 )
                 for i, (train_start, train_end, test_start, test_end) in enumerate(windows)
             ]
@@ -1811,6 +1821,8 @@ class WalkForwardBacktester:
                 _spy_t_opt = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
                 if not _spy_t_opt.empty:
                     _ctx_opt["spy"] = _spy_t_opt
+            if self._macros_full:
+                _ctx_opt["macros"] = self._macros_full
             if _ctx_opt:
                 _vix_train_ctx_opt = _ctx_opt
 
@@ -1878,6 +1890,8 @@ class WalkForwardBacktester:
                 _spy_t = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
                 if not _spy_t.empty:
                     _ctx_train["spy"] = _spy_t
+            if self._macros_full:
+                _ctx_train["macros"] = self._macros_full
             if _ctx_train:
                 _vix_train_ctx = _ctx_train
 
@@ -1940,6 +1954,8 @@ class WalkForwardBacktester:
                 _spy_w = spy_full.reindex(test_with_context.index, method="ffill").dropna(how="all")
                 if not _spy_w.empty:
                     _ctx_oos["spy"] = _spy_w
+            if self._macros_full:
+                _ctx_oos["macros"] = self._macros_full
             if _ctx_oos:
                 _vix_ctx = _ctx_oos
 
@@ -3350,6 +3366,8 @@ class WalkForwardBacktester:
                 _spy_t = spy_full.reindex(train_df.index, method="ffill").dropna(how="all")
                 if not _spy_t.empty:
                     _train_ctx["spy"] = _spy_t
+            if self._macros_full:
+                _train_ctx["macros"] = self._macros_full
             _market_ctx = _train_ctx if _train_ctx else None
 
             # W86: the LOADED ml section (a bare MLConfig() ignored any ml.* edit in config.yaml);
