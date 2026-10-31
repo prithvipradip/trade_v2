@@ -402,6 +402,10 @@ EXEMPT: dict[str, str] = {
         "the live trainer has no meta-labeler retrain; the gate itself is off (enabled: false).",
     "exit.auto_hedge":
         "no hedging code exists anywhere in src/; docs/archive/AUDIT_R12.md's 'one flip from live' is false.",
+    "backtest.research_history":
+        "W116: run_backtest / run_optimizer read it to choose between the stored history and the legacy loader; the "
+        "legacy loader is gone (research always reads the stored history), so nothing reads it. Registered in PLAN.md "
+        "W116; whether to delete it is decided with the other unread settings, not here.",
     # Read, but only inside settings.py through a derived property, which this scan skips:
     "trading.first_hour_end_et": "read via TradingConfig.first_hour_end_hour (property)",
     "trading.midday_end_et": "read via TradingConfig.midday_end_hour (property)",
