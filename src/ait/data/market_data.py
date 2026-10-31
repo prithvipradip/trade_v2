@@ -213,8 +213,10 @@ def _load_stored_index_daily(symbol, days, db_path, table_prefix, start_date, en
     short (the caller then falls through to the legacy path, which ends at Yahoo)."""
     from ait.data.historical import HistoricalDataStore
 
-    start = start_date or (today_et() - timedelta(days=days + 30))
-    span_days = (today_et() - start).days if start_date else days
+    # The window ends where the query ends: end_date when the run is pinned, else today.
+    end = end_date or today_et()
+    start = start_date or (end - timedelta(days=days + 30))
+    span_days = max(1, (end - start_date).days) if start_date else days
     needed = max(60, int(max(1, int(span_days * 252 / 365)) * 0.8))
     bars = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix).load_daily_iv_bars(
         STORED_INDEX_SYMBOLS[symbol], start, end_date)
@@ -244,12 +246,14 @@ def _load_research_daily(
 
     store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
     today = today_et()
+    # The window ends where the query ends: end_date when the run is pinned, else today.
+    end = end_date or today
     if start_date is not None:
         start = start_date
-        span_days = max(1, (today - start_date).days)
+        span_days = max(1, (end - start_date).days)
     else:
         span_days = days
-        start = today - timedelta(days=days + 30)
+        start = end - timedelta(days=days + 30)
     df = store.load(symbol, start_date=start, end_date=end_date)
     if not df.empty:
         # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.

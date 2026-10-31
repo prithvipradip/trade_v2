@@ -1403,7 +1403,9 @@ class WalkForwardBacktester:
         try:
             _ctx_days = self._context_days()
             _vix_full: pd.DataFrame = self._load_vix_context(_load_ohlcv, _ctx_days, data)
-        except Exception:
+        except Exception as exc:
+            log.warning("research_vix_context_failed", error=str(exc),
+                        note="the VIX context is empty for this run (MetaLabeler and cross-asset VIX features)")
             _vix_full = pd.DataFrame()
         try:
             _spy_full: pd.DataFrame = _load_ohlcv(
@@ -3572,10 +3574,14 @@ class WalkForwardBacktester:
         vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
                      research=research)
         if research and not vix.empty:
-            ends = [df.index.max() for df in data.values() if df is not None and not df.empty]
+            def _naive(ts) -> pd.Timestamp:
+                ts = pd.Timestamp(ts)
+                return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+            ends = [_naive(df.index.max()) for df in data.values() if df is not None and not df.empty]
             data_last = max(ends) if ends else None
             vix_last = vix.index.max()
-            if data_last is not None and pd.Timestamp(vix_last).tz_localize(None) < pd.Timestamp(data_last):
+            if data_last is not None and _naive(vix_last) < data_last:
                 log.warning("research_vix_store_stale_yahoo_fallback", vix_last=str(vix_last),
                             data_last=str(data_last))
                 vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
