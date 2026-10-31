@@ -93,6 +93,7 @@ Backtesting engine for strategy validation before live trading.
 | `options_chain.py` | Options chain service — fetch, filter, and price options with Greeks. |
 | `quality.py` | Data quality validation — prevents trading on bad data. |
 | `research_calendars.py` | Parsers for the event calendars of the strike-aware range study (research only). |
+| `research_inputs.py` | The research data contract: what a study needs, whether the store has it, and what to run when it does not. |
 | `short_dte_collector.py` | Collect and fit 0-6 DTE option bid/ask friction from IB hourly BID/ASK bars. |
 | `synthetic_chain.py` | A deterministic Black-Scholes option chain for the sizing self-test. |
 

@@ -38,6 +38,7 @@ SYMBOLS = ["SPY", "QQQ"]
 CAPITAL = 5000.0
 START = date(2022, 1, 3)
 SESSIONS = 900
+LAST_SESSION = pd.bdate_range(START, periods=SESSIONS)[-1].date()
 VIX_SESSIONS = 1500        # the VIX context is asked for a longer span than the prices (train + 900 days)
 
 
