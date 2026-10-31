@@ -656,6 +656,14 @@ class HistoricalDataStore:
                 f"ORDER BY ex_date", (symbol,)).fetchall()
         return [(date.fromisoformat(d), a) for d, a in rows]
 
+    def load_earnings_sessions(self, company_key: str) -> "list[date]":
+        """W116: the first session that can react to each stored earnings release of ``company_key``, ascending."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT event_session FROM {self._earnings_schedule_table} WHERE company_key=? "
+                f"ORDER BY event_session", (company_key,)).fetchall()
+        return [date.fromisoformat(d) for (d,) in rows]
+
     def dividends_span(self, symbol: str) -> "tuple[str, str, int] | None":
         """(first_ex_date, last_ex_date, rows) for a symbol, or None when it has none."""
         with sqlite3.connect(self._db_path) as conn:

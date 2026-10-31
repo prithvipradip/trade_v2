@@ -18,6 +18,8 @@ import pytest
 from tests.data import _w116_store_golden_inputs as gi
 from tests.data._w108s1_golden_inputs import snapshot
 
+pytestmark = pytest.mark.strict_inputs        # the production policy: nothing may be substituted
+
 GOLDEN = json.loads(gi.GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
@@ -62,6 +64,10 @@ def store_run(tmp_path_factory):
 
 
 class TestStoreBackedWalkForward:
+    def test_the_run_is_strict(self):
+        from ait.backtesting.strict import STRICT_INPUTS_DEFAULT
+        assert STRICT_INPUTS_DEFAULT is True
+
     def test_no_yahoo_request_is_made(self, store_run):
         assert store_run[1]["n"] == 0
 

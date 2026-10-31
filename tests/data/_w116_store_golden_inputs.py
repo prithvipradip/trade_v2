@@ -78,7 +78,9 @@ def seed(db_path: Path) -> date:
 def make_config(**overrides):
     from ait.backtesting.walkforward import WalkForwardConfig
     kw = dict(train_days=200, test_days=63, step_days=63, gap_days=5, initial_capital=CAPITAL,
-              train_window_models=False, macro_event_gate=False, history_start_date=START)
+              train_window_models=False, macro_event_gate=False, history_start_date=START,
+              intraday_features=False,       # stated: the fixture has no 5-minute bars
+              friction_model="legacy")        # stated: the fixture has no fitted per-leg friction model
     kw.update(overrides)
     return WalkForwardConfig(**kw)
 
@@ -105,13 +107,14 @@ def frozen_clock(day: date):
         md.today_et, wf.today_et, hist.datetime = saved
 
 
-def run(db_path: Path, config=None, today: date | None = None):
+def run(db_path: Path, config=None, today: date | None = None, reseed: bool = True):
     """Run the REAL walk-forward on the seeded store, loading through the real research loaders.
 
-    ``today`` defaults to the day after the last stored session."""
+    ``today`` defaults to the day after the last stored session. ``reseed=False`` runs on a store the caller has
+    already seeded and altered (a test that removes a session or an IV value)."""
     from ait.backtesting.engine import Backtester
     from ait.backtesting.walkforward import WalkForwardBacktester
-    last_day = seed(db_path)
+    last_day = seed(db_path) if reseed else LAST_SESSION
     saved = Backtester.__dict__["_load_earnings_dates"]
     Backtester._load_earnings_dates = staticmethod(_no_earnings)
     try:

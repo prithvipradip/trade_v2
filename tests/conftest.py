@@ -19,6 +19,45 @@ def pytest_configure(config: pytest.Config) -> None:
         "slow: long-running suites (walkforward, optimizer, training); "
         "excluded from the default selection, run nightly with -m slow",
     )
+    config.addinivalue_line(
+        "markers",
+        "strict_inputs: run with the production research data policy (W116) instead of the synthetic-inputs "
+        "default the rest of the suite uses",
+    )
+
+@pytest.fixture(autouse=True, scope="session")
+def _synthetic_inputs_for_the_suite():
+    """W116: the research engine refuses to substitute for a missing input (no stored IV, no calendar, no friction
+    model, no context frames) unless it is told otherwise. Most of the suite builds engines on synthetic frames that
+    carry none of those, so the SUITE runs with the policy off; a test, class or module marked ``strict_inputs`` runs
+    with the production default (the two fixtures below). THE ONLY PLACE the default is changed (a class guard pins
+    that). Session scope, so module- and class-scoped fixtures see it too."""
+    from ait.backtesting import strict
+    saved = strict.STRICT_INPUTS_DEFAULT
+    strict.STRICT_INPUTS_DEFAULT = False
+    yield
+    strict.STRICT_INPUTS_DEFAULT = saved
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _strict_inputs_for_marked_modules(request):
+    from ait.backtesting import strict
+    marks = getattr(request.module, "pytestmark", [])
+    marks = marks if isinstance(marks, list) else [marks]
+    if any(m.name == "strict_inputs" for m in marks):
+        strict.STRICT_INPUTS_DEFAULT = True
+        yield
+        strict.STRICT_INPUTS_DEFAULT = False
+    else:
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _strict_inputs_for_marked_tests(request, monkeypatch):
+    if request.node.get_closest_marker("strict_inputs") is not None:
+        from ait.backtesting import strict
+        monkeypatch.setattr(strict, "STRICT_INPUTS_DEFAULT", True)
+
 
 @pytest.fixture(autouse=True)
 def _neutralise_simulated_capital(monkeypatch):

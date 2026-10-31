@@ -33,6 +33,7 @@ Backtesting engine for strategy validation before live trading.
 | `result.py` | Backtest result container with performance metrics. |
 | `run_record.py` | The per-run record of a research run (what produced this number?). |
 | `settlement.py` | What happens to an option structure that reaches its expiry bell. |
+| `strict.py` | ONE switch for whether the research engine may substitute for a missing input. |
 | `study_harness.py` | The research "study harness" engine setup, defined once. |
 | `walkforward.py` | Walk-forward backtester with multi-symbol support. |
 

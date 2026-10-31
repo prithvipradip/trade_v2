@@ -623,7 +623,7 @@ never logged, and are never copied into reports.
 | `position_sizing` | The position sizer's multiplier curves (confidence, volatility, IV rank, per-strategy risk, drawdown, VIX tiers) | 10 | `config.yaml` | [GUIDE.md](GUIDE.md#72-sizing) |
 | `risk` | Risk-manager gates: per-trade and aggregate risk, concentration, VIX and IV-rank limits, the circuit breaker and the daily-loss brake | 21 | `config.yaml` | [GUIDE.md](GUIDE.md#7-risk-management) |
 | `options` | Option-chain liquidity filters, the entry expiry band and which strategies are enabled | 7 | `config.yaml` | [GUIDE.md](GUIDE.md#4-entry-pipeline), [GUIDE.md](GUIDE.md#5-strategies) |
-| `backtest` | The research engine, walk-forward, learner, optimiser, friction and data settings (research only; a few are shared with live) | 187 | `config_research.yaml` | [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md#4-configuration-where-every-value-lives) |
+| `backtest` | The research engine, walk-forward, learner, optimiser, friction and data settings (research only; a few are shared with live) | 189 | `config_research.yaml` | [RESEARCH_GUIDE.md](RESEARCH_GUIDE.md#4-configuration-where-every-value-lives) |
 | `ml` | Models: labels, validation, hyperparameters, features with their switches and windows, the retrain, drift and the entry-gate mode | 158 | `config.yaml` | [MODELS.md](MODELS.md) |
 | `regime` | The rule-based regime classifier's thresholds | 29 | `config.yaml` | [MODELS.md](MODELS.md#8-the-regime-classifier) |
 | `meta_label` | The meta-labeler gate and the guards before it can act | 10 | `config.yaml` | [MODELS.md](MODELS.md#7-the-models-one-by-one) |
