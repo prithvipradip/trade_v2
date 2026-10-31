@@ -23,6 +23,7 @@ from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING
 from ait.config.runtime_env import contract_float
 from ait.data.options_chain import OptionContract, OptionsChain
 from ait.execution.exit_policy import DEFAULT_TAKE_PROFIT
+from ait.risk.width_sizing import fitted_credit_width
 from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.strategies.iron_condor import SHORT_DELTA_TARGET, IronCondor
 from ait.utils.logging import get_logger
@@ -76,19 +77,25 @@ class _VerticalCreditSpread(Strategy):
             self._wing_fraction = wing_expected_move_fraction()
         return self._wing_fraction
 
+    def natural_wing_width(self, expected_move: float) -> float:
+        """The wing before any budget fit: ``max(wing floor, wing_k x EM x fraction)``, the floor and
+        ``wing_k`` from the same contract keys the condor and the engine read
+        (``AIT_IC_WING_FLOOR`` / ``AIT_IC_WING_K``)."""
+        return max(contract_float("AIT_IC_WING_FLOOR"),
+                   contract_float("AIT_IC_WING_K") * expected_move * self.wing_fraction())
+
     def wing_width(self, expected_move: float) -> float:
         """Target wing width (dollars per share) before the strike snap.
 
-        Research's rule (``engine.py`` credit spreads): ``max(wing floor, wing_k x EM x fraction)``,
-        the floor and ``wing_k`` from the same contract keys the condor and the engine read
-        (``AIT_IC_WING_FLOOR`` / ``AIT_IC_WING_K``). Then the condor's budget fit: the widest wing the
-        per-trade budget can carry is ``IronCondor.affordable_width`` (the ONE authority for the
-        budget <-> width algebra, W31), and a budget-capped wing may go below the floor, never below
-        ``IC_BUDGET_CAPPED_MIN_WING``. The algebra holds for one vertical exactly as for the condor:
-        max loss = (width - credit) x 100 with credit >= ratio floor x width.
+        Research's rule (``engine.py`` credit spreads) is the natural width above. Then the condor's
+        budget fit: the widest wing the per-trade budget can carry is ``IronCondor.affordable_width``
+        (the ONE authority for the budget <-> width algebra, W31), and a budget-capped wing may go below
+        the floor, never below ``IC_BUDGET_CAPPED_MIN_WING``. The algebra holds for one vertical exactly
+        as for the condor: max loss = (width - credit) x 100 with credit >= ratio floor x width.
+        ``generate_signals`` picks the strike through ``fitted_credit_width`` (the rule research uses),
+        which keeps a snapped wing at or below this cap when a listed strike allows it.
         """
-        width = max(contract_float("AIT_IC_WING_FLOOR"),
-                    contract_float("AIT_IC_WING_K") * expected_move * self.wing_fraction())
+        width = self.natural_wing_width(expected_move)
         if self.risk_budget and self.risk_budget > 0:
             affordable = IronCondor.affordable_width(self.risk_budget)
             if affordable < width:
@@ -169,7 +176,16 @@ class _VerticalCreditSpread(Strategy):
                   if (c.strike < short.strike if self.RIGHT == "P" else c.strike > short.strike)]
         if not beyond:
             return self._refuse(symbol, "no_wing", chain, short=short, wing_target=wing_target)
-        # Snapped to the listed strike nearest the target (the condor's R6 idiom).
+        # The budget fit chooses among the LISTED widths exactly as research's does: the widest at or
+        # below the budget cap (so the snap cannot land wider than the budget carries), the narrowest
+        # when none fits (the max_loss re-check below then refuses it). Not capped: the strike nearest
+        # the target (the condor's R6 idiom).
+        listed = {abs(short.strike - c.strike) for c in beyond}
+        # a budget-capped wing never goes below IC_BUDGET_CAPPED_MIN_WING ($1) while a listed strike allows it
+        listed = {w for w in listed if w >= IC_BUDGET_CAPPED_MIN_WING - 1e-9} or listed
+        wing_target = fitted_credit_width(
+            self.natural_wing_width(em), self.risk_budget, listed,
+            min_credit_ratio=contract_float("AIT_IC_MIN_CREDIT_WIDTH"))
         long_leg = min(beyond, key=lambda c: abs(abs(short.strike - c.strike) - wing_target))
         width = abs(short.strike - long_leg.strike)
 

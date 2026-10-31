@@ -24,6 +24,7 @@ from ait.config.settings import PositionSizingConfig
 # Strategies that benefit from high IV (selling premium): their IV-rank factor rises with the rank.
 SELLING_STRATEGIES: frozenset[str] = frozenset({
     "covered_call", "cash_secured_put", "iron_condor", "short_strangle",
+    "put_credit_spread", "call_credit_spread",
 })
 
 # Strategies whose ENTRY confidence comes from the payoff-matched range model rather than the directional

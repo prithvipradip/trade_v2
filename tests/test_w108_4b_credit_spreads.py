@@ -145,11 +145,22 @@ class TestTheBuilder:
             _, sigs = _build(cls, _bs_chain(*case), direction, budget=budget)
             assert all(s.max_loss <= budget for s in sigs), (case, budget)
 
-    def test_the_snap_overshoot_is_refused_like_the_condor(self):
-        """$600 budget: the fitted target is 6.67 wide, the nearest listed wing is 7 wide and its max loss
-        ($614) is above the budget. The condor's R16 guard refuses it; so does the vertical."""
+    def test_the_wing_is_the_widest_listed_one_the_budget_carries(self):
+        """$600 budget: the fitted target is 6.67 wide and the nearest listed wing (7 wide) would cost $614.
+        The builder takes the widest listed wing at or below the cap (6 wide, as research's fitted_credit_width
+        does) instead of refusing a structure the budget can carry."""
         chain = _bs_chain(220.0, 0.24, 21)
         strategy, sigs = _build(CallCreditSpread, chain, SignalDirection.BEARISH, budget=600.0)
+        assert len(sigs) == 1 and strategy.last_entry_reason is None
+        short, long_ = _legs(sigs[0])
+        assert abs(long_.strike - short.strike) == pytest.approx(6.0)
+        assert sigs[0].max_loss <= 600.0
+
+    def test_when_no_listed_wing_fits_the_budget_it_is_refused_like_the_condor(self):
+        """A $5 strike grid and a $300 budget (cap 3.33): the narrowest listed wing is 5 wide and its max loss is
+        above the budget. The condor's R16 guard refuses it; so does the vertical."""
+        chain = _bs_chain(600.0, 0.18, 21, step=5.0)
+        strategy, sigs = _build(CallCreditSpread, chain, SignalDirection.BEARISH, budget=300.0)
         assert sigs == [] and strategy.last_entry_reason == "max_loss_over_budget"
 
     @pytest.mark.parametrize("cls, direction, right", SIDES)

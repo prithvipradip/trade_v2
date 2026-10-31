@@ -106,6 +106,8 @@ _EXPECTED_LEG_SHAPE = {
     "event_straddle": (0, 2),
     "bull_call_spread": (1, 1),
     "bear_put_spread": (1, 1),
+    "put_credit_spread": (1, 1),
+    "call_credit_spread": (1, 1),
     "calendar_spread": (1, 1),
 }
 
