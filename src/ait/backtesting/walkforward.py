@@ -1396,7 +1396,7 @@ class WalkForwardBacktester:
         # and are merged below).
         self._meta_status_by_window: dict[int, dict[str, str]] = {}
 
-        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in the store).
+        # Load VIX and SPY data for the full backtest period (the IB-stored series only; W116).
         # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
@@ -1413,7 +1413,6 @@ class WalkForwardBacktester:
                 table_prefix=self._table_prefix,
                 start_date=self._config.history_start_date,
                 end_date=self._config.history_end_date,
-                research=(self._db_path is not None),     # W91: the tables are shared; no prefix to infer from
             )
             if not _spy_full.empty and _spy_full.index.tz is not None:
                 _spy_full.index = _spy_full.index.tz_localize(None)
@@ -3564,29 +3563,14 @@ class WalkForwardBacktester:
         return trimmed
 
     def _load_vix_context(self, loader, ctx_days: int, data: "dict[str, pd.DataFrame]") -> pd.DataFrame:
-        """The ^VIX context frame: the IB-stored series on the research path (W106), the legacy path otherwise.
+        """The ^VIX context frame: the IB-stored series, over the run's own window (``history_end_date`` when pinned).
 
-        W106 review follow-up: the stored series is used only when it reaches the last day of the symbols'
-        data. The VIX family has its own writer and can fall behind them; the frame is forward-filled onto
-        every test day, so a stale store would hand every later day its last close, silently. A short
-        tail falls back to the legacy path (Yahoo, as before W106) with a warning."""
-        research = self._db_path is not None
+        W116: no fallback of any kind. The loader raises ``ResearchDataUnavailable`` when the stored VIX does not
+        reach the last session of the window, so a store that lags the symbols can no longer be forward-filled onto
+        every later test day (the stale-tail case W106 handled by switching to Yahoo)."""
         vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
-                     research=research)
-        if research and not vix.empty:
-            def _naive(ts) -> pd.Timestamp:
-                ts = pd.Timestamp(ts)
-                return ts.tz_localize(None) if ts.tzinfo is not None else ts
-
-            ends = [_naive(df.index.max()) for df in data.values() if df is not None and not df.empty]
-            data_last = max(ends) if ends else None
-            vix_last = vix.index.max()
-            if data_last is not None and _naive(vix_last) < data_last:
-                log.warning("research_vix_store_stale_yahoo_fallback", vix_last=str(vix_last),
-                            data_last=str(data_last))
-                vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
-                             research=False)
-        # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
+                     end_date=self._config.history_end_date)
+        # the frame may carry a tz-aware index; normalize to tz-naive to match the OHLCV data
         if not vix.empty and vix.index.tz is not None:
             vix.index = vix.index.tz_localize(None)
         return vix
@@ -3721,11 +3705,9 @@ class WalkForwardBacktester:
                 # W65: the research kwargs are passed ONLY when set, so a legacy run
                 # (no prefix, no start date) makes the exact pre-W65 call.
                 _kw: dict = {}
-                if self._db_path is not None:          # W91: research mode = a db_path was given
-                    _kw["table_prefix"] = self._table_prefix
-                    _kw["research"] = True
-                    if cfg.history_end_date is not None:   # W91: a registered study's pinned last day
-                        _kw["end_date"] = cfg.history_end_date
+                _kw["table_prefix"] = self._table_prefix
+                if cfg.history_end_date is not None:       # W91: a registered study's pinned last day
+                    _kw["end_date"] = cfg.history_end_date
                 if start is not None:
                     _kw["start_date"] = start
                 df = await loop.run_in_executor(

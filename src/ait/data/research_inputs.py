@@ -101,9 +101,9 @@ def last_completed_session(today: date) -> date:
     return last_session_on_or_before(today - timedelta(days=1))
 
 
-def window_start(days: int, end: date) -> date:
-    """First calendar day of a request that names ``days`` and no start date, counted back from ``end``."""
-    return end - timedelta(days=int(days) + WINDOW_BUFFER_DAYS)
+def window_start(days: int, anchor: date) -> date:
+    """First calendar day of a request that names ``days`` and no start date, counted back from ``anchor``."""
+    return anchor - timedelta(days=int(days) + WINDOW_BUFFER_DAYS)
 
 
 def required_window(*, today: date, days: int | None = None, start_date: date | None = None,
@@ -112,15 +112,29 @@ def required_window(*, today: date, days: int | None = None, start_date: date | 
 
     * end: ``end_date`` when the run is pinned, else the last completed session; never later than the last
       completed session (a pin in the future cannot be satisfied), and snapped back to a session.
-    * start: ``start_date`` when given, else ``days`` back from the end (``window_start``).
+    * start: ``start_date`` when given, else ``days`` back from the run's own end: the pin when there is one, else
+      today (the loaders have always counted a days-only request back from today; the extra days in front of it
+      absorb a short first week).
     """
     cap = last_completed_session(today)
     end = last_session_on_or_before(min(end_date, cap)) if end_date is not None else cap
     if start_date is None:
         if days is None:
             raise ValueError("required_window needs start_date or days")
-        start_date = window_start(days, end)
+        start_date = window_start(days, end_date if end_date is not None else today)
     return Window(start_date, end)
+
+
+def prices_request(symbol: str, window: Window, db_path: "Path | str", table_prefix: str = "") -> "ResearchRequest":
+    """A request that checks one symbol's daily bars only (what the loaders verify before they read)."""
+    return ResearchRequest(window=window, symbols=(symbol,), db_path=db_path, max_null_iv_run=0,
+                           max_dividend_gap_days=0, table_prefix=table_prefix, needs_iv=False)
+
+
+def index_request(db_symbol: str, window: Window, db_path: "Path | str", table_prefix: str = "") -> "ResearchRequest":
+    """A request that checks one stored index series (a VIX-family member) only."""
+    return ResearchRequest(window=window, symbols=(), db_path=db_path, max_null_iv_run=0, max_dividend_gap_days=0,
+                           table_prefix=table_prefix, vix_symbols=(db_symbol,), needs_iv=False)
 
 
 @dataclass

@@ -105,41 +105,42 @@ def _yahoo_frame(n: int = 700) -> pd.DataFrame:
 
 
 class TestTheFallbackIsLoud:
-    def test_an_empty_store_warns_that_yahoo_is_the_only_source(self, tmp_path, monkeypatch):
-        cap = LogCapture(md.log)
-        monkeypatch.setattr(md, "log", cap)
+    def test_an_empty_store_refuses_and_yahoo_is_never_asked(self, tmp_path, monkeypatch):
+        """W52a made the Yahoo-only fallback LOUD; W116 removed the fallback: a store that holds nothing for the
+        symbol is a refusal naming the symbol, the database and the fix."""
+        from ait.data.research_inputs import ResearchDataUnavailable
+        asked = {"n": 0}
 
         class _Ticker:
-            def __init__(self, symbol): pass
-            def history(self, **kw): return _yahoo_frame()
+            def __init__(self, symbol):
+                asked["n"] += 1
         monkeypatch.setattr(md.yf, "Ticker", _Ticker)
 
         empty = tmp_path / "empty.db"
-        df = md.load_daily_ohlcv("SPY", days=730, db_path=empty)
-        assert len(df) > 0
-        warns = [kw for lvl, e, kw in cap.events
-                 if lvl == "warning" and e == "daily_ohlcv_store_empty_yahoo_only"]
-        assert warns, "an empty store fell back to Yahoo without a warning"
-        assert warns[0]["symbol"] == "SPY"
-        assert str(empty) in str(warns[0]["db_path"])
-        assert "implied_vol" in df.columns and df["implied_vol"].isna().all()
+        HistoricalDataStore(db_path=empty)
+        with pytest.raises(ResearchDataUnavailable) as e:
+            md.load_daily_ohlcv("SPY", days=730, db_path=empty)
+        assert asked["n"] == 0
+        gap = e.value.gaps[0]
+        assert gap.input == "daily_prices" and gap.symbol == "SPY"
+        assert "backfill_historical_data.py --symbols SPY --mode daily" in gap.remedy
 
-    def test_a_partial_store_keeps_the_info_line(self, tmp_path, monkeypatch):
-        """Short-but-not-empty coverage is the R23 case, not this one."""
-        cap = LogCapture(md.log)
-        monkeypatch.setattr(md, "log", cap)
+    def test_a_partial_store_is_never_topped_up_from_yahoo(self, tmp_path, monkeypatch):
+        """Short-but-not-empty coverage (the R23 case) is the same refusal: no mixed-source frame."""
+        from ait.data.historical import SOURCE_IB_TRADES_RTH
+        from ait.data.research_inputs import ResearchDataUnavailable
+        asked = {"n": 0}
 
         class _Ticker:
-            def __init__(self, symbol): pass
-            def history(self, **kw): return _yahoo_frame()
+            def __init__(self, symbol):
+                asked["n"] += 1
         monkeypatch.setattr(md.yf, "Ticker", _Ticker)
         store = HistoricalDataStore(db_path=tmp_path / "partial.db")
-        monkeypatch.setattr(store.__class__, "resample_to_daily",
-                            lambda self, symbol, days: _yahoo_frame(20).iloc[:, :5])
+        store.save("SPY", _yahoo_frame(20).iloc[:, :5], source=SOURCE_IB_TRADES_RTH)
 
-        md.load_daily_ohlcv("SPY", days=730, db_path=tmp_path / "partial.db")
-        assert "daily_ohlcv_store_empty_yahoo_only" not in cap.names()
-        assert "daily_ohlcv_yahoo_fallback" in cap.names()
+        with pytest.raises(ResearchDataUnavailable):
+            md.load_daily_ohlcv("SPY", days=730, db_path=tmp_path / "partial.db")
+        assert asked["n"] == 0
 
     def test_the_engine_warns_when_it_runs_on_model_defaults(self, monkeypatch,
                                                               synth_df, synth_features):

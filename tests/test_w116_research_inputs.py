@@ -1,7 +1,7 @@
 """W116 WP0: the research data contract's types and the one window rule."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -63,6 +63,11 @@ class TestRequiredWindow:
     def test_days_count_back_from_the_end_with_the_buffer(self):
         w = required_window(today=self.TODAY, days=730, end_date=date(2025, 12, 31))
         assert w.start == window_start(730, date(2025, 12, 31)) == date(2023, 12, 2)
+
+    def test_a_days_only_request_counts_back_from_today_when_unpinned(self):
+        w = required_window(today=self.TODAY, days=730)
+        assert w.start == self.TODAY - timedelta(days=760) == window_start(730, self.TODAY)
+        assert w.end == date(2026, 10, 30)
 
     def test_an_explicit_start_wins_over_days(self):
         w = required_window(today=self.TODAY, days=730, start_date=date(2024, 6, 3))

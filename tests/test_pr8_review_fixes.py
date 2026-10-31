@@ -3,11 +3,12 @@
 * the executor's leg-shape guard knows the two live credit verticals (class guard: every multi-leg
   strategy the selector can build has a shape);
 * the sizer's selling set and the selector's selling set agree (class guard);
-* the research loaders judge a pinned window against ITS end, not against today;
+* (the research loaders judging a pinned window against ITS end moved to ``test_research_data_coverage`` and
+  ``test_w106_research_vix`` when W116 made the loaders strict; the walk-forward's VIX staleness check went with the
+  Yahoo fallback it guarded)
 * a credit-spread wing snapped to a listed strike never lands wider than the budget carries when a
   narrower listed strike fits;
 * an option fetch whose bars were all dropped for want of an underlying close is asked again;
-* the walk-forward's VIX staleness check survives a tz-aware symbol index.
 
 House rules: every test executes the real code path; no source-text assertions.
 """
@@ -18,10 +19,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-import ait.data.market_data as md
-from ait.backtesting.walkforward import WalkForwardBacktester
 from ait.config.settings import PositionSizingConfig
-from ait.data.historical import HistoricalDataStore
 from ait.execution.executor import _EXPECTED_LEG_SHAPE, _validate_combo_legs
 from ait.risk import scalers
 from ait.risk.scalers import ScalerInputs, scaler_factors
@@ -29,7 +27,6 @@ from ait.strategies.credit_spreads import PutCreditSpread
 from ait.strategies.iron_condor import IronCondor
 from ait.strategies.base import SignalDirection
 from ait.strategies.selector import STRATEGY_MAP, StrategySelector
-from tests.test_research_data_coverage import _fake_yahoo
 from tests.test_w108_4b_credit_spreads import _bs_chain, _legs, pinned_contract  # noqa: F401 — autouse fixture
 
 
@@ -69,67 +66,6 @@ def test_the_iv_rank_factor_rises_with_rank_for_a_credit_vertical():
                               sizing, 0.5).iv_rank
 
     assert factor(90.0) > factor(10.0)
-
-
-# --------------------------------------------------------------------------- the window ends where the query ends
-
-TODAY = date(2026, 10, 31)
-
-
-def _seed(tmp_path, *, start: str, end: str, symbol: str | None = None):
-    db = tmp_path / "historical.db"
-    store = HistoricalDataStore(db_path=db)
-    idx = pd.bdate_range(start=start, end=end)
-    if symbol is None:                                    # the VIX family, stored /100
-        store.save_daily_iv_bars("VIX", pd.DataFrame(
-            {"Open": 0.150, "High": 0.160, "Low": 0.140, "Close": 0.155}, index=idx))
-    else:
-        store.save(symbol, pd.DataFrame(
-            {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1e6}, index=idx))
-    return db
-
-
-def test_a_pinned_vix_window_is_judged_against_its_end_not_today(tmp_path, monkeypatch):
-    db = _seed(tmp_path, start="2024-01-02", end="2025-12-31")
-    monkeypatch.setattr(md, "today_et", lambda: TODAY)
-    calls = _fake_yahoo(monkeypatch, rows=300)
-    df = md.load_daily_ohlcv("^VIX", days=730, db_path=db, research=True,
-                             start_date=date(2024, 1, 2), end_date=date(2025, 12, 31))
-    assert calls["n"] == 0, "Yahoo was asked although the store covers the pinned window"
-    assert df.index.max() == pd.Timestamp("2025-12-31") and df["Close"].iloc[-1] == pytest.approx(15.5)
-
-
-def test_a_pinned_vix_window_without_a_start_is_anchored_to_its_end(tmp_path, monkeypatch):
-    """No start_date: `days` before the END, not before today (today - 760 would hold only ~315 bars)."""
-    db = _seed(tmp_path, start="2023-01-02", end="2025-12-31")
-    monkeypatch.setattr(md, "today_et", lambda: TODAY)
-    calls = _fake_yahoo(monkeypatch, rows=300)
-    df = md.load_daily_ohlcv("^VIX", days=730, db_path=db, research=True, end_date=date(2025, 12, 31))
-    assert calls["n"] == 0
-    assert df.index.max() == pd.Timestamp("2025-12-31") and len(df) > 500
-
-
-def test_a_pinned_symbol_window_is_judged_against_its_end_not_today(tmp_path, monkeypatch):
-    db = _seed(tmp_path, start="2024-01-02", end="2025-12-31", symbol="QQQ")
-    monkeypatch.setattr(md, "today_et", lambda: TODAY)
-    out = md._load_research_daily("QQQ", 730, db, "", date(2024, 1, 2), date(2025, 12, 31))
-    assert out is not None and out.index.max() == pd.Timestamp("2025-12-31")
-
-
-def test_without_an_end_date_a_short_store_still_falls_back(tmp_path, monkeypatch):
-    """Unpinned = the window ends today, so a store that stopped in 2025 IS short."""
-    db = _seed(tmp_path, start="2024-01-02", end="2025-12-31")
-    monkeypatch.setattr(md, "today_et", lambda: TODAY)
-    calls = _fake_yahoo(monkeypatch, rows=300)
-    md.load_daily_ohlcv("^VIX", days=730, db_path=db, research=True, start_date=date(2024, 1, 2))
-    assert calls["n"] == 1
-
-
-def test_a_pinned_symbol_window_still_falls_back_when_it_is_really_short(tmp_path, monkeypatch):
-    db = _seed(tmp_path, start="2025-10-01", end="2025-12-31", symbol="QQQ")     # ~65 bars of ~500
-    monkeypatch.setattr(md, "today_et", lambda: TODAY)
-    out = md._load_research_daily("QQQ", 730, db, "", date(2024, 1, 2), date(2025, 12, 31))
-    assert out is None
 
 
 # --------------------------------------------------------------------------- the wing snap respects the budget
@@ -175,31 +111,3 @@ def test_an_empty_answer_is_still_final():
     store = _temp_store()
     _run(store, _FakeClient(bars=[]))
     assert store.option_fetch_is_final(_contract()["option_ticker"], date(2024, 9, 1)) is True
-
-
-# --------------------------------------------------------------------------- the walk-forward's VIX staleness check
-
-def _frame(end: str, close: float, tz=None) -> pd.DataFrame:
-    idx = pd.bdate_range(end=end, periods=300, tz=tz)
-    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close, "Volume": 0.0}, index=idx)
-
-
-class _Loader:
-    def __init__(self, stored_end: str):
-        self.calls: list[bool] = []
-        self._stored_end = stored_end
-
-    def __call__(self, symbol, *, research, **kw):
-        self.calls.append(research)
-        return _frame(self._stored_end, 30.0) if research else _frame("2026-10-27", 18.0)
-
-
-def test_a_tz_aware_symbol_index_does_not_break_the_staleness_check(tmp_path):
-    wf = WalkForwardBacktester(["SPY"], ["iron_condor"], db_path=tmp_path / "h.db")
-    data = {"SPY": _frame("2026-10-27", 1.0, tz="America/New_York")}
-    stale = _Loader(stored_end="2026-08-25")
-    vix = wf._load_vix_context(stale, 400, data)
-    assert stale.calls == [True, False] and vix["Close"].iloc[-1] == 18.0
-    current = _Loader(stored_end="2026-10-27")
-    assert wf._load_vix_context(current, 400, data)["Close"].iloc[-1] == 30.0
-    assert current.calls == [True]

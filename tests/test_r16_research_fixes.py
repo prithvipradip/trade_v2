@@ -471,7 +471,7 @@ class TestWalkforwardTz:
         import ait.data.market_data as md
 
         monkeypatch.setattr(
-            md, "load_daily_ohlcv", lambda s, days=0, db_path=None: _aware_df()
+            md, "load_daily_ohlcv", lambda s, days=0, db_path=None, **kw: _aware_df()
         )
         wf = WalkForwardBacktester(["SPY"], ["iron_condor"])
         data = asyncio.run(wf._fetch_data())
@@ -485,7 +485,7 @@ class TestWalkforwardTz:
         import ait.data.market_data as md
 
         monkeypatch.setattr(
-            md, "load_daily_ohlcv", lambda s, days=0, db_path=None: pd.DataFrame()
+            md, "load_daily_ohlcv", lambda s, days=0, db_path=None, **kw: pd.DataFrame()
         )
         wf = WalkForwardBacktester(["SPY"], ["iron_condor"])
         captured: dict = {}
