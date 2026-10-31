@@ -1466,13 +1466,15 @@ class HistoricalDataStore:
     def option_fetch_is_final(self, option_ticker: str, start_date: date) -> bool:
         """W106: is this contract's history already complete for a run starting at `start_date`?
         True only when an earlier fetch was made AFTER the contract expired, reached its expiry, and
-        started no later than `start_date`: then an empty answer stays empty. A fetch over part of
-        the contract's life (a later --start-date, an --end-date before expiry) is not final."""
+        started no later than `start_date`, and the provider returned NO bars: then an empty answer
+        stays empty. A fetch over part of the contract's life (a later --start-date, an --end-date
+        before expiry) is not final, and neither is one whose bars were all dropped for want of an
+        underlying close (bars > 0, rows_saved = 0): it is asked again once those closes exist."""
         with sqlite3.connect(self._db_path) as conn:
             row = conn.execute(
                 f"SELECT 1 FROM {self._option_fetch_log_table} "
                 f"WHERE option_ticker = ? AND fetched_on > expiry AND fetched_to >= expiry "
-                f"AND fetched_from <= ? LIMIT 1",
+                f"AND fetched_from <= ? AND bars = 0 LIMIT 1",
                 (option_ticker, start_date.isoformat()),
             ).fetchone()
         return row is not None

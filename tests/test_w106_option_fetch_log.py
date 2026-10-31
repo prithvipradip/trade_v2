@@ -1,10 +1,11 @@
 """W106 item 9: a contract that came back empty is not fetched again on every run.
 
-A contract with no bars (never traded) or no storable bar (no underlying close)
-stored nothing, so `option_ticker_has_data` stayed False and every plain run spent
-another rate-limited call on it (~2,000 SPY contracts, ~7 h per restart at 12.5 s).
-A fetch made after the contract expired is now recorded and is final; one made
-before expiry is not (more bars can still come); `--retry-empty` overrides.
+A contract with no bars (never traded) stored nothing, so `option_ticker_has_data` stayed False
+and every plain run spent another rate-limited call on it (~2,000 SPY contracts, ~7 h per restart
+at 12.5 s). A fetch made after the contract expired that returned no bars is now recorded and is
+final; one made before expiry is not (more bars can still come); a fetch whose bars were all
+dropped for want of an underlying close is not final either (it is asked again once the closes
+exist); `--retry-empty` overrides.
 """
 from __future__ import annotations
 
@@ -32,12 +33,16 @@ def test_an_expired_empty_contract_is_fetched_once():
     assert _run(store, again) == 0 and again.fetch_calls == 0
 
 
-def test_a_bar_without_an_underlying_close_counts_as_empty_too():
+def test_a_bar_without_an_underlying_close_is_asked_again():
+    """Bars came back but none could be stored (no underlying close that day): not final, so the
+    contract is fetched again once daily_prices has the close."""
     store = _temp_store()
     t_ms = int(pd.Timestamp(date(2024, 9, 18), tz="UTC").timestamp() * 1000)
     bars = [{"o": 5.0, "h": 5.5, "l": 4.8, "c": 5.2, "v": 1000, "vw": 5.1, "n": 200, "t": t_ms}]
     assert _run(store, _FakeClient(bars=bars)) == 0
-    assert _run(store, _FakeClient(raise_on_fetch=True)) == 0
+    again = _FakeClient(bars=bars)
+    _run(store, again)
+    assert again.fetch_calls == 1
 
 
 def test_retry_empty_fetches_again():

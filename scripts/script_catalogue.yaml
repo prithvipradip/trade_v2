@@ -401,7 +401,7 @@ scripts/iv_rank_parity_probe.py:
   what: "Compares the research IV-rank rise veto with live's IV-rank level gates: how the two ranks relate and how many vetoed days live would have traded anyway."
   when: "To revisit whether the research veto belongs in research."
   needs_ib: "no"
-  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the pre-W91 research table set (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone. With --ab: A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
+  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the research table set that was archived when the research and live tables were merged (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone. With --ab: A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/iv_rank_parity_probe.py [--research-prefix archive_w91_research_] [--ab --workers 6]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
   stamp: "1630471f3d74"
