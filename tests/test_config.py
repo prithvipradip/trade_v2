@@ -58,12 +58,36 @@ class TestValidConfig:
         assert config.max_daily_loss_pct == 0.20
 
 
-class TestOptionsRangeValidation:
-    """Test dte_range validation (W106: the unread delta_range was deleted)."""
+class TestDeltaRangeValidation:
+    """Test delta_range validation."""
 
-    def test_delta_range_is_no_longer_a_setting(self) -> None:
+    def test_valid_delta_range(self) -> None:
+        config = OptionsConfig(delta_range=[0.20, 0.50])
+        assert config.delta_range == [0.20, 0.50]
+
+    def test_delta_range_wrong_order(self) -> None:
         with pytest.raises(ValidationError, match="delta_range"):
-            OptionsConfig(delta_range=[0.20, 0.50])
+            OptionsConfig(delta_range=[0.50, 0.20])
+
+    def test_delta_range_at_zero(self) -> None:
+        with pytest.raises(ValidationError, match="delta_range"):
+            OptionsConfig(delta_range=[0.0, 0.50])
+
+    def test_delta_range_at_one(self) -> None:
+        with pytest.raises(ValidationError, match="delta_range"):
+            OptionsConfig(delta_range=[0.20, 1.0])
+
+    def test_delta_range_equal_values(self) -> None:
+        with pytest.raises(ValidationError, match="delta_range"):
+            OptionsConfig(delta_range=[0.30, 0.30])
+
+    def test_delta_range_too_few_elements(self) -> None:
+        with pytest.raises(ValidationError, match="delta_range"):
+            OptionsConfig(delta_range=[0.30])
+
+    def test_delta_range_too_many_elements(self) -> None:
+        with pytest.raises(ValidationError, match="delta_range"):
+            OptionsConfig(delta_range=[0.10, 0.30, 0.50])
 
     def test_dte_range_valid(self) -> None:
         config = OptionsConfig(dte_range=[7, 60])

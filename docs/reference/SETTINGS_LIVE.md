@@ -4,7 +4,7 @@
 
 Every setting of the live bot and the supervisor, and the sections research shares (`ml`, `regime`, `meta_label`, `exit`, `options`, ...). Research-only settings (`backtest`, `parity`) are in [SETTINGS_RESEARCH.md](SETTINGS_RESEARCH.md). The *Shipped* column is what `config.yaml` sets; a key it does not list runs at the schema default. Explanations and the rules that link settings: [GUIDE.md](../GUIDE.md#13-configuration-system) and [MODELS.md](../MODELS.md). Secrets come only from `.env` and are never shown here.
 
-372 settings; 0 have no description in the schema yet (shown as `-`).
+376 settings; 0 have no description in the schema yet (shown as `-`).
 
 ## Trading universe, mode and cadence (`trading`)
 
@@ -14,6 +14,7 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | `trading.universe` | `list[str]` | - | [SPY, QQQ, AAPL] | [SPY, QQQ, IWM] | config.yaml | Symbols the bot scans for entries. |
 | `trading.scan_interval_seconds` | `int` | 30 - 3600 | 300 | 300 | config.yaml | Seconds between entry scans, counted from when the previous scan finishes. |
 | `trading.max_daily_trades` | `int` | 1 - 50 | 5 | 12 | config.yaml | Upper bound on new positions opened per day; the time-of-day trade budget (first hour, midday, rest of the session) is bounded by it. |
+| `trading.trading_hours_only` | `bool` | - | true | true | config.yaml | Not read by any code: regular trading hours are enforced unconditionally by the scheduler and by the executor (the executor override is the environment variable AIT_ALLOW_AFTER_HOURS=1). |
 | `trading.no_new_entries_minutes_before_close` | `int` | 0 - 120 | 15 | 15 | config.yaml | No new entries inside this many minutes of the session close. |
 | `trading.first_hour_end_et` | `str` | - | 10:30 | 10:30 | config.yaml | End of the 'first hour' (ET). |
 | `trading.midday_end_et` | `str` | - | 14:00 | 14:00 | config.yaml | End of the mid-day window (ET). |
@@ -92,6 +93,7 @@ Every setting of the live bot and the supervisor, and the sections research shar
 
 | Setting | Type | Allowed range | Default | Shipped | Listed in | Meaning |
 |---|---|---|---|---|---|---|
+| `options.delta_range` | `list[float]` | - | [0.2, 0.5] | [0.2, 0.5] | config.yaml | Not read by any code: long-option strike targeting uses its own constant, and live trades iron condors only. |
 | `options.dte_range` | `list[int]` | - | [14, 45] | [14, 30] | config.yaml | Days-to-expiry band, [minimum, maximum], for new entries; the range model's horizon is derived from its minimum. |
 | `options.min_open_interest` | `int` | 0 - .. | 100 | 10 | config.yaml | Option contracts with less open interest than this are dropped from the chain. |
 | `options.min_volume` | `int` | 0 - .. | 50 | 0 | config.yaml | Option contracts with less volume than this are dropped from the chain. |
@@ -302,6 +304,7 @@ Every setting of the live bot and the supervisor, and the sections research shar
 |---|---|---|---|---|---|---|
 | `meta_label.enabled` | `bool` | - | false | false | config.yaml | Master switch for the meta-labeler gate (off today). |
 | `meta_label.min_probability` | `float` | 0.3 - 0.8 | 0.5 | 0.5 | config.yaml | Minimum predicted probability of profit for the meta-labeler to let a trade through, when it acts. |
+| `meta_label.retrain_with_primary` | `bool` | - | true | true | config.yaml | Not read by any code: the live trainer has no meta-labeler retrain, and the gate itself is off. |
 | `meta_label.min_trades_for_training` | `int` | 10 - 1000 | 30 | 30 | config.yaml | The meta-labeler is not trained on fewer closed trades than this. min_closes_to_enable below is the separate question of when its output is TRUSTED for live entries. |
 | `meta_label.min_class_trades` | `int` | 2 - 500 | 5 | 5 | config.yaml | The meta-labeler also needs at least this many profitable and this many unprofitable closed trades. |
 | `meta_label.cv_max_splits` | `int` | 2 - 20 | 5 | 5 | config.yaml | Its training cross-validation uses at most this many folds. |
@@ -381,6 +384,7 @@ Every setting of the live bot and the supervisor, and the sections research shar
 | `exit.time_decay_scaling` | `bool` | - | true | true | config.yaml | Shrinks the take-profit target as expiry nears (the take-profit ladder). |
 | `exit.volatility_adjusted_stops` | `bool` | - | true | true | config.yaml | Widens the stop for volatile underlyings (debit structures only). |
 | `exit.initial_stop_loss_pct` | `float` | 0.15 - 0.75 | 0.5 | 0.5 | config.yaml | Fixed stop, as a fraction of cost, before the breakeven trigger activates (debit structures). |
+| `exit.auto_hedge` | `bool` | - | false | false | config.yaml | Not read by any code: no hedging code exists in the live tree. |
 | `exit.max_quote_staleness_seconds` | `float` | 30.0 - 900.0 | 180.0 | 180.0 | neither (schema default) | Underlying quote older than this (by exchange tick time) marks the touch stop's input DEGRADED — it then needs two agreeing ticks to fire instead of one. |
 | `exit.touch_confirm_ticks` | `int` | 1 - 5 | 2 | 2 | neither (schema default) | Consecutive agreeing evaluations required before a touch stop fires on a degraded/frozen quote. 1 = fire on a single stale print. |
 | `exit.max_quote_spread_pct` | `float` | 0.02 - 0.5 | 0.15 | 0.15 | neither (schema default) | Underlying quote bid-ask spread above this marks the touch stop's input DEGRADED — same two-agreeing-ticks confirmation as a stale or outlier print. |
