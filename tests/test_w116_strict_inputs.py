@@ -52,6 +52,17 @@ class TestTheDefault:
         assert strict.STRICT_INPUTS_DEFAULT is True
         assert strict.resolve_strict(None) is True and strict.resolve_strict(False) is False
 
+    def test_a_fresh_process_defaults_to_strict(self):
+        """The conftest turns the default off for the suite (and on again for this module), so the SOURCE's default
+        is only visible from a process that never ran it."""
+        import subprocess
+        import sys
+        out = subprocess.run([sys.executable, "-c",
+                              "from ait.backtesting import strict; print(strict.STRICT_INPUTS_DEFAULT, strict.resolve_strict(None))"],
+                             capture_output=True, text=True, env={**__import__("os").environ,
+                                                                  "PYTHONPATH": str(ROOT / "src")})
+        assert out.stdout.split() == ["True", "True"], out.stderr
+
     def test_an_engine_and_a_walk_forward_built_without_the_flag_are_strict(self):
         assert WalkForwardBacktester(["SPY"], ["iron_condor"], db_path=Path("x.db"))._strict is True
 
