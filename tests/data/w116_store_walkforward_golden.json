@@ -1,0 +1,378 @@
+{
+ "entry_funnel": {
+  "QQQ": {
+   "builder:credit_floor": 3,
+   "builder:iv_floor": 56,
+   "builder_none": 59,
+   "days_evaluated": 736,
+   "entries_taken": 17,
+   "iv_rank_rise": 1,
+   "max_concurrent": 7,
+   "no_strategy": 652
+  },
+  "SPY": {
+   "builder:iv_floor": 79,
+   "builder_none": 79,
+   "days_evaluated": 736,
+   "iv_rank_rise": 8,
+   "no_strategy": 649
+  }
+ },
+ "equity_curve": [
+  [
+   "2022-11-15 00:00:00",
+   4850.58
+  ],
+  [
+   "2022-11-30 00:00:00",
+   4754.62
+  ],
+  [
+   "2022-12-06 00:00:00",
+   4651.14
+  ],
+  [
+   "2022-12-15 00:00:00",
+   4605.43
+  ],
+  [
+   "2023-01-12 00:00:00",
+   4431.17
+  ],
+  [
+   "2023-02-28 00:00:00",
+   4321.83
+  ],
+  [
+   "2023-03-02 00:00:00",
+   4178.2
+  ],
+  [
+   "2023-04-28 00:00:00",
+   4034.7
+  ],
+  [
+   "2023-05-01 00:00:00",
+   4012.16
+  ],
+  [
+   "2023-05-25 00:00:00",
+   3903.6099999999997
+  ],
+  [
+   "2023-06-02 00:00:00",
+   3849.12
+  ],
+  [
+   "2023-06-05 00:00:00",
+   3791.63
+  ],
+  [
+   "2023-06-22 00:00:00",
+   3726.9700000000003
+  ],
+  [
+   "2023-08-09 00:00:00",
+   3645.9300000000003
+  ],
+  [
+   "2023-08-09 00:00:00",
+   3557.2400000000002
+  ]
+ ],
+ "metrics": {
+  "avg_loss": 96.184,
+  "avg_win": 0.0,
+  "avg_window_return": -0.05771040000000001,
+  "best_trade": -22.54,
+  "capital_utilization": 0.016798704761904763,
+  "cash_drag_adjusted_return": -0.24615522956878846,
+  "consistency": 0.0,
+  "expectancy": -96.184,
+  "max_drawdown": 0.288552,
+  "profit_factor": 0.0,
+  "raroc": -17.177038592544548,
+  "sharpe_ratio": -10.03313938267851,
+  "sortino_ratio": -10.03313938267851,
+  "total_return": -0.288552,
+  "total_trades": 15,
+  "win_rate": 0.0,
+  "worst_trade": -174.26
+ },
+ "strategy_results": {
+  "iron_condor": {
+   "avg_pnl": -96.184,
+   "losses": 15,
+   "total_pnl": -1442.76,
+   "trades": 15,
+   "win_rate": 0.0,
+   "wins": 0
+  }
+ },
+ "symbol_results": {
+  "QQQ": {
+   "final_capital": 3557.24,
+   "initial_capital": 5000.0,
+   "total_trades": 15
+  }
+ },
+ "windows": [
+  {
+   "final_capital": 4754.62,
+   "initial_capital": 5000.0,
+   "max_drawdown": 0.04907600000000002,
+   "pool_rejections": {},
+   "test_end": "2022-11-30",
+   "test_start": "2022-09-28",
+   "total_return": -0.04907600000000002,
+   "trades": [
+    {
+     "contracts": 1,
+     "credit": 32.27,
+     "entry_date": "2022-11-14",
+     "entry_price": 0.3227,
+     "exit_date": "2022-11-15",
+     "exit_price": 1.7435,
+     "exit_reason": "touch_stop",
+     "max_loss": 267.73,
+     "pnl": -149.42,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 27.82,
+     "entry_date": "2022-11-30",
+     "entry_price": 0.2782,
+     "exit_date": "2022-11-30",
+     "exit_price": 1.1645,
+     "exit_reason": "backtest_end",
+     "max_loss": 272.18,
+     "pnl": -95.96,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    }
+   ],
+   "window_id": 2
+  },
+  {
+   "final_capital": 4676.55,
+   "initial_capital": 5000.0,
+   "max_drawdown": 0.06468999999999997,
+   "pool_rejections": {},
+   "test_end": "2023-02-01",
+   "test_start": "2022-11-30",
+   "total_return": -0.06468999999999997,
+   "trades": [
+    {
+     "contracts": 1,
+     "credit": 27.82,
+     "entry_date": "2022-11-30",
+     "entry_price": 0.2782,
+     "exit_date": "2022-12-06",
+     "exit_price": 1.2396,
+     "exit_reason": "touch_stop",
+     "max_loss": 272.18,
+     "pnl": -103.48,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 29.28,
+     "entry_date": "2022-12-06",
+     "entry_price": 0.2928,
+     "exit_date": "2022-12-15",
+     "exit_price": 0.6765,
+     "exit_reason": "expiry_approaching",
+     "max_loss": 270.72,
+     "pnl": -45.71,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 28.5,
+     "entry_date": "2023-01-04",
+     "entry_price": 0.285,
+     "exit_date": "2023-01-12",
+     "exit_price": 1.9542,
+     "exit_reason": "touch_stop",
+     "max_loss": 271.5,
+     "pnl": -174.26,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    }
+   ],
+   "window_id": 3
+  },
+  {
+   "final_capital": 4747.03,
+   "initial_capital": 5000.0,
+   "max_drawdown": 0.05059400000000005,
+   "pool_rejections": {},
+   "test_end": "2023-04-05",
+   "test_start": "2023-02-01",
+   "total_return": -0.05059400000000005,
+   "trades": [
+    {
+     "contracts": 1,
+     "credit": 20.82,
+     "entry_date": "2023-02-21",
+     "entry_price": 0.2082,
+     "exit_date": "2023-02-28",
+     "exit_price": 1.2282,
+     "exit_reason": "touch_stop",
+     "max_loss": 279.18,
+     "pnl": -109.34,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 22.59,
+     "entry_date": "2023-02-22",
+     "entry_price": 0.2259,
+     "exit_date": "2023-03-02",
+     "exit_price": 1.5889,
+     "exit_reason": "touch_stop",
+     "max_loss": 277.41,
+     "pnl": -143.63,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    }
+   ],
+   "window_id": 4
+  },
+  {
+   "final_capital": 4613.43,
+   "initial_capital": 5000.0,
+   "max_drawdown": 0.07731399999999994,
+   "pool_rejections": {
+    "correlation_cluster": 2
+   },
+   "test_end": "2023-06-07",
+   "test_start": "2023-04-05",
+   "total_return": -0.07731399999999994,
+   "trades": [
+    {
+     "contracts": 1,
+     "credit": 24.26,
+     "entry_date": "2023-04-19",
+     "entry_price": 0.2426,
+     "exit_date": "2023-04-28",
+     "exit_price": 1.6043,
+     "exit_reason": "touch_stop",
+     "max_loss": 275.74,
+     "pnl": -143.5,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 24.31,
+     "entry_date": "2023-04-20",
+     "entry_price": 0.2431,
+     "exit_date": "2023-05-01",
+     "exit_price": 0.3951,
+     "exit_reason": "expiry_approaching",
+     "max_loss": 275.69,
+     "pnl": -22.54,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 21.5,
+     "entry_date": "2023-05-19",
+     "entry_price": 0.215,
+     "exit_date": "2023-05-25",
+     "exit_price": 1.2272,
+     "exit_reason": "touch_stop",
+     "max_loss": 278.5,
+     "pnl": -108.55,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 23.18,
+     "entry_date": "2023-05-24",
+     "entry_price": 0.2318,
+     "exit_date": "2023-06-02",
+     "exit_price": 0.7034,
+     "exit_reason": "expiry_approaching",
+     "max_loss": 276.82,
+     "pnl": -54.49,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 23.57,
+     "entry_date": "2023-05-26",
+     "entry_price": 0.2357,
+     "exit_date": "2023-06-05",
+     "exit_price": 0.7373,
+     "exit_reason": "expiry_approaching",
+     "max_loss": 276.43,
+     "pnl": -57.49,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    }
+   ],
+   "window_id": 5
+  },
+  {
+   "final_capital": 4765.61,
+   "initial_capital": 5000.0,
+   "max_drawdown": 0.046877999999999885,
+   "pool_rejections": {},
+   "test_end": "2023-08-09",
+   "test_start": "2023-06-07",
+   "total_return": -0.046878000000000065,
+   "trades": [
+    {
+     "contracts": 1,
+     "credit": 22.01,
+     "entry_date": "2023-06-13",
+     "entry_price": 0.2201,
+     "exit_date": "2023-06-22",
+     "exit_price": 0.7933,
+     "exit_reason": "expiry_approaching",
+     "max_loss": 277.99,
+     "pnl": -64.66,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 19.39,
+     "entry_date": "2023-08-08",
+     "entry_price": 0.1939,
+     "exit_date": "2023-08-09",
+     "exit_price": 0.931,
+     "exit_reason": "backtest_end",
+     "max_loss": 280.61,
+     "pnl": -81.04,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    },
+    {
+     "contracts": 1,
+     "credit": 20.5,
+     "entry_date": "2023-08-09",
+     "entry_price": 0.205,
+     "exit_date": "2023-08-09",
+     "exit_price": 1.0185,
+     "exit_reason": "backtest_end",
+     "max_loss": 279.5,
+     "pnl": -88.69,
+     "strategy": "iron_condor",
+     "symbol": "QQQ"
+    }
+   ],
+   "window_id": 6
+  }
+ ]
+}
