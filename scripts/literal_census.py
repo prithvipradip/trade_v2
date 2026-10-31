@@ -42,7 +42,7 @@ MODULES = [
     *(f"src/ait/backtesting/{m}.py" for m in (
         "engine", "walkforward", "learner", "replay", "pricing", "iv_surface", "iv_model", "settlement", "friction",
         "study_harness", "result", "pool", "range_bank", "run_record", "ex_div", "dte_report", "gate_parity",
-        "expiry_calendar", "iv_rank_compare", "strict")),
+        "expiry_calendar", "iv_rank_compare", "strict", "preflight")),
     *(f"src/ait/optimization/{m}.py" for m in ("optimizer", "objectives", "results")),
     *(f"src/ait/ml/{m}.py" for m in (
         "trainer", "meta_label", "hyperparams", "features", "ensemble", "range_predictor", "vol_magnitude_predictor",

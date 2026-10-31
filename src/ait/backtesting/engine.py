@@ -560,6 +560,7 @@ class Backtester:
         self._leg_spread_model = None  # set by _load_leg_spread_model() when per_leg_usd
         # W66: entry-funnel counters (see _reject / BacktestResult.entry_funnel)
         self._funnel: Counter = Counter()
+        self._declared: Counter = Counter()      # W116: counts of the declared modelling behaviours (see BacktestResult)
         self._max_contracts_per_trade = (
             int(max_contracts_per_trade) if max_contracts_per_trade else None)
         self._stop_loss_pct = stop_loss_pct
@@ -879,6 +880,11 @@ class Backtester:
         the labeler's ``min_probability`` was; it now reports the labeler's own cut, else ``meta_label.min_probability``."""
         mp = getattr(self._meta_labeler, "min_probability", None)
         return float(mp if mp is not None else self._meta_min_probability)
+
+    def _count_declared(self, name: str) -> None:
+        """W116: count one use of a declared modelling behaviour (partial engines built with __new__ count nothing)."""
+        if self._declared is not None:
+            self._declared[name] += 1
 
     def _reject(self, reason: str) -> None:
         """W66: record that an evaluated day ended in this entry rejection.
@@ -1675,6 +1681,8 @@ class Backtester:
             start_date=dates[0].date() if hasattr(dates[0], "date") else dates[0],
             end_date=last_date,
             entry_funnel=dict(self._funnel),
+            declared_models={**{k: int(v) for k, v in self._declared.items()},
+                             **{f"surface_legs_{k}": int(v) for k, v in self._surface_stats.items() if v}},
         )
 
         log.info(
@@ -2057,6 +2065,7 @@ class Backtester:
                     return pred.direction, pred.confidence, features_df
             except Exception:
                 pass
+        self._count_declared("direction_fallback_days")      # W116: declared: no model direction this day
         direction, confidence = self._simple_direction(hist)
         return direction, confidence, features_df
 
@@ -2274,6 +2283,7 @@ class Backtester:
     # and set only what they need; those instances must stay on LEGACY semantics
     # (the same idiom as the W70 executor durations). __init__ overwrites all four.
     _earnings_exempt: frozenset = frozenset()   # W116: set from backtest.earnings_exempt_symbols by __init__
+    _declared = None                        # W116: a Counter set by __init__; partial engines count nothing
     _strict: bool = False                   # W116: partial engines (Backtester.__new__) keep the synthetic-inputs behaviour
     _engine_model: str = "legacy"
     _friction_short_dte: bool = False       # W76
@@ -3432,6 +3442,7 @@ class Backtester:
         entry_iv = pos.get("entry_iv") or pos.get("iv", self._iv_floor)
         if hist is None:
             return entry_iv
+        self._count_declared("iv_blend_remarks")             # W116: declared model: entry IV blended with realized vol
         return iv_model.remark_iv(entry_iv, hist["Close"].values, self._iv_floor)
 
     def _eod(self, d: date) -> datetime:

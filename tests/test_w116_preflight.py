@@ -35,7 +35,7 @@ def db(tmp_path):
 def _req(db, **kw):
     last = LAST
     base = dict(window=ri.Window(date(2022, 6, 1), last), symbols=("SPY", "QQQ"), db_path=db,
-                max_null_iv_run=3, max_dividend_gap_days=100)
+                max_null_iv_run=3, max_dividend_gap_days=100, max_event_gap_days=120)
     base.update(kw)
     return ri.ResearchRequest(**base)
 
@@ -152,31 +152,43 @@ class TestDividends:
 
 
 class TestEconEvents:
-    def _seed(self, db, types=("FOMC", "CPI"), first="2021-12-01", last="2026-12-31", source=SOURCE_INVESTING_CSV):
+    def _seed(self, db, types=("FOMC", "CPI"), first="2021-12-01", last="2026-12-31", source=SOURCE_INVESTING_CSV,
+              extra_rows=()):
         HistoricalDataStore(db_path=db)
-        for t in types:
-            for d in (first, last):
-                _sql(db, "INSERT INTO econ_events (event_date, event, country, engine_event_type, source) "
-                         "VALUES (?,?,?,?,?)", (d, f"{t} {d}", "United States", t, source))
+        rows = [(d, t) for t in types for d in (first, last)] + list(extra_rows)
+        for d, t in rows:
+            _sql(db, "INSERT INTO econ_events (event_date, event, country, engine_event_type, source) "
+                     "VALUES (?,?,?,?,?)", (d, f"{t} {d}", "United States", t, source))
 
-    def test_events_spanning_the_window_and_lookahead_pass(self, db):
-        self._seed(db)
-        assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"),
-                                             macro_lookahead_days=5)).ok
+    def test_events_inside_the_window_and_an_export_that_covers_it_pass(self, db):
+        self._seed(db, extra_rows=[("2023-06-14", "FOMC"), ("2023-06-13", "CPI")])
+        assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))).ok
+
+    def test_a_type_that_first_occurs_after_the_window_start_is_not_a_gap(self, db):
+        """The first FOMC of a year is weeks into it: the export's own start, not the type's, is the bound."""
+        self._seed(db, types=("FOMC",), first="2021-12-01", last="2026-12-31",
+                   extra_rows=[("2022-07-27", "FOMC"), ("2023-09-20", "FOMC")])
+        assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",),
+                                             window=ri.Window(date(2022, 6, 1), LAST))).ok
 
     def test_a_type_with_no_rows_is_a_gap(self, db):
         self._seed(db, types=("FOMC",))
-        (g,) = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "NFP"))),
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "NFP"))),
                      "econ_events")
-        assert g.symbol == "NFP" and "load_econ_calendar_csv.py" in g.remedy
+        assert any(g.symbol == "NFP" and "load_econ_calendar_csv.py" in g.remedy for g in gaps)
 
-    def test_a_calendar_that_ends_before_the_window_is_a_gap(self, db):
-        self._seed(db, last="2023-12-29")
-        (g,) = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))), "econ_events")
-        assert "2023-12-29" in g.found
+    def test_an_export_that_starts_after_the_window_start_is_a_gap(self, db):
+        self._seed(db, first="2023-01-03", extra_rows=[("2023-06-14", "FOMC")])
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))), "econ_events")
+        assert any(g.symbol is None and "starts on or before" in g.required and "2023-01-03" in g.found for g in gaps)
+
+    def test_a_type_whose_last_event_is_long_before_the_window_ends_is_a_gap(self, db):
+        self._seed(db, types=("FOMC",), first="2021-12-01", last="2023-01-25", extra_rows=[("2025-01-01", "CPI")])
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))), "econ_events")
+        assert any(g.symbol == "FOMC" and "2023-01-25" in g.found for g in gaps)
 
     def test_a_foreign_tag_is_a_gap(self, db):
-        self._seed(db, source="HARDCODED")
+        self._seed(db, source="HARDCODED", extra_rows=[("2023-06-14", "FOMC"), ("2023-06-13", "CPI")])
         assert any("HARDCODED" in g.found for g in _gaps(
             ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))), "econ_events"))
 
@@ -300,6 +312,7 @@ READERS = {
     "load_daily_iv": "daily_prices",
     "load_daily_iv_bars": "daily_iv",
     "load_dividends": "dividends",
+    "load_earnings_sessions": "earnings_schedule",
     "econ_events_span": "econ_events",
     "load_econ_events": "econ_events",
     "load_intraday": "intraday_prices",

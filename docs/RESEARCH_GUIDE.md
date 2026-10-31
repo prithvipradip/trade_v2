@@ -36,7 +36,7 @@ Every row of history stored in `data/historical.db` carries a `source` tag sayin
 | Underlying daily OHLCV (SPY, QQQ, IWM) | `daily_prices` | `IB_TRADES_RTH` | daily retrain (append-only), `backfill_historical_data.py --mode daily` |
 | Daily implied vol (close) | `daily_prices.implied_vol` | `IB_OPTION_IV` | `ait.data.iv_refresh` (retrain, `--mode iv`), the bot for today |
 | Daily implied vol (OHLC) | `daily_iv` | `IB_OPTION_IV` | `ait.data.iv_refresh` |
-| VIX, VIX3M, VIX6M, VIX9D (/100; research reads `^VIX` from here on the index scale, Yahoo only when the store is short) | `daily_iv` | `IB_INDEX_TRADES` | `ait.data.iv_refresh`, `--mode vix` |
+| VIX, VIX3M, VIX6M, VIX9D (/100; research reads `^VIX` from here on the index scale; there is no Yahoo fallback, see [10.3](#103-the-research-data-contract-stored-inputs-or-no-study)) | `daily_iv` | `IB_INDEX_TRADES` | `ait.data.iv_refresh`, `--mode vix` |
 | 5-minute bars | `intraday_prices` | `TRADES` | the bot (it only adds; no process deletes 5-minute bars, and the 730 days it reads for features is a load window, not a retention limit), `backfill_historical_data.py` |
 | Option daily bars + solved IV/greeks | `option_daily_bars` | Polygon | `backfill_option_history.py` |
 | Which option contracts were fetched, and how many bars came back | `option_fetch_log` | - | `backfill_option_history.py` |
@@ -126,6 +126,9 @@ module, run `python scripts/gen_docs.py`, and record the decision in `PLAN.md`; 
 | `RESEARCH_DELTA_MIN` | 0.05 | \|delta\| | Lower end of the delta band a strike search may be asked for. Below it the strike is far enough OTM that a modelled quote is noise. Also the lower bound the optimizer accepts for delta_short / delta_long overrides (a wider range would search values the engine clamps). | backtesting/engine.py (_build_debit_position, _build_credit_position); optimization/param_spaces.py HARD_BOUNDS |
 | `RESEARCH_DELTA_MAX` | 0.45 | \|delta\| | Upper end of the delta band a strike search may be asked for. Above it a leg is no longer out of the money; the structures built from it stop meaning what their names say. | backtesting/engine.py; optimization/param_spaces.py HARD_BOUNDS |
 | `IV_SCALE_MIN` | 0.5 | ratio | Lower clamp of the iv_floor / iv scaling applied to a builder's delta. Keeps one stale or extreme IV print from moving a strike by more than a factor of two. | backtesting/engine.py (_build_debit_position, _build_credit_position) |
+| `RESEARCH_MAX_NULL_IV_RUN_SESSIONS` | 3 | sessions | Longest run of consecutive sessions with no stored implied vol that a study may contain; an isolated gap is a counted no-entry day, a longer run (or a symbol with no stored IV) refuses the study. It is the line the stored history is checked AGAINST: if a study file could raise it, a study could be told to run on weeks of invented IV, which is the substitution the data contract exists to stop. | data/research_inputs.py (the implied-vol check); backtesting/preflight.py |
+| `RESEARCH_MAX_DIVIDEND_GAP_DAYS` | 100 | days | Longest gap after a symbol's last stored ex-dividend date for which the stored dividends still count as current for a window. Same reason: a stale dividend table silently turns the ex-dividend gate off at the tail of the window. | data/research_inputs.py (the dividends check); backtesting/preflight.py |
+| `RESEARCH_MAX_EVENT_GAP_DAYS` | 120 | days | Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current at the end of a window. Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window. | data/research_inputs.py (the econ_events check); backtesting/preflight.py |
 | `IV_SCALE_MAX` | 1.5 | ratio | Upper clamp of the same scaling. Same reason, other direction. | backtesting/engine.py |
 | `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | dollars | How far a settled gross loss may exceed the defined max loss before it is counted as over_max_loss. A floating-point tolerance, not a modelling choice; loosening it would hide a pricing bug. | backtesting/engine.py (_finish_settlement) |
 | `PROB_CLIP_EPS` | 0.0000001 | probability | Probabilities are clipped to [eps, 1 - eps] before log-loss. Numerical safety (log 0); not a modelling choice. | backtesting/walkforward.py (_prob_score_metrics) |
@@ -404,6 +407,34 @@ before trusting a DTE band in an Optuna study, and after any change to `backtest
   `parity.min_trades_per_band` is INSUFFICIENT, never PASS. Tolerances are the `parity:` block of `config_research.yaml` (operator-owned).
 - **Expiry settlement parity:** `summary.md` also reports, for every structure that reached its expiry bell, whether the modelled leg outcomes (expired / exercised / assigned) and leftover shares match the statement, and the P&L error.
 - **Never paste** per-trade prices, P&L or any account identifier into `PLAN.md`: it is shared via git with the other box. Report error statistics by DTE band only.
+
+### 10.3 The research data contract: stored inputs or no study
+
+Research never substitutes or mixes data sources. If an input a study needs is not stored, the study **does not start**: it stops with one message that lists every gap, what was needed, what was found and the command that closes it. There is no fallback to Yahoo, to 5-minute bars resampled into daily bars, to a hard-coded calendar, to a modelled implied vol or to the legacy friction model, and no switch that turns this off. (The live bot is unaffected: it has its own data path.)
+
+Check before you run, without running anything:
+
+```bash
+python scripts/research_preflight.py [--study-file studies/<name>.yaml] [--symbols QQQ] [--json]    # exit 0 = every input is stored, 2 = gaps
+```
+
+The walk-forward runs the same check first thing, `run_backtest.py` prints it, and a refusal exits with status 2 (the weekly backtest job records it in `reports/backtest_<ts>.json`). The window checked is the study's own: its `history_start_date` to its `history_end_date` (or the last completed session when it is not pinned), so a study pinned to a past end date keeps its inputs while the shared tables grow.
+
+| Input | What must be stored for the window | Fix |
+|---|---|---|
+| Daily bars (each traded symbol, and SPY for the context) | Every NYSE session, all tagged `IB_TRADES_RTH`. An unpinned study needs the last completed session, so a store that is a few days behind refuses. | `scripts/backfill_historical_data.py --symbols <SYM> --mode daily` |
+| Implied vol (each traded symbol) | A stored value on each session. An isolated missing session is a **no-entry day** (counted in the run's entry funnel as `builder:iv_missing`); a run of more than the fixed limit, or no IV at all, refuses. | `... --mode iv` |
+| VIX (`^VIX` for the context) | Every NYSE session of the context span, tagged `IB_INDEX_TRADES`. | `... --mode vix --symbols VIX` |
+| Dividends (when the ex-dividend gate is on) | Rows for each symbol, tagged `YAHOO_DIVIDENDS` (loaded once by the ingest script, then read from the store), the latest ex-date within the fixed gap of the window end. | `scripts/backfill_dividends.py --symbols <SYM>` |
+| Economic events (when the macro gate is on) | An export that starts on or before the window, and events of every configured type inside it. No hard-coded list. | `scripts/load_econ_calendar_csv.py --csv <export>` |
+| Earnings | `earnings_schedule` rows for the symbol, or the symbol listed in `backtest.earnings_exempt_symbols` (the index ETFs have none). | `scripts/build_research_calendars.py --what earnings` |
+| Per-leg friction (`friction_model: per_leg_usd`) | A fitted model for each symbol. | `scripts/calibrate_option_spreads.py --source ib-bars --symbols <SYM> ...` |
+| 5-minute bars (`backtest.intraday_features: true`) | Bars on at least `vlmc_min_coverage` of the sessions. Set the feature false to run on daily bars only; the choice is stated and logged, never made silently. | `... --mode intraday` |
+| Option bars (`pricing_source: surface`) | Bars for the symbol over the window; a leg the surface cannot price is counted in the run. | `scripts/backfill_option_history.py` |
+
+Fixed limits (not configurable, listed in [section 4](#4-configuration-where-every-value-lives) under the fixed research limits): the longest run of sessions without IV, the longest dividend and macro-event gaps.
+
+**Declared models.** Two behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, and a window whose ML model fails to train trades ungated. They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
 
 ---
 

@@ -84,16 +84,27 @@ def seeded(tmp_path):
 
 
 class TestEndToEndOnAStoredHistory:
-    def test_sessions_without_iv_become_counted_no_entry_days(self, seeded):
+    def test_isolated_sessions_without_iv_become_counted_no_entry_days(self, seeded):
         db, last = seeded
-        gaps = ri_dates = pd.bdate_range(gi.START, periods=gi.SESSIONS)[300:340]
+        sessions = pd.bdate_range(gi.START, periods=gi.SESSIONS)[250:520:3]       # single-session holes, never a run
         with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE daily_prices SET implied_vol=NULL WHERE symbol='QQQ' AND date>=? AND date<=?",
-                         (str(gaps[0].date()), str(gaps[-1].date())))
+            conn.executemany("UPDATE daily_prices SET implied_vol=NULL WHERE symbol='QQQ' AND date=?",
+                             [(str(d.date()),) for d in sessions])
         result = gi.run(db, reseed=False)
         funnel = result.entry_funnel
         assert funnel["QQQ"].get("builder:iv_missing", 0) > 0
         assert funnel["SPY"].get("builder:iv_missing", 0) == 0
+
+    def test_a_long_hole_in_the_iv_stops_the_study_before_it_starts(self, seeded):
+        db, last = seeded
+        hole = pd.bdate_range(gi.START, periods=gi.SESSIONS)[300:340]
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE daily_prices SET implied_vol=NULL WHERE symbol='QQQ' AND date>=? AND date<=?",
+                         (str(hole[0].date()), str(hole[-1].date())))
+        with pytest.raises(ResearchDataUnavailable) as e:
+            gi.run(db, reseed=False)
+        gap = e.value.gaps[0]
+        assert gap.input == "implied_vol" and gap.symbol == "QQQ" and "--mode iv" in gap.remedy
 
 
 class TestCalendarIsStoredOrRefused:

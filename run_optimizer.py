@@ -81,8 +81,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--table-prefix", default=None,
                    help="History table prefix (default: config backtest.research_table_prefix, '' = the one "
                         "shared set of tables since W91).")
-    p.add_argument("--legacy-history", action="store_true",
-                   help="W91: use the legacy loader (5-min resample / Yahoo) for this run.")
     p.add_argument("--db-path", default="data/historical.db",
                    help="SQLite store holding the research tables (default: data/historical.db).")
     p.add_argument("--storage", type=str, default=None, help="Optuna storage URL, e.g. sqlite:///data/optuna.db")
@@ -177,25 +175,22 @@ def main() -> None:
     try:
         from ait.config.settings import load_settings
         _bcfg = load_settings().backtest
-    except Exception:  # noqa: BLE001
-        _bcfg = None
-    _prefix = (args.table_prefix if args.table_prefix is not None
-               else (_bcfg.research_table_prefix if _bcfg else ""))
-    _research = (not args.legacy_history) and (bool(_prefix) or bool(_bcfg and _bcfg.research_history))   # W91
-    _calendar = None
-    if _research and _bcfg is not None:
-        from ait.data.economic_calendar import build_research_calendar
-        try:
-            _calendar = build_research_calendar(Path(args.db_path), _prefix, _bcfg.macro_event_types)
-        except Exception as _exc:  # noqa: BLE001
-            print(f"  ! research calendar unavailable ({_exc}); hardcoded calendar used")
-    print(f"  History:     {'stored history tables ' + _prefix + '* in ' + args.db_path if _research else 'legacy loader'}"
+    except Exception as _exc:  # noqa: BLE001
+        print(f"ERROR: config unavailable ({_exc}): a run on the model defaults is a different harness. "
+              f"Run from the repository root.", file=sys.stderr)
+        sys.exit(2)
+    _prefix = (args.table_prefix if args.table_prefix is not None else _bcfg.research_table_prefix)
+    # W116: research reads the stored history, always; the calendar is the stored one or the study does not start
+    from ait.data.economic_calendar import build_research_calendar
+    from ait.data.research_inputs import ResearchDataUnavailable
+    _calendar = build_research_calendar(Path(args.db_path), _prefix, _bcfg.macro_event_types)
+    print(f"  History:     stored history tables {_prefix}* in {args.db_path}"
           f"{' | research macro calendar' if _calendar else ''}")
 
     optimizer = StrategyOptimizer(
         table_prefix=_prefix,
-        db_path=(Path(args.db_path) if _research else None),
-        history_start_date=(_bcfg.history_start_date if (_bcfg and _research) else None),
+        db_path=Path(args.db_path),
+        history_start_date=_bcfg.history_start_date,
         economic_calendar=_calendar,
         symbols=args.symbols,
         strategies=args.strategies,
@@ -214,6 +209,9 @@ def main() -> None:
     print("\nRunning optimization...")
     try:
         result = optimizer.run()
+    except ResearchDataUnavailable as e:
+        print(f"\nREFUSED: {e}", file=sys.stderr)
+        sys.exit(2)
     except RuntimeError as e:
         print(f"\nERROR: {e}")
         sys.exit(1)

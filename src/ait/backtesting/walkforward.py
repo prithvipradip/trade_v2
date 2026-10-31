@@ -601,6 +601,9 @@ class WalkForwardResult:
     meta_training_status: dict = field(default_factory=dict)
     # W66: {symbol: {reason: days}} summed over every window (zero-trade windows included)
     entry_funnel: dict = field(default_factory=dict)
+    # W116: what the study's inputs were: the preflight report (window, inputs checked, the declared no-entry sessions)
+    # and the summed counts of the declared modelling behaviours; stamped in the run record
+    data_contract: dict = field(default_factory=dict)
     # W67: {window_id: {symbol: {"usable", "best_value", "best_n_trades"}}} (empty = no Optuna)
     optimization_status: dict = field(default_factory=dict)
     # W108 S1: how the windows' capital was set. "reset" = every window started at initial_capital (the run of record);
@@ -1283,7 +1286,8 @@ def _window_task_mp(args: tuple) -> tuple:
     )
     return (window_id, wr, best_params, meta_status,
             bt._funnel_by_window.get(window_id, {}),
-            bt._opt_status_by_window.get(window_id, {}))
+            bt._opt_status_by_window.get(window_id, {}),
+            bt._declared_by_window.get(window_id, {}))
 
 
 class WalkForwardBacktester:
@@ -1330,6 +1334,8 @@ class WalkForwardBacktester:
         # zero-trade windows whose WindowResult is None (they are exactly where the
         # funnel explains the emptiness).
         self._funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
+        self._declared_by_window: dict[int, dict[str, dict[str, int]]] = {}    # W116: declared-model counts
+        self._preflight_report = None                                          # W116: set by run() under strict inputs
         # W67: {window_id: {symbol: {"usable": bool, "best_value": float, "best_n_trades": int}}}
         # for every per-window Optuna study, so a run whose studies never found a trading
         # trial says so in its summary instead of looking like an optimized result.
@@ -1384,6 +1390,12 @@ class WalkForwardBacktester:
         check_carry_is_sequential(_carry, self._config.optimize_n_jobs)
         self._carried_by_window = {}
         self._carried_funnel_by_window = {}
+        self._preflight_report = None
+        if self._strict:
+            # W116: every input the study needs, checked together, BEFORE anything is loaded or trained: one refusal
+            # that lists every gap and the command that closes each, not the first loader error
+            from ait.data.research_inputs import preflight_or_raise
+            self._preflight_report = preflight_or_raise(self.research_request(), context="walk-forward")
         if data is None:
             data = await self._fetch_data()
 
@@ -1491,8 +1503,9 @@ class WalkForwardBacktester:
                                      initargs=(self._settings,)) as executor:
                 mp_results = list(executor.map(_window_task_mp, args_list))
 
-            for _wid, wr, curr_best_params, _meta_status, _fun, _opt in sorted(mp_results, key=lambda x: x[0]):
+            for _wid, wr, curr_best_params, _meta_status, _fun, _opt, _dec in sorted(mp_results, key=lambda x: x[0]):
                 self._funnel_by_window[_wid] = _fun
+                self._declared_by_window[_wid] = _dec
                 self._opt_status_by_window[_wid] = _opt
                 # R20b review follow-up: merge the per-symbol meta-labeler
                 # status independently of whether the window produced trades
@@ -1585,6 +1598,7 @@ class WalkForwardBacktester:
             meta_training_status=_meta_status_all,
             entry_funnel=self._aggregate_funnel(),
             optimization_status=self._opt_status_by_window,
+            data_contract=self.data_contract(),
         )
 
         # Compute per-symbol results
@@ -2070,6 +2084,7 @@ class WalkForwardBacktester:
                             iv_rank_series=self._iv_rank_series.get(symbol), **_oos_kwargs)
             result = bt.run()
             self._funnel_by_window.setdefault(window_id, {})[symbol] = dict(result.entry_funnel)
+            self._declared_by_window.setdefault(window_id, {})[symbol] = dict(result.declared_models)
 
             # Evaluate range predictor on OOS data — calibration bins + Brier/AUROC
             # per model (train/test generalisation gap visible in the dashboard).
@@ -3641,6 +3656,16 @@ class WalkForwardBacktester:
             if df is not None and "implied_vol" in df.columns:
                 self._iv_rank_series[sym] = iv_rank_series(df["implied_vol"])
 
+    def data_contract(self) -> dict:
+        """W116: the preflight report and the summed declared-model counts of this run (for the run record)."""
+        declared: dict[str, int] = {}
+        for per_symbol in self._declared_by_window.values():
+            for counts in per_symbol.values():
+                for name, n in counts.items():
+                    declared[name] = declared.get(name, 0) + int(n)
+        return {"preflight": self._preflight_report.as_dict() if self._preflight_report is not None else None,
+                "declared_models": declared}
+
     def _aggregate_funnel(self, by_window: "dict | None" = None) -> dict[str, dict[str, int]]:
         """W66: sum the per-window entry funnels into {symbol: {reason: days}}. W108 S1: ``by_window`` names another
         {window_id: {symbol: funnel}} (the carried replay's); None = the run of record's."""
@@ -3746,11 +3771,9 @@ class WalkForwardBacktester:
         return max(cfg.train_days + self._tuning.context_padding_days,       # W90b: was 900 / 400 literals
                    span + self._tuning.context_span_padding_days)
 
-    async def _fetch_data(self) -> dict[str, pd.DataFrame]:
-        """Load daily OHLCV from IB store (fallback: Yahoo Finance)."""
-        from ait.data.market_data import load_daily_ohlcv
-
-        data = {}
+    def _fetch_days(self) -> int:
+        """Calendar days of daily history the run asks the loader for (the loader counts a days-only request back from
+        its end; a configured start date wins over it)."""
         cfg = self._config
         fetch_days = cfg.train_days + cfg.test_days + self._tuning.fetch_padding_days     # W90b: was + 100
         start = cfg.history_start_date
@@ -3758,6 +3781,32 @@ class WalkForwardBacktester:
             fetch_days = max(fetch_days, (today_et() - start).days + self._tuning.history_span_padding_days)
         elif cfg.history_days:
             fetch_days = max(fetch_days, cfg.history_days)
+        return fetch_days
+
+    def research_request(self):
+        """W116: what this study needs from the history database (see ``ait.backtesting.preflight``)."""
+        from ait.backtesting.preflight import build_request
+        cfg = self._config
+        settings = self._settings
+        if settings is None:
+            from ait.config.settings import load_settings
+            settings = load_settings()
+        return build_request(
+            symbols=self._symbols, db_path=self._db_path, table_prefix=self._table_prefix, today=today_et(),
+            history_start_date=cfg.history_start_date, history_end_date=cfg.history_end_date,
+            fetch_days=self._fetch_days(), context_days=self._context_days(), settings=settings,
+            macro_event_gate=cfg.macro_event_gate, macro_event_types=cfg.macro_event_types,
+            friction_model=cfg.friction_model, intraday_features=cfg.intraday_features,
+            vlmc_min_coverage=cfg.vlmc_min_coverage, ex_div_entry_gate=cfg.ex_div_entry_gate)
+
+    async def _fetch_data(self) -> dict[str, pd.DataFrame]:
+        """Load daily OHLCV from the IB-stored history (W116: no fallback; a store that lacks the window refuses)."""
+        from ait.data.market_data import load_daily_ohlcv
+
+        data = {}
+        cfg = self._config
+        fetch_days = self._fetch_days()
+        start = cfg.history_start_date
 
         for symbol in self._symbols:
             try:

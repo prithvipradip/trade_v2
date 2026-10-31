@@ -27,6 +27,7 @@ Backtesting engine for strategy validation before live trading.
 | `iv_surface.py` | An implied-vol surface fitted from REAL option bars (research only). |
 | `learner.py` | In-backtest self-learning adapter. |
 | `pool.py` | Shared-capital allocator for walk-forward. |
+| `preflight.py` | The research preflight for a walk-forward study: the run's resolved settings in, a ResearchRequest out. |
 | `pricing.py` | Black-Scholes pricing primitives for the backtest engine. |
 | `range_bank.py` | Per-horizon range models for ONE (window, symbol). |
 | `replay.py` | Research-vs-reality PARITY REPLAY (read-only). |

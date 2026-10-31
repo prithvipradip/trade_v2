@@ -36,6 +36,17 @@ SETTLEMENT_LOSS_TOLERANCE = 1e-6
 # Probabilities are clipped to [eps, 1 - eps] before log-loss / calibration so log(0) cannot occur.
 PROB_CLIP_EPS = 1e-7
 
+# --- Research data contract (W116) -----------------------------------------------------------------------------
+# The longest run of consecutive sessions with no stored implied vol that a study may contain. An isolated missing
+# session becomes a counted no-entry day; a longer run (or a symbol with no stored IV at all) refuses the study.
+RESEARCH_MAX_NULL_IV_RUN_SESSIONS = 3
+# The longest gap between a symbol's last stored ex-dividend date and the end of a window before the stored dividends
+# count as stale (the quarterly payers in the universe never exceed it).
+RESEARCH_MAX_DIVIDEND_GAP_DAYS = 100
+# The longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current
+# at the end of a window (the quarterly GDP release is the sparsest type in use).
+RESEARCH_MAX_EVENT_GAP_DAYS = 120
+
 RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
     Invariant(
         "RESEARCH_DELTA_MIN", RESEARCH_DELTA_MIN, "|delta|",
@@ -53,6 +64,25 @@ RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
         "Lower clamp of the iv_floor / iv scaling applied to a builder's delta.",
         "Keeps one stale or extreme IV print from moving a strike by more than a factor of two.",
         "backtesting/engine.py (_build_debit_position, _build_credit_position)"),
+    Invariant(
+        "RESEARCH_MAX_NULL_IV_RUN_SESSIONS", RESEARCH_MAX_NULL_IV_RUN_SESSIONS, "sessions",
+        "Longest run of consecutive sessions with no stored implied vol that a study may contain; an isolated "
+        "gap is a counted no-entry day, a longer run (or a symbol with no stored IV) refuses the study.",
+        "It is the line the stored history is checked AGAINST: if a study file could raise it, a study could be "
+        "told to run on weeks of invented IV, which is the substitution the data contract exists to stop.",
+        "data/research_inputs.py (the implied-vol check); backtesting/preflight.py"),
+    Invariant(
+        "RESEARCH_MAX_DIVIDEND_GAP_DAYS", RESEARCH_MAX_DIVIDEND_GAP_DAYS, "days",
+        "Longest gap after a symbol's last stored ex-dividend date for which the stored dividends still count as "
+        "current for a window.",
+        "Same reason: a stale dividend table silently turns the ex-dividend gate off at the tail of the window.",
+        "data/research_inputs.py (the dividends check); backtesting/preflight.py"),
+    Invariant(
+        "RESEARCH_MAX_EVENT_GAP_DAYS", RESEARCH_MAX_EVENT_GAP_DAYS, "days",
+        "Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as "
+        "current at the end of a window.",
+        "Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window.",
+        "data/research_inputs.py (the econ_events check); backtesting/preflight.py"),
     Invariant(
         "IV_SCALE_MAX", IV_SCALE_MAX, "ratio",
         "Upper clamp of the same scaling.",

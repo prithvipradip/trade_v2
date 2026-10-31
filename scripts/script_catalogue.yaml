@@ -28,23 +28,23 @@ run_orchestrator.py:
 
 run_backtest.py:
   group: Entry point
-  what: "Walk-forward backtest of the iron-condor rules on the stored research history. Prints the parity manifest and writes a run record."
+  what: "Walk-forward backtest of the iron-condor rules on the stored research history. Checks first that every input is stored (exit 2 listing each gap and its fix when one is not), prints the parity manifest and writes a run record."
   when: "To test a change in research. --study-file records the run as a study."
   needs_ib: "no"
   writes: "reports/runs/<run_id>/run_record.json, and an MLflow run when MLflow is installed (--no-run-record skips both). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python run_backtest.py --symbols QQQ --study-file studies/_template.yaml"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#3-what-one-run-does)"
-  stamp: "0393b4af189b"
+  stamp: "1ab89666d69f"
 
 run_optimizer.py:
   group: Entry point
-  what: "Optuna search over strategy parameters (and optionally ML hyperparameters), then reports the best parameters."
+  what: "Optuna search over strategy parameters (and optionally ML hyperparameters), then reports the best parameters. Reads the stored history only: exit 2 listing the gap when an input is not stored."
   when: "To search parameters outside a walk-forward. --apply is refused unless AIT_ALLOW_APPLY=1 is set, and is refused with --study-file."
   needs_ib: "no"
   writes: "reports/optimization_result.json (--output) and reports/runs/<run_id>/run_record.json (--no-run-record skips it). With --apply it rewrites the file named by --config as plain YAML: four parameters change and every comment in the file is lost. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python run_optimizer.py --strategies iron_condor --symbols QQQ --n-trials 20"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#8-the-optimizer)"
-  stamp: "82320c9a69ea"
+  stamp: "c0d87bc30c78"
 
 status.py:
   group: Entry point
@@ -602,7 +602,7 @@ scripts/literal_census.py:
   writes: "nothing; --update rewrites tests/data/literal_allowlist.json"
   example: "python scripts/literal_census.py [--update]"
   explained: "[TECHNICAL_GUIDE.md](../TECHNICAL_GUIDE.md#research-numbers-and-the-literal-census)"
-  stamp: "6d48d60d7af6"
+  stamp: "7990719a79dd"
 
 scripts/wingk_study.py:
   group: Historical
@@ -733,3 +733,13 @@ scripts/shadow_round3_rerun.py:
   example: "python scripts/shadow_round3_rerun.py"
   explained: "PLAN.md (RERUN B VERDICT)"
   stamp: "475040d0ad91"
+
+scripts/research_preflight.py:
+  group: Research tool
+  what: "Checks, without running anything, that the stored history holds every input a study needs for its window, and lists every gap with what was needed, what was found and the command that fixes it."
+  when: "Before a study or a backtest, after a backfill, or when a run refused to start."
+  needs_ib: "no"
+  writes: "nothing (prints; the history database is opened read-only). Exit 0 when every input is stored, 2 when any is missing or the configuration cannot be resolved."
+  example: "python scripts/research_preflight.py [--study-file studies/<name>.yaml] [--symbols QQQ] [--json]"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#103-the-research-data-contract-stored-inputs-or-no-study)"
+  stamp: "dfe8b16740d1"

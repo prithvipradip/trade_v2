@@ -35,6 +35,10 @@ class BacktestResult:
     # exactly one reason or in `entries_taken`; includes `days_evaluated`. Empty for
     # results built outside Backtester.run().
     entry_funnel: dict[str, int] = field(default_factory=dict)
+    # W116: counts of the DECLARED modelling behaviours this run used (re-marks from the entry-IV / realized-vol blend,
+    # entries decided by the model-free fallback direction, surface legs priced / missed). Named in the research
+    # guide, stamped in the run record.
+    declared_models: dict[str, int] = field(default_factory=dict)
 
     # --- Core metrics as properties ---
 

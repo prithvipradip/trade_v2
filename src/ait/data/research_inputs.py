@@ -170,15 +170,16 @@ class ResearchRequest:
     db_path: "Path | str"
     max_null_iv_run: int
     max_dividend_gap_days: int
+    max_event_gap_days: int = 0
     table_prefix: str = ""
     context_window: "Window | None" = None
+    vix_window: "Window | None" = None
     context_symbols: tuple[str, ...] = ()
     vix_symbols: tuple[str, ...] = ()
     needs_iv: bool = True
     ex_div_gate: bool = False
     macro_gate: bool = False
     macro_event_types: tuple[str, ...] = ()
-    macro_lookahead_days: int = 0
     earnings_gate: bool = False
     earnings_exempt: tuple[str, ...] = ()
     friction_per_leg: bool = False
@@ -294,7 +295,7 @@ def _check_iv(conn, req, notes) -> list[DataGap]:
 
 def _check_vix(conn, req, notes) -> list[DataGap]:
     from ait.data.historical import SOURCE_IB_VIX_INDEX
-    win = req.context_window or req.window
+    win = req.vix_window or req.context_window or req.window
     return _daily_gaps(conn, req, notes, req.vix_symbols, win, f"{req.table_prefix}daily_iv", "symbol", "date",
                        "iv_close", "source", SOURCE_IB_VIX_INDEX, "vix_family",
                        lambda s: f"{_BACKFILL} --mode vix --symbols {s} --years {_years(req, win)}")
@@ -331,20 +332,28 @@ def _check_econ(conn, req, notes) -> list[DataGap]:
     from ait.data.historical import SOURCE_INVESTING_CSV
     t = f"{req.table_prefix}econ_events"
     remedy = "python scripts/load_econ_calendar_csv.py --csv <the Investing.com economic calendar export>"
-    need_end = req.window.end + timedelta(days=req.macro_lookahead_days)
     if not _has_table(conn, t):
         return [_no_table("econ_events", t, None, "stored economic events", remedy)]
     out = []
+    first, last, n = conn.execute(f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {t}").fetchone()
+    # the export must reach back to the window's start: an earlier session has no gate at all
+    if not n or date.fromisoformat(first) > req.window.start:
+        out.append(DataGap("econ_events", None, f"a calendar export that starts on or before {req.window.start}",
+                           f"{n} rows starting {first}" if n else "no rows", remedy))
     for etype in req.macro_event_types:
-        required = f"{etype} events from {req.window.start} to {need_end}, tagged {SOURCE_INVESTING_CSV}"
+        required = (f"{etype} events inside {req.window.start}..{req.window.end}, the last no more than "
+                    f"{req.max_event_gap_days} days before the window ends, tagged {SOURCE_INVESTING_CSV}")
         row = conn.execute(f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {t} WHERE engine_event_type=?",
                            (etype,)).fetchone()
         if not row or not row[2]:
             out.append(DataGap("econ_events", etype, required, "no rows", remedy))
             continue
-        first, last = date.fromisoformat(row[0]), date.fromisoformat(row[1])
-        if first > req.window.start or last < need_end:
-            out.append(DataGap("econ_events", etype, required, f"{row[2]} rows spanning {first}..{last}", remedy))
+        inside = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE engine_event_type=? AND event_date>=? AND event_date<=?",
+                              (etype, str(req.window.start), str(req.window.end))).fetchone()[0]
+        newest = date.fromisoformat(row[1])
+        if not inside or (req.window.end - newest).days > req.max_event_gap_days:
+            out.append(DataGap("econ_events", etype, required,
+                               f"{row[2]} rows spanning {row[0]}..{row[1]} ({inside} inside the window)", remedy))
     foreign = [r for r in conn.execute(
         f"SELECT source, COUNT(*) FROM {t} WHERE engine_event_type IN ({','.join('?' * len(req.macro_event_types))}) "
         f"AND source IS NOT ? GROUP BY source", (*req.macro_event_types, SOURCE_INVESTING_CSV))]
@@ -487,3 +496,17 @@ def preflight_or_raise(req: ResearchRequest, context: str = "") -> PreflightRepo
     if not report.ok:
         raise ResearchDataUnavailable(report.gaps, context)
     return report
+
+
+def format_report(report: PreflightReport) -> str:
+    """The preflight as text: the window, what was checked, then every gap (or OK) with its fix command."""
+    lines = [f"research data preflight: window {report.window.start}..{report.window.end}",
+             "checked: " + (", ".join(report.checked) or "nothing")]
+    for key, value in sorted(report.notes.items()):
+        lines.append(f"declared: {key} = {value}")
+    if report.ok:
+        lines.append("OK: every input the study needs is stored")
+    else:
+        lines.append(f"REFUSED: {len(report.gaps)} gap(s)")
+        lines += [f"  - {g.line()}" for g in report.gaps]
+    return "\n".join(lines)
