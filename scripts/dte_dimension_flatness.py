@@ -27,7 +27,6 @@ import json  # noqa: E402
 import sqlite3  # noqa: E402
 import sys  # noqa: E402
 import warnings  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -102,13 +101,17 @@ def _run_one(task: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbol", default="QQQ")
     ap.add_argument("--start", default="2025-04-01")
     ap.add_argument("--end", default="2025-07-31")
     ap.add_argument("--dtes", type=int, nargs="+", default=list(DEFAULT_DTES))
     ap.add_argument("--workers", type=int, default=4)
+    add_study_args(ap)
     args = ap.parse_args(argv)
+    study = load_study_config(args.study_file)      # also this process's config for --workers 1
 
     tasks = []
     for dim, kwarg, values, exempt in SWEEPS:
@@ -124,10 +127,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(tasks)} runs ({args.symbol} {args.start}..{args.end}, DTEs {args.dtes}, "
           f"{args.workers} workers)", flush=True)
     if args.workers > 1:
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        with study_pool(args.workers, args.study_file) as ex:
             res = list(ex.map(_run_one, tasks))
     else:
         res = [_run_one(t) for t in tasks]
+    write_study_record("dte_dimension_flatness", args, study, res, symbols=[args.symbol])
 
     print("\n## Dimension flatness (identical trade fingerprint at every value = FLAT)\n")
     print("| dimension | entry DTE | values tried | distinct outcomes | trades (min-max) | total $ (min-max) | verdict |")

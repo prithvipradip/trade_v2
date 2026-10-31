@@ -211,10 +211,10 @@ scripts/backfill_option_history.py:
   what: "Backfills historical option daily bars (with solved implied vol and greeks) for one symbol from Polygon."
   when: "To extend the option-bar history an IV surface needs. Slow (about 12.5 s per request by default)."
   needs_ib: "no"
-  writes: "option_daily_bars in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry."
+  writes: "option_daily_bars and option_fetch_log in data/historical.db and a progress file data/backfill_option_history_status.json. Needs POLYGON_API_KEY in the environment (the dry run too). --dry-run prints the request plan and stores nothing; --since-last continues from the latest stored expiry; a contract fetched after it expired that came back empty is skipped on later runs unless --retry-empty."
   example: "python scripts/backfill_option_history.py --symbol QQQ [--dry-run | --since-last]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
-  stamp: "3efdece63675"
+  stamp: "9adaad0e8615"
 
 scripts/backfill_risk_free_rate.py:
   group: Data
@@ -351,20 +351,20 @@ scripts/gate_parity_ab.py:
   what: "Measures what the one-sided entry gates (research volatility cap, research trending-down veto, live's VIX halt) cost or earn, in four arms per symbol."
   when: "Whenever the gate order, the IV-rank cap or the entry-DTE range changes."
   needs_ib: "no"
-  writes: "nothing unless --dump FILE is given. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. VIX closes come from Yahoo (network)."
+  writes: "nothing unless --dump FILE is given. Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. VIX closes come from Yahoo (network). A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/gate_parity_ab.py --workers 3 [--entry-dte 14]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#111-one-sided-entry-gates)"
-  stamp: "3a3fb0ae8f87"
+  stamp: "08e51646803e"
 
 scripts/ex_div_gate_ab.py:
   group: Study
   what: "Runs the realistic engine with the ex-dividend entry block off, as live, exact and last-k-days, to see what the block costs or protects."
   when: "To check the research twin of the ex-dividend block against live's rule."
   needs_ib: "no"
-  writes: "no files (prints a table). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  writes: "a run record only (prints a table). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db. A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/ex_div_gate_ab.py --workers 3 [--entry-dte 14 7] [--k 3 5 7]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#113-the-ex-dividend-entry-block)"
-  stamp: "d2765b912c80"
+  stamp: "0da93aed6516"
 
 scripts/gate_study.py:
   group: Study
@@ -391,20 +391,20 @@ scripts/dte_dimension_flatness.py:
   what: "Sweeps one DTE-study dimension at several entry DTEs on identical data to find dimensions that change no trade (flat, so not worth searching)."
   when: "Before adding a dimension to a DTE search."
   needs_ib: "no"
-  writes: "no files (prints a table). 5-minute bars are read with the database opened read-only; the engine runs it starts also open the history store, which creates any missing empty table in data/historical.db."
+  writes: "no files (prints a table). 5-minute bars are read with the database opened read-only; the engine runs it starts also open the history store, which creates any missing empty table in data/historical.db. A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
   example: "python scripts/dte_dimension_flatness.py --symbol QQQ [--dtes 1 3 7 14] [--workers 3]"
   explained: "-"
-  stamp: "10c09d2a342a"
+  stamp: "7d925c7d4a3c"
 
 scripts/iv_rank_parity_probe.py:
   group: Study
   what: "Compares the research IV-rank rise veto with live's IV-rank level gates: how the two ranks relate and how many vetoed days live would have traded anyway."
   when: "To revisit whether the research veto belongs in research."
   needs_ib: "no"
-  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table."
-  example: "python scripts/iv_rank_parity_probe.py [--ab --workers 6]"
+  writes: "no files (prints). The history database is opened read-only; with --ab the engine runs also open the history store, which creates any missing empty table. Needs the research table set that was archived when the research and live tables were merged (--research-prefix, default archive_w91_research_); refuses with exit 2 when it is gone. With --ab: A run record in reports/runs/<run_id>/ (--no-run-record skips it); --study-file applies a study in every worker."
+  example: "python scripts/iv_rank_parity_probe.py [--research-prefix archive_w91_research_] [--ab --workers 6]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#112-the-iv-rank-rise-veto)"
-  stamp: "090ec11a0a69"
+  stamp: "1630471f3d74"
 
 scripts/range_horizon_study.py:
   group: Study
@@ -475,6 +475,24 @@ scripts/budget_ladder_study.py:
   example: "python scripts/budget_ladder_study.py [--entry-dtes 18,25] [--skip-stress]"
   explained: "-"
   stamp: "b8f73fa7710e"
+scripts/scaler_arms_study.py:
+  group: Study
+  what: "Walk-forward study of the condor's sizing scalers on a multi-lot book ($200,000 pool, 3% budget, lot cap 3, scalers on against off, with one-lot reference and sanity arms) under a pre-registered rule with a stressed-friction repeat."
+  when: "Before raising positions.max_contracts_per_trade on a large account, to decide whether position_sizing.scaled_strategies should list iron_condor (the pre-registered rule is in the script docstring and PLAN.md)."
+  needs_ib: "no"
+  writes: "reports/scaler_arms_study/entry_dte_<n>/ and stress_2x/ (per-arm .json), results.json, results.md; the engine opens the history store, which creates any missing empty table in data/historical.db."
+  example: "python scripts/scaler_arms_study.py [--entry-dtes 18,25] [--skip-stress]"
+  explained: "-"
+  stamp: "db4df27eb057"
+scripts/study_cli.py:
+  group: Developer
+  what: "Library module, not run directly: the --study-file / --no-run-record options, the study-aware process pool and the run record shared by gate_parity_ab, ex_div_gate_ab, dte_dimension_flatness and iv_rank_parity_probe."
+  when: "Never run by itself; read it to see how a study file reaches every worker of those four scripts."
+  needs_ib: "no"
+  writes: "nothing by itself (the scripts that import it write a run record in reports/runs/<run_id>/)."
+  example: "-"
+  explained: "-"
+  stamp: "ffc37462b995"
 
 scripts/paper_checkpoint.py:
   group: Study

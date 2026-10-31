@@ -52,6 +52,8 @@ from ait.utils.time import ET, get_market_close, time_to_expiry_years  # W74: re
 from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_flag, contract_float  # R19: ONE authority for env-contract defaults
 from ait.risk.lot_sizing import lots_for_budget  # W108: the ONE lot rule, shared with live's PositionSizer and the pool
+# W108 4a: the ONE budget-to-width rule for the spreads, shared with live's strategies/spreads.py
+from ait.risk.width_sizing import fitted_credit_width, fitted_debit_width, whole_dollar_widths
 from ait.risk.scalers import (  # W114: the ONE set of scalers + their inputs, shared with live's PositionSizer
     RANGE_GATED_STRATEGIES,
     ScalerInputs,
@@ -2523,6 +2525,15 @@ class Backtester:
                 self._get_leg_iv(iv, long_strike, S, OptionType.CALL), OptionType.CALL)
             short_price = black_scholes_price(S, short_strike, t, r,
                 self._get_leg_iv(iv, short_strike, S, OptionType.CALL), OptionType.CALL)
+            if self._budget_aware_wings:
+                # W108 4a: live parity (strategies/spreads.py): the short strike moves inward to the
+                # widest width whose debit fits the per-trade budget; none fits = refused.
+                _fit = self._budget_fitted_debit_short(long_strike, short_strike, long_price, short_price,
+                                                       S, iv, t, r, OptionType.CALL, capital)
+                if _fit is None:
+                    self._reject("builder:no_debit_width_fits_budget")  # detail of the loop's builder_none
+                    return None
+                short_strike, short_price = _fit
             price = long_price - short_price  # Net debit
             strike = long_strike
             opt_type = "call"
@@ -2541,6 +2552,14 @@ class Backtester:
                 self._get_leg_iv(iv, long_strike, S, OptionType.PUT), OptionType.PUT)
             short_price = black_scholes_price(S, short_strike, t, r,
                 self._get_leg_iv(iv, short_strike, S, OptionType.PUT), OptionType.PUT)
+            if self._budget_aware_wings:
+                # W108 4a: as bull_call_spread above (the short put moves UP toward the long put).
+                _fit = self._budget_fitted_debit_short(long_strike, short_strike, long_price, short_price,
+                                                       S, iv, t, r, OptionType.PUT, capital)
+                if _fit is None:
+                    self._reject("builder:no_debit_width_fits_budget")  # detail of the loop's builder_none
+                    return None
+                short_strike, short_price = _fit
             price = long_price - short_price  # Net debit
             strike = long_strike
             opt_type = "put"
@@ -3006,6 +3025,7 @@ class Backtester:
             expected_move = S * iv * (dte / 365.0) ** 0.5
             wing = max(self._wing_k * expected_move * self._spr.wing_expected_move_fraction,      # W90f: was 0.5
                        self._wing_floor_dollars)
+            wing = self._budget_fitted_credit_wing(wing, capital)   # W108 4a
 
             long_put_strike = short_put_strike - wing
 
@@ -3062,6 +3082,7 @@ class Backtester:
             expected_move = S * iv * (dte / 365.0) ** 0.5
             wing = max(self._wing_k * expected_move * self._spr.wing_expected_move_fraction,      # W90f: was 0.5
                        self._wing_floor_dollars)
+            wing = self._budget_fitted_credit_wing(wing, capital)   # W108 4a
             long_call_strike = short_call_strike + wing
             short_call_price = black_scholes_price(S, short_call_strike, t, r,
                 self._get_leg_iv(iv, short_call_strike, S, OptionType.CALL), OptionType.CALL)
@@ -3188,6 +3209,45 @@ class Backtester:
             }
 
         return None
+
+    def _budget_fitted_credit_wing(self, wing: float, capital: float) -> float:
+        """W108 4a: a put / call credit spread's wing after the budget fit (the ONE rule,
+        ait.risk.width_sizing.fitted_credit_width, which W108 4b's live builders call too).
+
+        Off (the wing unchanged) unless budget_aware_wings, exactly like the condor's cap. Max loss per
+        lot = (wing - credit) x 100 and these builders enforce no credit/width floor, so the worst case is
+        the wing itself: the widest $1 width at or below budget / 100 (min_credit_ratio 0), never under
+        IC_BUDGET_CAPPED_MIN_WING; _lots still refuses a wing whose real max loss does not fit.
+        """
+        if not self._budget_aware_wings:
+            return wing
+        return fitted_credit_width(wing, capital * self._position_size_pct, whole_dollar_widths(wing))
+
+    def _budget_fitted_debit_short(
+        self, long_strike: float, short_strike: float, long_price: float, short_price: float,
+        S: float, iv: float, t: float, r: float, opt: OptionType, capital: float,
+    ) -> tuple[float, float] | None:
+        """W108 4a: (short strike, short price) of a debit spread after the budget fit; None = no width fits.
+
+        The SAME rule live's builders call (ait.risk.width_sizing.fitted_debit_width): a debit spread's
+        max loss is its DEBIT, so the fit is priced. The delta-placed spread is kept when its debit fits
+        the per-trade budget (capital x position_size_pct, what _lots checks); otherwise the short strike
+        moves toward the long one, on the engine's $1 grid, to the widest width whose debit fits. Each
+        width is priced like the natural one (Black-Scholes at the leg's skewed IV), and its debit is the
+        one _finalize_spread_position charges (x (1 + slippage_pct)), so a fitted spread always passes _lots.
+        """
+        natural = abs(short_strike - long_strike)
+        inward = 1.0 if opt == OptionType.CALL else -1.0      # a call spread's short strike sits ABOVE the long one
+        shorts = {w: long_strike + inward * w for w in whole_dollar_widths(natural)}
+        prices = {w: black_scholes_price(S, k, t, r, self._get_leg_iv(iv, k, S, opt), opt)
+                  for w, k in shorts.items() if w != natural}
+        shorts[natural], prices[natural] = short_strike, short_price
+        width = fitted_debit_width(
+            natural, capital * self._position_size_pct,
+            {w: (long_price - p) * (1 + self._slippage_pct) for w, p in prices.items()})
+        if width is None:
+            return None
+        return shorts[width], prices[width]
 
     def _finalize_spread_position(
         self, strategy: str, trade_type: str, net_cost: float,

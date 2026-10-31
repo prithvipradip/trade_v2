@@ -16,6 +16,10 @@ from ait.strategies.base import Signal, SignalDirection, Strategy
 from ait.utils.logging import get_logger
 from ait.config.invariants import IC_BUDGET_CAPPED_MIN_WING  # W70: fixed, visible
 from ait.config.runtime_env import contract_float  # R19: ONE authority for env-contract defaults
+from ait.risk.width_sizing import (  # W108 4a: the ONE budget<->width rule (credit structures)
+    affordable_width as _shared_affordable_width,
+    budget_for_width as _shared_budget_for_width,
+)
 from ait.utils.time import today_et
 
 log = get_logger("strategies.iron_condor")
@@ -54,8 +58,10 @@ class IronCondor(Strategy):
         credit >= min_ratio * width, so width <= budget / (100 * (1 - ratio)).
         `budget_for_width` is its exact inverse; the pair is pinned by a test.
         """
-        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-        return risk_budget / (100.0 * max(0.5, 1.0 - min_ratio))
+        # W108 4a: the arithmetic moved, unchanged, to ait.risk.width_sizing (shared with the
+        # spread builders and research); the condor passes its own credit/width floor.
+        return _shared_affordable_width(
+            risk_budget, min_credit_ratio=contract_float("AIT_IC_MIN_CREDIT_WIDTH"))
 
     @staticmethod
     def budget_for_width(width: float) -> float:
@@ -66,8 +72,9 @@ class IronCondor(Strategy):
         relationship. Confusing the two is what made the self-test's first cut
         advise $86 where the account needed $140 (PLAN.md W25 [C1]).
         """
-        min_ratio = contract_float("AIT_IC_MIN_CREDIT_WIDTH")
-        return width * 100.0 * max(0.5, 1.0 - min_ratio)
+        # W108 4a: same move as affordable_width above.
+        return _shared_budget_for_width(
+            width, min_credit_ratio=contract_float("AIT_IC_MIN_CREDIT_WIDTH"))
 
     def _log_entry_quality(
         self,

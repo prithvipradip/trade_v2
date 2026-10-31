@@ -247,6 +247,10 @@ class TestInertWingUsesTheSmallestDte:
     def _opt_small(monkeypatch, **kw):
         from ait.strategies.iron_condor import IronCondor
         monkeypatch.setattr(IronCondor, "affordable_width", staticmethod(lambda budget: 0.5))
+        # W108 S2: a 0.5 ceiling under the default $2 wing floor binds at every k and every DTE (the engine's
+        # free wing is max(k x EM, floor)), so the rule now drops wing_k there whatever the DTE; a floor under
+        # the ceiling keeps this test about the DTE alone.
+        kw.setdefault("wing_floor_dollars", 0.1)
         o = _opt(**kw)
         idx = pd.bdate_range("2024-01-02", periods=40)
         o._data = {"SPY": pd.DataFrame({"Close": 100.0}, index=idx)}

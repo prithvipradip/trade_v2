@@ -25,7 +25,6 @@ import argparse  # noqa: E402
 import sqlite3  # noqa: E402
 import sys  # noqa: E402
 import warnings  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +32,7 @@ DB = ROOT / "data" / "historical.db"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-def _series(symbol: str, db: Path):
+def _series(symbol: str, db: Path, prefix: str = "archive_w91_research_"):
     """(ohlcv+iv frame, research IV, live-store IV, feature rank, S_research, S_live)."""
     import pandas as pd
 
@@ -42,8 +41,9 @@ def _series(symbol: str, db: Path):
     from ait.ml.features import FeatureEngine
 
     # W91: this W71 probe compares the research_* table with the live one; after the tables were merged the two are
-    # identical by construction, so it only has meaning on a database that still has both sets.
-    frame = ResearchData(str(db), symbol, prefix="research_").daily_frame()
+    # identical by construction, so it only has meaning on a database that still has both sets. W106: after the W91
+    # archive the old set is `archive_w91_research_*` (the default); `--research-prefix research_` before it.
+    frame = ResearchData(str(db), symbol, prefix=prefix).daily_frame()
     research_iv = frame["implied_vol"]
     with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
         live = pd.read_sql_query(
@@ -61,7 +61,8 @@ def _fmt(x, nd=2):
     return "n/a" if x is None or x != x else f"{x:.{nd}f}"
 
 
-def compare(symbols: list[str], db: Path, threshold: float, since: str) -> None:
+def compare(symbols: list[str], db: Path, threshold: float, since: str,
+            prefix: str = "archive_w91_research_") -> None:
     import pandas as pd
 
     from ait.backtesting import iv_rank_compare as cmp
@@ -73,7 +74,7 @@ def compare(symbols: list[str], db: Path, threshold: float, since: str) -> None:
     print("|---|---|---|---|---|---|---|---|---|---|")
     rows2, rows3 = [], []
     for sym in symbols:
-        frame, riv, liv, f, s_res, s_live = _series(sym, db)
+        frame, riv, liv, f, s_res, s_live = _series(sym, db, prefix)
         for label, mask in (("full history", slice(None)), (f"{since}+", slice(since, None))):
             r = cmp.veto_vs_live(f.loc[mask], s_res.loc[mask], threshold)
             print(f"| {sym} | {label} | {r['n_days']} | {_fmt(r['spearman_feature_vs_stored'])} | "
@@ -115,10 +116,11 @@ def _arm(task: dict) -> dict:
     from ait.backtesting.study_harness import assert_friction_loaded, study_engine_kwargs, study_inputs
 
     # features from a year of warm-up before the window, as the walk-forward does per window
-    rd, data, features, ivr = study_inputs(DB, task["symbol"], task["start"], task["end"])
+    db = Path(task.get("db") or DB)                # W106: --db reaches the engine arms too
+    rd, data, features, ivr = study_inputs(db, task["symbol"], task["start"], task["end"])
     # W87a: the study engine block is defined once (backtesting/study_harness.py); entry DTE fixed at 14
     bt = Backtester(**study_engine_kwargs(
-        data=data, symbol=task["symbol"], db_path=DB, intraday_store=rd, entry_dte=14,
+        data=data, symbol=task["symbol"], db_path=db, intraday_store=rd, entry_dte=14,
         features_cache=features, iv_rank_series=ivr,
         iv_rank_rise_gate=bool(task["gate"]), iv_rank_rise_threshold=task["threshold"]))
     assert_friction_loaded(bt)
@@ -131,11 +133,14 @@ def _arm(task: dict) -> dict:
             "rank_cap_days": f.get("iv_rank_cap", 0), "days": f.get("days_evaluated", 0)}
 
 
-def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int) -> None:
-    tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end}
+def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int, study_file=None,
+       db: Path = DB) -> list:
+    from study_cli import study_pool
+
+    tasks = [{"symbol": s, "threshold": threshold, "gate": g, "start": start, "end": end, "db": str(db)}
              for s in symbols for g in (True, False)]
     print(f"\n## 4. Realistic-engine A/B of the rise veto ({start}..{end}, entry DTE 14, 1 contract)\n")
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    with study_pool(workers, study_file) as ex:
         res = list(ex.map(_arm, tasks))
     print("| symbol | veto | trades | win % | total $ | days vetoed by the rise gate | days at live floor | days at live cap |")
     print("|---|---|---|---|---|---|---|---|")
@@ -144,9 +149,12 @@ def ab(symbols: list[str], threshold: float, start: str, end: str, workers: int)
         print(f"| {r['symbol']} | {arm} | {r['n']} | {r['win']:.0%} | {r['total']:,.0f} | {r['rise_days']} | "
               f"{r['rank_floor_days']} | {r['rank_cap_days']} |")
     print("\nA difference of a few $k over ~60-120 trades per arm is inside the noise; the decision rests on parity.")
+    return res
 
 
 def main(argv: list[str] | None = None) -> int:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["QQQ", "SPY", "IWM"])
     ap.add_argument("--threshold", type=float, default=0.30)
@@ -155,11 +163,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ab-start", default="2024-01-02")
     ap.add_argument("--ab-end", default="2026-10-08")
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--db", type=Path, default=DB)
+    ap.add_argument("--research-prefix", default="archive_w91_research_",
+                    help="W106: the pre-W91 research table set to compare with the live one "
+                         "(archive_w91_research_ after the W91 archive, research_ before it)")
+    add_study_args(ap)
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
-    compare(args.symbols, DB, args.threshold, args.since)
-    if args.ab:
-        ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers)
+    table = f"{args.research_prefix}daily_prices"
+    with sqlite3.connect(f"file:{args.db}?mode=ro", uri=True) as c:
+        present = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if not present:
+        print(f"{table} is not in {args.db}: this probe compares the pre-W91 research tables with the live "
+              f"ones and needs a database that still has them (see --research-prefix).", file=sys.stderr)
+        return 2
+    study = load_study_config(args.study_file)
+    compare(args.symbols, args.db, args.threshold, args.since, args.research_prefix)
+    if args.ab:            # the run record covers the engine A/B (the series comparison reads no settings)
+        res = ab(args.symbols, args.threshold, args.ab_start, args.ab_end, args.workers, args.study_file, args.db)
+        write_study_record("iv_rank_parity_probe", args, study, res, symbols=args.symbols)
     return 0
 
 

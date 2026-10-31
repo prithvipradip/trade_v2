@@ -111,7 +111,14 @@ def load_daily_ohlcv(
     """
     from ait.data.historical import HistoricalDataStore, DB_PATH as _DEFAULT_DB
 
-    if (bool(table_prefix) if research is None else research) and not symbol.startswith("^"):
+    _research_path = bool(table_prefix) if research is None else research
+    if _research_path and symbol in STORED_INDEX_SYMBOLS:
+        # W106: the VIX family is stored from IB since W91 (daily_iv, /100); Yahoo only as a fallback
+        _index = _load_stored_index_daily(
+            symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date, end_date)
+        if _index is not None:
+            return _index
+    if _research_path and not symbol.startswith("^"):
         # indices (^VIX) are not in the research store
         _research = _load_research_daily(
             symbol, days, db_path or _DEFAULT_DB, table_prefix, start_date, end_date)
@@ -197,6 +204,32 @@ def load_daily_ohlcv(
     return df
 
 
+# W106: research index symbols -> their `daily_iv` symbol (IB daily TRADES of the CBOE index, stored /100).
+STORED_INDEX_SYMBOLS = {"^VIX": "VIX", "^VIX3M": "VIX3M", "^VIX6M": "VIX6M", "^VIX9D": "VIX9D"}
+
+
+def _load_stored_index_daily(symbol, days, db_path, table_prefix, start_date, end_date):
+    """The stored IB series of an index on its own scale (VIX 15.3, not 0.153), or None when the store is
+    short (the caller then falls through to the legacy path, which ends at Yahoo)."""
+    from ait.data.historical import HistoricalDataStore
+
+    # The window ends where the query ends: end_date when the run is pinned, else today.
+    end = end_date or today_et()
+    start = start_date or (end - timedelta(days=days + 30))
+    span_days = max(1, (end - start_date).days) if start_date else days
+    needed = max(60, int(max(1, int(span_days * 252 / 365)) * 0.8))
+    bars = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix).load_daily_iv_bars(
+        STORED_INDEX_SYMBOLS[symbol], start, end_date)
+    if len(bars) < needed:
+        log.warning("index_daily_store_short_yahoo_fallback", symbol=symbol, rows=len(bars), needed=needed)
+        return None
+    df = bars[["Open", "High", "Low", "Close"]].astype(float) * 100.0
+    df["Volume"] = 0.0
+    df["implied_vol"] = float("nan")
+    log.info("index_daily_from_ib_store", symbol=symbol, rows=len(df))
+    return df
+
+
 def _load_research_daily(
     symbol: str,
     days: int,
@@ -213,12 +246,14 @@ def _load_research_daily(
 
     store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
     today = today_et()
+    # The window ends where the query ends: end_date when the run is pinned, else today.
+    end = end_date or today
     if start_date is not None:
         start = start_date
-        span_days = max(1, (today - start_date).days)
+        span_days = max(1, (end - start_date).days)
     else:
         span_days = days
-        start = today - timedelta(days=days + 30)
+        start = end - timedelta(days=days + 30)
     df = store.load(symbol, start_date=start, end_date=end_date)
     if not df.empty:
         # IV-only skeleton rows (save_daily_iv inserts them) have NaN prices.

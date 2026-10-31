@@ -136,6 +136,8 @@ position_sizing:
     short_strangle: 0.8
     calendar_spread: 0.7
     event_straddle: 0.7
+    put_credit_spread: 0.6             # W108 4b: live builders exist, NOT enabled (options.strategies); inert
+    call_credit_spread: 0.6            # unless named in scaled_strategies
   scaled_strategies: []                # W108 (2026-10-27, operator): strategies whose lot COUNT the six multipliers above
                                        # throttle. Empty = every strategy is sized by the budget alone
                                        # (risk.max_position_risk_pct x NLV / one lot's max loss; ait.risk.lot_sizing, the same

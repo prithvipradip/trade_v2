@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 import aiohttp
 
@@ -47,6 +47,21 @@ TICKER_TO_CIK = {
 USER_AGENT = "AIT v2 Trading Bot prithvi.pradip@cluedigital.com"
 
 
+def _filing_time(filing_date: str, acceptance: str) -> datetime:
+    """When the filing became public, UTC: acceptanceDateTime when present, else
+    the END of filingDate (a bare date must not fall out of the window early).
+
+    KNOWN QUIRK (measured 2026-10-17, research_calendars.item_202_filings): for some filings
+    EDGAR's acceptanceDateTime is the ET time plus twice the UTC offset, still labelled Z, i.e.
+    4-5 hours LATER than the true acceptance. It only ever lengthens the look-back window (a
+    filing stays "recent" 4-5 hours longer), never drops one; a filing already acted on is not
+    acted on again because the handled accessions persist (TradingOrchestrator._build_edgar_monitor)."""
+    if acceptance:
+        return datetime.fromisoformat(acceptance.replace("Z", "+00:00")).astimezone(timezone.utc)
+    d = datetime.strptime(filing_date, "%Y-%m-%d").date()
+    return datetime.combine(d, time.max, tzinfo=timezone.utc)
+
+
 @dataclass
 class Filing:
     """A single SEC filing."""
@@ -66,12 +81,21 @@ class Filing:
 class EDGARMonitor:
     """Polls SEC EDGAR for new filings on tracked symbols."""
 
-    def __init__(self, tracked_symbols: list[str] | None = None) -> None:
+    def __init__(self, tracked_symbols: list[str] | None = None, seen: "list[str] | None" = None) -> None:
         self._tracked = tracked_symbols or list(TICKER_TO_CIK.keys())
-        # Cache filings for 1 hour to avoid duplicate alerts
-        self._seen_filings: set[str] = set()
+        # Accessions already emitted (W106: seeded from the state database, so a restart inside the
+        # look-back window does not emit, and flatten on, the same 8-K again). A dict keeps the order
+        # handled, so the persisted record can keep the newest.
+        self._seen_filings: dict[str, None] = dict.fromkeys(seen or [])
         self._filings_cache = TTLCache(default_ttl=300, max_size=1000)
         self._last_check: datetime | None = None
+
+    def mark_seen(self, accession: str) -> None:
+        self._seen_filings[accession] = None
+
+    def seen_accessions(self) -> list[str]:
+        """Accessions already emitted, oldest first."""
+        return list(self._seen_filings)
 
     async def fetch_recent_filings(
         self, symbol: str, max_age_hours: int = 24
@@ -111,14 +135,18 @@ class EDGARMonitor:
         recent = data.get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
         dates = recent.get("filingDate", [])
+        accepted = recent.get("acceptanceDateTime", [])
         accessions = recent.get("accessionNumber", [])
         primary_docs = recent.get("primaryDocument", [])
 
-        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        # W106: the window is measured on the acceptance time (UTC). filingDate is a
+        # bare date: read as midnight against a host-naive now - 24h it dropped a
+        # filing accepted late yesterday before the next morning's check.
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         filings = []
         for i in range(min(len(forms), 20)):  # last 20 filings only
             try:
-                filing_date = datetime.strptime(dates[i], "%Y-%m-%d")
+                filing_date = _filing_time(dates[i], accepted[i] if i < len(accepted) else "")
                 if filing_date < cutoff:
                     break  # filings are sorted desc; older = stop
                 filings.append(Filing(
@@ -159,7 +187,7 @@ class EDGARMonitor:
                     continue
                 if filing.accession_number in self._seen_filings:
                     continue
-                self._seen_filings.add(filing.accession_number)
+                self.mark_seen(filing.accession_number)
                 new_material.append(filing)
                 log.info(
                     "edgar_8k_detected",

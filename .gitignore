@@ -21,6 +21,14 @@ models/
 logs/
 reports/integration_test/
 reports/runs/
+# W106: regenerated, bulky report artifacts. Study results / summaries stay committable;
+# files tracked before W106 stay tracked (removing them is the operators' call).
+reports/**/window_*.json
+reports/**/timeseries_bars.json
+reports/**/run.log
+reports/daily_*.json
+reports/backtest_*.json
+reports/econ_calendar_audit_*.json
 
 # MLflow experiment tracking (data/mlflow.db + data/mlruns/ — covered by /data/ above)
 mlflow.db

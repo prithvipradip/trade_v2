@@ -35,7 +35,6 @@ apply_runtime_env_defaults()  # before any trading-subsystem import (docs/TECHNI
 import argparse  # noqa: E402
 import sys  # noqa: E402
 import warnings  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +109,8 @@ def summarise(trades: list[tuple[str, float]], prev_vix, halt: float) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["QQQ", "SPY", "IWM"])
     ap.add_argument("--start", default="2024-01-02")
@@ -123,8 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
     ap.add_argument("--dump", default=None,
                     help="write the raw per-arm results (entry date, pnl per trade) to this JSON file")
+    add_study_args(ap)
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
+    study = load_study_config(args.study_file)
 
     halt = args.halt
     if halt is None:
@@ -137,8 +140,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(tasks)} runs ({args.start}..{args.end}, realistic engine, entry DTE {args.entry_dte}, "
           f"1 contract; "
           f"VIX halt {halt:g} applied after the fact)", flush=True)
-    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as ex:
+    with study_pool(args.workers, args.study_file) as ex:
         res = list(ex.map(run_arm, tasks))
+    write_study_record("gate_parity_ab", args, study, res, symbols=args.symbols)
     prev = vix_prev_close(args.start, args.end)
     window = prev.loc[args.start:args.end]
     n_halt_days = int((window >= halt).sum())

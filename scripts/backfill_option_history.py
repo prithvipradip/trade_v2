@@ -52,7 +52,9 @@ on each re-run (live, unexpired contracts are deliberately not fetched: that is
 one call per live contract per run). Cadence: roughly 1,550 new QQQ contracts a
 week, ~5.5h at the default pause.
   - First refresh: the plain command (full window) -- it also retries contracts
-    that failed or returned no bars last time.
+    that failed last time. A contract fetched AFTER it expired that came back empty
+    is recorded in option_fetch_log and skipped from then on (W106); --retry-empty
+    asks again.
   - Later refreshes: `--since-last` lists only expiries from the latest stored one
     onward (fast); run the plain command now and then to catch retries.
   - The run is capped at the underlying's last stored COMPLETED close in daily_prices
@@ -144,6 +146,8 @@ log = get_logger("scripts.backfill_option_history")
 
 BASE_URL = "https://api.polygon.io"
 AUTH_FAILURE_LIMIT = 3
+# W106: aggregate-response statuses that are a real answer (an empty one included); anything else is an error reply.
+ANSWER_OK_STATUSES = ("OK", "DELAYED")
 STATUS_FILE = Path("data") / "backfill_option_history_status.json"
 # Network-retry backoff (seconds); [0, ...] so the first attempt has no
 # extra delay. Patient enough to ride out a post-sleep WiFi reconnection,
@@ -278,6 +282,9 @@ class PolygonClient:
     def get_daily_bars(self, option_ticker: str, from_date: date, to_date: date) -> list[dict]:
         url = f"{BASE_URL}/v2/aggs/ticker/{option_ticker}/range/1/day/{from_date}/{to_date}"
         data = self._get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000})
+        # W106: whether this was a real answer. `_get` returns {} for a 401, a NOT_AUTHORIZED body or an
+        # unparseable reply, which must not be recorded as "this contract has no bars".
+        self.last_answer_ok = bool(data) and data.get("status") in ANSWER_OK_STATUSES
         return data.get("results", []) if data else []
 
 
@@ -367,14 +374,31 @@ def process_contract(
     start_date: date,
     end_date: date,
     risk_free_rate: float,
+    retry_empty: bool = False,
 ) -> int:
     ticker = contract["option_ticker"]
     if store.option_ticker_has_data(ticker):
+        return 0
+    # W106: an expired contract that already came back empty stays empty.
+    if not retry_empty and store.option_fetch_is_final(ticker, start_date):
         return 0
 
     expiry = date.fromisoformat(contract["expiry"])
     fetch_to = min(expiry, end_date)
     bars = client.get_daily_bars(ticker, start_date, fetch_to)
+    saved = _store_bars(store, symbol, contract, bars or [], underlying_closes,
+                        expiry, risk_free_rate)
+    if getattr(client, "last_answer_ok", True):      # an error reply is retried next run, never final
+        store.record_option_fetch(symbol, ticker, contract["expiry"], today_et(), start_date, fetch_to,
+                                  len(bars or []), saved)
+    else:
+        log.warning("option_fetch_not_recorded_error_reply", ticker=ticker)
+    return saved
+
+
+def _store_bars(store, symbol, contract, bars, underlying_closes, expiry,
+                risk_free_rate) -> int:
+    ticker = contract["option_ticker"]
     if not bars:
         return 0
 
@@ -446,7 +470,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="W85: list only expiries from the latest one already "
                             "stored (inclusive) onward, instead of the whole window. "
                             "Fast weekly refresh; does NOT retry older contracts that "
-                            "failed or returned no bars -- run without it periodically.")
+                            "failed -- run without it periodically.")
+    parser.add_argument("--retry-empty", action="store_true",
+                       help="W106: also re-fetch contracts already fetched after they "
+                            "expired that came back empty (normally skipped: an expired "
+                            "contract's history cannot grow).")
     parser.add_argument("--dry-run", action="store_true",
                        help="Print the request plan without fetching or storing.")
     return parser.parse_args(argv)
@@ -553,7 +581,7 @@ def _run(argv: list[str] | None) -> int:
         try:
             rows = process_contract(
                 client, store, args.symbol, contract, underlying_closes,
-                start_date, end_date, r)
+                start_date, end_date, r, retry_empty=args.retry_empty)
         except Exception as e:  # noqa: BLE001 -- one bad contract must not kill the run
             log.warning("contract_fetch_failed", ticker=contract["option_ticker"],
                        error=str(e))

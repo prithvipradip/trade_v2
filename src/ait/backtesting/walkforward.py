@@ -80,6 +80,17 @@ def fetched_rows_sufficient(rows: int, minimum: int) -> bool:
     return rows > minimum
 
 
+def check_carry_is_sequential(carry_equity: bool, n_jobs: int) -> None:
+    """W108 S1: refuse ``carry_equity`` with parallel window workers. A carried window starts at the PREVIOUS window's
+    ending equity, so the windows' OOS replays must run in order; the ProcessPoolExecutor branch runs every window in its
+    own process at the fresh budget. Not sequentialized silently: the sequential branch also turns on the
+    BacktestLearner and the warm starts, which the parallel branch does not have, so the reset run would change too."""
+    if carry_equity and int(n_jobs) > 1:
+        raise ValueError(
+            f"carry_equity=True needs the windows replayed in order (each starts at the previous window's ending "
+            f"equity), but optimize_n_jobs={n_jobs} runs them in parallel worker processes. Set optimize_n_jobs=1.")
+
+
 def check_oos_context_covers_features(context_bars: int, iv_rank_lookback: int) -> None:
     """W95: refuse an out-of-sample context shorter than the feature spec's longest look-back. A shorter context does not
     fail, it silently changes the feature VALUES in the test window (measured: ``iv_rank`` differs below 252 bars,
@@ -307,6 +318,14 @@ class WalkForwardConfig:
                                           # process parallelism is the effective speedup path).
                                           # Set via --wf-n-jobs CLI flag (default: 1 = sequential).
     optimize_val_split: bool = False      # H2: score Optuna objective on held-out 20% val slice
+    # W108 S1: carried equity, an opt-in ESTIMATE. False (default) = today: every window's OOS engines, its pool and its
+    # result start at initial_capital (account.capital). True = the run is unchanged (the reset windows stay the basis
+    # for parameter selection: Optuna trials, the learner, warm starts) AND every window's OOS is replayed a second time
+    # starting at the previous carried window's ending equity, attached as WalkForwardResult.carried_estimate. An
+    # estimate because the parameters and models were selected at the fresh budget, not at the carried equity. Needs
+    # optimize_n_jobs=1 (refused otherwise: check_carry_is_sequential). Research-only, no backtest.* setting: like
+    # train_window_models it picks how a study is evaluated, so the study script sets it.
+    carry_equity: bool = False
 
     def __post_init__(self) -> None:
         """R20b (pre-registered PLAN 2026-08-21): research defaults migrate to
@@ -373,6 +392,8 @@ class WalkForwardConfig:
         if self.dte_search and not self.optimize_per_window:
             raise ValueError("dte_search requires optimize_per_window=True (the DTE is chosen "
                              "per window by Optuna)")
+        self.carry_equity = bool(self.carry_equity)
+        check_carry_is_sequential(self.carry_equity, self.optimize_n_jobs)   # W108 S1
         if self.initial_capital is None:
             # W90a: account.capital of the LOADED settings (the frozen research view: an overlay or a study reaches it);
             # was research_capital(), a raw read of config.yaml that ignored both
@@ -574,6 +595,11 @@ class WalkForwardResult:
     entry_funnel: dict = field(default_factory=dict)
     # W67: {window_id: {symbol: {"usable", "best_value", "best_n_trades"}}} (empty = no Optuna)
     optimization_status: dict = field(default_factory=dict)
+    # W108 S1: how the windows' capital was set. "reset" = every window started at initial_capital (the run of record);
+    # "carried_estimate" = each window started at the previous window's ending equity, with the parameters and models
+    # the reset run selected (so an estimate). A reset result carries the estimate here when carry_equity was on.
+    equity_basis: str = "reset"
+    carried_estimate: "WalkForwardResult | None" = None
 
     @property
     def optimization_failures(self) -> int:
@@ -587,13 +613,23 @@ class WalkForwardResult:
 
     @property
     def total_return(self) -> float:
-        if not self.windows:
+        """W108 S1: ONE equity path for every aggregate figure: initial_capital plus each accepted trade's realised P&L,
+        windows in order, trades in their window's order -- the path max_drawdown and equity_curve() already walked.
+        The return is that path's end over its start (= the sum of all P&L / initial_capital).
+
+        Was the PRODUCT of the window returns, which claims every window's exposure was rescaled to the equity at its
+        start; a reset run never did that (each window was sized off initial_capital, and at the shipped budget the lot
+        rule is integer and budget-capped), so the compounded figure disagreed with the drawdown and the curve beside
+        it. On a carried run (equity_basis "carried_estimate") the windows chain, so the product of the window returns
+        and this path are the same number."""
+        if not self.windows or self.initial_capital <= 0:
             return 0.0
-        # Chain returns across windows
-        equity = self.initial_capital
-        for w in self.windows:
-            equity *= (1 + w.backtest_result.total_return)
-        return (equity - self.initial_capital) / self.initial_capital
+        return sum(t.get("pnl", 0) for t in self._all_trades()) / self.initial_capital
+
+    @property
+    def final_equity(self) -> float:
+        """W108 S1: the end of the equity path total_return, max_drawdown and equity_curve() read."""
+        return self.initial_capital + sum(t.get("pnl", 0) for t in self._all_trades())
 
     @property
     def win_rate(self) -> float:
@@ -760,10 +796,18 @@ class WalkForwardResult:
         return self.total_return / util if util > 0 else 0.0
 
     def summary(self) -> str:
+        # W108 S1: a carried result says what it is before any number is read (nothing for the run of record).
+        basis = [] if self.equity_basis != "carried_estimate" else [
+            "  CARRIED-EQUITY ESTIMATE: each window's out-of-sample replay started at the",
+            "  previous window's ending equity. The parameters and models were selected at",
+            f"  the fresh ${self.initial_capital:,.0f} budget (the reset run), so this is an estimate.",
+            "-" * 60,
+        ]
         lines = [
             "=" * 60,
             "  WALK-FORWARD BACKTEST RESULTS",
             "=" * 60,
+            *basis,
             f"  Windows:           {len(self.windows)}",
             f"  Total Trades:      {self.total_trades}",
             f"  Total Return:      {self.total_return:.2%}",
@@ -906,6 +950,18 @@ class WalkForwardResult:
                     lines.append("           builder detail: " +
                                  ", ".join(f"{k}={v}" for k, v in det[:5]))
 
+        if self.carried_estimate is not None:
+            # W108 S1: the carried path beside the run of record, labelled as the estimate it is.
+            est = self.carried_estimate
+            lines += [
+                "-" * 60,
+                "  CARRIED-EQUITY ESTIMATE (each window starts at the previous window's ending",
+                "  equity; parameters and models selected at the fresh budget above)",
+                f"  Total Return:      {est.total_return:.2%}",
+                f"  Max Drawdown:      {est.max_drawdown:.2%}",
+                f"  Final Equity:      ${est.final_equity:,.2f}  (reset run: ${self.final_equity:,.2f})",
+                f"  Total Trades:      {est.total_trades}  (reset run: {self.total_trades})",
+            ]
         lines.append("=" * 60)
         return "\n".join(lines)
 
@@ -1153,6 +1209,18 @@ def _isnan(v: object) -> bool:
         return False
 
 
+def carried_equity_before(initial_capital: float, carried_trades: list[dict], first_test_day) -> float:
+    """W108 S1: the equity a carried window starts with: `initial_capital` plus the realised P&L of the carried
+    trades that closed strictly before `first_test_day` (no P&L realised on or after it may size its entries)."""
+    cutoff = pd.Timestamp(str(first_test_day)).date()
+    realised = 0.0
+    for t in carried_trades:
+        exit_day = t.get("exit_date") or t.get("exit_time")
+        if exit_day and pd.Timestamp(str(exit_day)).date() < cutoff:
+            realised += float(t.get("pnl", 0.0) or 0.0)
+    return initial_capital + realised
+
+
 def _init_worker_settings(settings) -> None:
     """Pool initializer (W88a): make the PARENT's resolved settings this worker's configuration.
 
@@ -1252,6 +1320,11 @@ class WalkForwardBacktester:
         # for every per-window Optuna study, so a run whose studies never found a trading
         # trial says so in its summary instead of looking like an optimized result.
         self._opt_status_by_window: dict[int, dict[str, dict]] = {}
+        # W108 S1: the carried-equity replay (carry_equity on): {window_id: carried WindowResult, None = no candidate
+        # trades} and its per-symbol entry funnels. Kept apart from the reset dicts above so nothing that selects
+        # parameters (learner, warm starts, global best) or reports the run of record ever reads them.
+        self._carried_by_window: dict[int, WindowResult | None] = {}
+        self._carried_funnel_by_window: dict[int, dict[str, dict[str, int]]] = {}
         # W68: {symbol: IV-rank series by date} over each symbol's FULL history (live's 252-obs
         # lookback), filled lazily by _ensure_iv_rank_series; empty when the gate is off.
         self._iv_rank_series: dict[str, pd.Series] = {}
@@ -1290,6 +1363,11 @@ class WalkForwardBacktester:
             data: Pre-loaded data as {symbol: OHLCV DataFrame}.
                   If None, fetches from Yahoo Finance.
         """
+        # W108 S1: also here, for a config changed after construction (dataclasses do not re-validate on assignment).
+        _carry = bool(getattr(self._config, "carry_equity", False))
+        check_carry_is_sequential(_carry, self._config.optimize_n_jobs)
+        self._carried_by_window = {}
+        self._carried_funnel_by_window = {}
         if data is None:
             data = await self._fetch_data()
 
@@ -1318,20 +1396,16 @@ class WalkForwardBacktester:
         # and are merged below).
         self._meta_status_by_window: dict[int, dict[str, str]] = {}
 
-        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in DB).
+        # Load VIX and SPY data for the full backtest period (yfinance fallback when not in the store).
         # VIX: Priority-2 IV proxy and live feature for the MetaLabeler.
         # SPY: cross-asset features (relative strength, momentum, correlation) for the ML model.
         from ait.data.market_data import load_daily_ohlcv as _load_ohlcv
         try:
             _ctx_days = self._context_days()
-            _vix_full: pd.DataFrame = _load_ohlcv(
-                "^VIX", days=_ctx_days, db_path=self._db_path,
-                table_prefix=self._table_prefix,
-            )
-            # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
-            if not _vix_full.empty and _vix_full.index.tz is not None:
-                _vix_full.index = _vix_full.index.tz_localize(None)
-        except Exception:
+            _vix_full: pd.DataFrame = self._load_vix_context(_load_ohlcv, _ctx_days, data)
+        except Exception as exc:
+            log.warning("research_vix_context_failed", error=str(exc),
+                        note="the VIX context is empty for this run (MetaLabeler and cross-asset VIX features)")
             _vix_full = pd.DataFrame()
         try:
             _spy_full: pd.DataFrame = _load_ohlcv(
@@ -1419,7 +1493,16 @@ class WalkForwardBacktester:
             # Sequential: warm-starting and BacktestLearner adaptation are active.
             learner = BacktestLearner(base_confidence=self._config.min_confidence)
             prev_best_params: dict | None = None
+            # W108 S1: the carried equity entering the next window (carry_equity on): the pool plus the P&L of every
+            # carried trade CLOSED BEFORE that window's first test day. Not the previous window's ending equity: with
+            # the inclusive test ranges consecutive windows can share a boundary day (a trade closed at that day's
+            # close would size the same morning's entries) and overlapping windows (step_days < test_days) would size
+            # entries with P&L realised weeks later. Only the carried replay reads it; everything below that selects
+            # parameters reads the reset `wr`, as before.
+            _carried_trades: list[dict] = []
             for i, (train_start, train_end, test_start, test_end) in enumerate(windows):
+                _carried_equity = carried_equity_before(
+                    float(self._config.initial_capital), _carried_trades, test_start)
                 prev_oos = window_results[-1].backtest_result if window_results else None
                 wr, curr_best_params, _meta_status = self._run_single_window(
                     window_id=i + 1,
@@ -1433,7 +1516,11 @@ class WalkForwardBacktester:
                     learner=learner,
                     prev_best_params=prev_best_params,
                     prev_oos=prev_oos,
+                    carry_capital=_carried_equity if _carry else None,
                 )
+                _cw = self._carried_by_window.get(i + 1)
+                if _cw is not None:
+                    _carried_trades.extend(_cw.backtest_result.trades)
                 if wr is not None:
                     window_results.append(wr)
                     if curr_best_params is not None:
@@ -1485,6 +1572,28 @@ class WalkForwardBacktester:
         # Compute per-strategy breakdown
         result.strategy_results = self._compute_strategy_results(window_results)
 
+        if _carry:
+            # W108 S1: the carried path as its own result (same aggregation, same one equity path), attached to the run
+            # of record. Model / meta / optimisation statuses are the reset run's: the replay reused those objects.
+            _carried_windows = [cw for _wid, cw in sorted(self._carried_by_window.items()) if cw is not None]
+            est = WalkForwardResult(
+                windows=_carried_windows,
+                initial_capital=self._config.initial_capital,
+                config=self._config,
+                range_training_status=dict(self._range_status_by_window),
+                meta_training_status=_meta_status_all,
+                entry_funnel=self._aggregate_funnel(self._carried_funnel_by_window),
+                optimization_status=self._opt_status_by_window,
+                equity_basis="carried_estimate",
+            )
+            est.symbol_results = self._compute_symbol_results(_carried_windows, data)
+            est.strategy_results = self._compute_strategy_results(_carried_windows)
+            result.carried_estimate = est
+            log.info("walk_forward_carried_estimate", windows=len(_carried_windows),
+                     total_trades=est.total_trades, total_return=f"{est.total_return:.2%}",
+                     final_equity=round(est.final_equity, 2),
+                     note="parameters and models selected at the fresh budget (the reset run): an estimate")
+
         log.info(
             "walk_forward_complete",
             windows=len(window_results),
@@ -1529,6 +1638,7 @@ class WalkForwardBacktester:
         prev_best_params: "dict | None" = None,
         prev_oos: "BacktestResult | None" = None,
         pretrained_range: "dict | None" = None,
+        carry_capital: "float | None" = None,
     ) -> "tuple[WindowResult | None, dict | None, dict]":
         """Run optimization, ML training, and backtest for one window.
 
@@ -1540,6 +1650,11 @@ class WalkForwardBacktester:
         visibility) must not be silently dropped along with the WindowResult.
         Pass learner=None in parallel mode — the method then uses static
         config defaults (no cross-window adaptation).
+
+        W108 S1: ``carry_capital`` (carry_equity on) also replays the window's OOS at that equity: each symbol's engine
+        again, same window config / models / features / context, seeded with ``carry_capital``, then the pool at
+        ``carry_capital``. The carried WindowResult (None when no candidates) goes to ``self._carried_by_window``; the
+        returned (reset) values are exactly what they are with carry off.
         """
         log.info(
             "running_window",
@@ -1576,6 +1691,7 @@ class WalkForwardBacktester:
         # allocate_pool (backtesting/pool.py), which replays all symbols' trades
         # chronologically against ONE equity. Supersedes the BT-H3 per-symbol sleeves.
         per_symbol_capital = self._config.initial_capital
+        carried_symbol_trades: list = []   # W108 S1: the carried replay's candidates (carry_capital given)
 
         for symbol, df in data.items():
             if learner is not None and not learner.is_symbol_allowed(symbol):
@@ -1833,7 +1949,9 @@ class WalkForwardBacktester:
             # enables capture of limit_price and fill_time on every OOS trade.
             _oos_intraday_store = self._make_intraday_store()
 
-            bt = Backtester(
+            # W108 S1: the OOS engine's arguments as one dict, so the carried replay below builds the SAME engine with
+            # only initial_capital changed (was an inline call; the arguments are unchanged).
+            _oos_kwargs = dict(
                 data=test_with_context,
                 context_bars=context_bars,
                 strategies=active_strategies,
@@ -1849,15 +1967,10 @@ class WalkForwardBacktester:
                 friction_entry_capture=window_cfg.friction_entry_capture,
                 friction_exit_capture=window_cfg.friction_exit_capture,
                 friction_stress_multiplier=window_cfg.friction_stress_multiplier,
-                gates_mode=window_cfg.gates_mode,
-                iv_rank_gate=window_cfg.iv_rank_gate,
                 iv_rank_rise_gate=window_cfg.iv_rank_rise_gate,          # W71c
                 regime_veto_gate=window_cfg.regime_veto_gate,            # W81
                 ex_div_entry_gate=window_cfg.ex_div_entry_gate,          # W84
                 ex_div_entry_k_days=window_cfg.ex_div_entry_k_days,      # W84
-                iv_rank_series=self._iv_rank_series.get(symbol),
-                fractal_veto_spread=window_cfg.fractal_veto_spread,
-                penalty_on_range_prob=window_cfg.penalty_on_range_prob,
                 economic_calendar=self._research_calendar,
                 stop_loss_pct=window_cfg.stop_loss_pct,
                 profit_target_pct=window_cfg.profit_target_pct,
@@ -1893,7 +2006,6 @@ class WalkForwardBacktester:
                 max_hold_fraction=getattr(window_cfg, "max_hold_fraction", None),
                 flatten_minutes_before_close=getattr(window_cfg, "flatten_minutes_before_close", None),
                 delta_short=getattr(window_cfg, "delta_short", None),
-                db_path=self._db_path,  # W52a: the engine reads THIS store
                 post_event_blackout_days=getattr(window_cfg, "post_event_blackout_days", None),
                 post_event_dates=getattr(window_cfg, "post_event_dates", None),
                 max_loss_per_contract_dollars=getattr(
@@ -1921,12 +2033,19 @@ class WalkForwardBacktester:
                 entry_window_start_et=getattr(window_cfg, "entry_window_start_et", None),
                 entry_window_end_et=getattr(window_cfg, "entry_window_end_et", None),
                 limit_order_timeout_bars=getattr(window_cfg, "limit_order_timeout_bars", None),
-                symbol=symbol,
                 # R20b review follow-up: reuse settings loaded once in
                 # __init__ instead of every window's OOS Backtester
                 # independently re-reading + re-validating config.yaml.
                 settings=self._settings,
             )
+            # W52a / W66 / W67 / W68: symbol, store, the gate inputs and the IV-rank inputs stay explicit at every
+            # construction (the W66, W67 and W68 class guards read the call).
+            bt = Backtester(symbol=symbol, db_path=self._db_path,  # W52a: the engine reads THIS store
+                            gates_mode=window_cfg.gates_mode,
+                            fractal_veto_spread=window_cfg.fractal_veto_spread,
+                            penalty_on_range_prob=window_cfg.penalty_on_range_prob,
+                            iv_rank_gate=window_cfg.iv_rank_gate,
+                            iv_rank_series=self._iv_rank_series.get(symbol), **_oos_kwargs)
             result = bt.run()
             self._funnel_by_window.setdefault(window_id, {})[symbol] = dict(result.entry_funnel)
 
@@ -1979,6 +2098,29 @@ class WalkForwardBacktester:
                     window_id=window_id,
                     precomputed_features=_oos_feat_cache,
                 )
+
+            if carry_capital is not None:
+                # W108 S1: the carried replay, LAST for this symbol so every reset-path use of the window's models,
+                # features and context (the OOS run, its evaluations, the timeseries export) is already done. The same
+                # engine arguments, seeded with the carried equity: the engine's own budget (capital x size pct per
+                # lot, budget-aware wings) follows it. Nothing here feeds the learner, warm starts or best params.
+                _carried = Backtester(symbol=symbol, db_path=self._db_path,
+                                      gates_mode=window_cfg.gates_mode,
+                                      fractal_veto_spread=window_cfg.fractal_veto_spread,
+                                      penalty_on_range_prob=window_cfg.penalty_on_range_prob,
+                                      iv_rank_gate=window_cfg.iv_rank_gate,
+                                      iv_rank_series=self._iv_rank_series.get(symbol),
+                                      **{**_oos_kwargs, "initial_capital": float(carry_capital)}).run()
+                self._carried_funnel_by_window.setdefault(window_id, {})[symbol] = dict(_carried.entry_funnel)
+                for t in _carried.trades:
+                    t["symbol"] = symbol
+                    t["_pool_size_pct"] = effective_position_size
+                carried_symbol_trades.extend(_carried.trades)
+
+        if carry_capital is not None:
+            self._carried_by_window[window_id] = self._carried_window_result(
+                window_id, (train_start, train_end, test_start, test_end), carried_symbol_trades,
+                float(carry_capital), model_accuracy, _range_status_local, _meta_status_local)
 
         all_symbol_trades.sort(
             key=lambda t: str(t.get("entry_date") or t.get("entry_time") or ""))
@@ -2035,6 +2177,54 @@ class WalkForwardBacktester:
                 optuna_meta=_optuna_meta, model_weights=_model_weights,
             )
             return None, curr_best_params, dict(_meta_status_local)
+
+    def _carried_window_result(
+        self,
+        window_id: int,
+        dates: "tuple[date, date, date, date]",
+        candidates: list,
+        capital: float,
+        model_accuracy: float,
+        range_status: dict,
+        meta_status: dict,
+    ) -> "WindowResult | None":
+        """W108 S1: the carried replay's window: its candidates through the SAME shared pool as the reset window
+        (allocate_pool, the same limits and size fraction) with the carried equity as the pool, so the per-trade budget
+        and the aggregate-risk and per-symbol caps scale with it. None when no symbol produced a candidate (the reset
+        path's rule). The window's result starts at ``capital`` and ends at ``capital`` plus its accepted trades' P&L."""
+        if not candidates:
+            return None
+        from ait.backtesting.pool import allocate_pool
+        candidates = sorted(candidates, key=lambda t: str(t.get("entry_date") or t.get("entry_time") or ""))
+        _pool = allocate_pool(
+            candidates,
+            pool_capital=capital,
+            position_size_pct=self._config.position_size_pct,
+            **self._pool_limits(),
+        )
+        log.info("window_pool_allocation_carried", window=window_id, pool=round(capital, 2),
+                 candidates=len(candidates), accepted=len(_pool.accepted),
+                 rejections=dict(_pool.rejections), peak_open_risk=round(_pool.peak_open_risk, 2))
+        train_start, train_end, test_start, test_end = dates
+        total_pnl = sum(t.get("pnl", 0) for t in _pool.accepted)
+        return WindowResult(
+            window_id=window_id,
+            train_start=train_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            backtest_result=BacktestResult(
+                trades=_pool.accepted,
+                initial_capital=capital,
+                final_capital=capital + total_pnl,
+                start_date=test_start,
+                end_date=test_end,
+            ),
+            model_accuracy=model_accuracy,
+            pool_rejections=dict(_pool.rejections),
+            range_model_status=dict(range_status),
+            meta_labeler_status=dict(meta_status),
+        )
 
     def _write_window_progress(
         self,
@@ -3373,6 +3563,34 @@ class WalkForwardBacktester:
                  span=span[:2], rows=span[2])
         return trimmed
 
+    def _load_vix_context(self, loader, ctx_days: int, data: "dict[str, pd.DataFrame]") -> pd.DataFrame:
+        """The ^VIX context frame: the IB-stored series on the research path (W106), the legacy path otherwise.
+
+        W106 review follow-up: the stored series is used only when it reaches the last day of the symbols'
+        data. The VIX family has its own writer and can fall behind them; the frame is forward-filled onto
+        every test day, so a stale store would hand every later day its last close, silently. A short
+        tail falls back to the legacy path (Yahoo, as before W106) with a warning."""
+        research = self._db_path is not None
+        vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
+                     research=research)
+        if research and not vix.empty:
+            def _naive(ts) -> pd.Timestamp:
+                ts = pd.Timestamp(ts)
+                return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+            ends = [_naive(df.index.max()) for df in data.values() if df is not None and not df.empty]
+            data_last = max(ends) if ends else None
+            vix_last = vix.index.max()
+            if data_last is not None and _naive(vix_last) < data_last:
+                log.warning("research_vix_store_stale_yahoo_fallback", vix_last=str(vix_last),
+                            data_last=str(data_last))
+                vix = loader("^VIX", days=ctx_days, db_path=self._db_path, table_prefix=self._table_prefix,
+                             research=False)
+        # yfinance may return tz-aware index; normalize to tz-naive to match OHLCV data
+        if not vix.empty and vix.index.tz is not None:
+            vix.index = vix.index.tz_localize(None)
+        return vix
+
     def _ensure_iv_rank_series(self, data: "dict[str, pd.DataFrame]") -> None:
         """W68: IV rank over each symbol's FULL history, once per instance (the parallel path
         builds one instance per window, so this also runs inside each worker).
@@ -3390,10 +3608,11 @@ class WalkForwardBacktester:
             if df is not None and "implied_vol" in df.columns:
                 self._iv_rank_series[sym] = iv_rank_series(df["implied_vol"])
 
-    def _aggregate_funnel(self) -> dict[str, dict[str, int]]:
-        """W66: sum the per-window entry funnels into {symbol: {reason: days}}."""
+    def _aggregate_funnel(self, by_window: "dict | None" = None) -> dict[str, dict[str, int]]:
+        """W66: sum the per-window entry funnels into {symbol: {reason: days}}. W108 S1: ``by_window`` names another
+        {window_id: {symbol: funnel}} (the carried replay's); None = the run of record's."""
         total: dict[str, dict[str, int]] = {}
-        for per_symbol in self._funnel_by_window.values():
+        for per_symbol in (self._funnel_by_window if by_window is None else by_window).values():
             for sym, funnel in per_symbol.items():
                 acc = total.setdefault(sym, {})
                 for reason, n in funnel.items():

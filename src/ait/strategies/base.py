@@ -43,14 +43,17 @@ class SignalDirection(str, Enum):
 # shadow-tournament arms that exist only inside the engine. Both are credit
 # structures, so both belong in CREDIT_STRATEGIES: classification follows the
 # cash-flow direction, not whether the name happens to be tradeable today.
+# W108 4b: put_credit_spread / call_credit_spread moved here from the backtest
+# set — they now have live builders in STRATEGY_MAP (strategies/credit_spreads.py,
+# not enabled). The union below, which every consumer reads, is unchanged.
 LIVE_CREDIT_STRATEGIES = frozenset({
     "iron_condor", "short_strangle", "covered_call", "cash_secured_put",
+    "put_credit_spread", "call_credit_spread",
 })
 
 BACKTEST_CREDIT_STRATEGIES = frozenset({
     "iron_butterfly", "wide_wing_condor", "broken_wing_condor",
-    "call_credit_spread", "put_credit_spread", "jade_lizard",
-    "short_straddle",
+    "jade_lizard", "short_straddle",
 })
 
 CREDIT_STRATEGIES = LIVE_CREDIT_STRATEGIES | BACKTEST_CREDIT_STRATEGIES

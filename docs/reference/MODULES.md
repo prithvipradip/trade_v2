@@ -210,12 +210,14 @@ Reporting authorities shared by every operator-facing surface.
 | `pdt_guard.py` | Pattern Day Trader (PDT) protection. |
 | `position_sizer.py` | Volatility-adjusted position sizing with Kelly criterion. |
 | `scalers.py` | The sizing scalers and the inputs they read: ONE implementation, called by live and by research. |
+| `width_sizing.py` | The ONE budget-to-width rule for defined-risk verticals, shared by the live builders and the research engine. |
 
 ## `strategies/`
 
 | Module | What it is |
 |---|---|
 | `base.py` | Base strategy interface and signal dataclass. |
+| `credit_spreads.py` | Vertical credit spreads: the put credit spread (bullish) and the call credit spread (bearish). |
 | `iron_condor.py` | Iron condor strategy — premium selling in range-bound markets. |
 | `long_options.py` | Directional strategies: long calls and long puts. |
 | `selector.py` | Strategy selector — picks the best strategy based on market conditions. |

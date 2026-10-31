@@ -11,6 +11,7 @@ import pandas as pd
 from ait.config.settings import OptionsConfig
 from ait.data.options_chain import OptionsChain
 from ait.strategies.base import Signal, SignalDirection, Strategy
+from ait.strategies.credit_spreads import CallCreditSpread, PutCreditSpread
 from ait.strategies.iron_condor import IronCondor
 from ait.strategies.long_options import LongCall, LongPut
 from ait.strategies.spreads import BearPutSpread, BullCallSpread
@@ -32,6 +33,12 @@ STRATEGY_MAP: dict[str, type[Strategy]] = {
     "iron_condor": IronCondor,
     "long_straddle": LongStraddle,
     "short_strangle": ShortStrangle,
+    # W108 4b: registered, NOT enabled. A name here is only instantiated when
+    # options.strategies lists it (config.yaml ships [iron_condor]); enabling
+    # either is a recorded operator decision after a pre-registered test of
+    # the direction model that gates them (PLAN.md W108 NEXT PHASES, 4d).
+    "put_credit_spread": PutCreditSpread,
+    "call_credit_spread": CallCreditSpread,
 }
 
 
@@ -144,8 +151,10 @@ class StrategySelector:
         return ranked
 
     # Strategies that profit from selling premium (short vega)
+    # W108 4b: + the two credit verticals (short premium; ranked on IV rank as
+    # sellers). Ranking only: it changes nothing until one of them is enabled.
     SELLING_STRATEGIES = frozenset({
-        "iron_condor", "short_strangle",
+        "iron_condor", "short_strangle", "put_credit_spread", "call_credit_spread",
     })
     # Strategies that profit from buying premium (long vega)
     BUYING_STRATEGIES = frozenset({

@@ -30,7 +30,6 @@ apply_runtime_env_defaults()  # before any trading-subsystem import (docs/TECHNI
 import argparse  # noqa: E402
 import sys  # noqa: E402
 import warnings  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +69,8 @@ def run_arm(task: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from study_cli import add_study_args, load_study_config, study_pool, write_study_record
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--symbols", nargs="+", default=["QQQ", "SPY", "IWM"])
     ap.add_argument("--start", default="2024-01-02")
@@ -77,16 +78,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--entry-dte", nargs="+", type=int, default=[14, 7])
     ap.add_argument("--k", nargs="+", type=int, default=[3, 5, 7], help="K values for last_k_days")
     ap.add_argument("--workers", type=int, default=3)
+    add_study_args(ap)
     args = ap.parse_args(argv)
     warnings.filterwarnings("ignore")
+    study = load_study_config(args.study_file)
 
     arm_map = arms(args.k)
     tasks = [{"symbol": s, "entry_dte": d, "arm": a, "mode": m, "k": k,
               "start": args.start, "end": args.end}
              for s in args.symbols for d in args.entry_dte for a, (m, k) in arm_map.items()]
     print(f"{len(tasks)} runs ({args.start}..{args.end}, realistic engine, 1 contract)", flush=True)
-    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as ex:
+    with study_pool(args.workers, args.study_file) as ex:
         res = list(ex.map(run_arm, tasks))
+    write_study_record("ex_div_gate_ab", args, study, res, symbols=args.symbols)
 
     print("\n## Ex-dividend entry block A/B (statistics only; QQQ first)\n")
     print("| symbol | entry DTE | arm | trades | win % | total $ | vs off $ | worst trade $ "

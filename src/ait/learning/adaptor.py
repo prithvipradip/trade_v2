@@ -97,6 +97,17 @@ class StrategyAdaptor:
 
         Returns list of adaptations actually applied.
         """
+        # W106: inactive (paper_trading_mode) must not bank adaptations either.
+        # The consults below were no-ops, but this path still mutated and
+        # persisted the overrides, so everything learned in paper switched on
+        # at go-live. Log what would have changed; change nothing.
+        if not self._active:
+            for insight in insights:
+                if insight.confidence >= self._limits.min_insight_confidence:
+                    log.info("adaptation_suppressed_inactive", action=insight.action,
+                             confidence=insight.confidence)
+            return []
+
         adaptations: list[Adaptation] = []
         applied = 0
         # Deep-audit VL: three insights mapping to the SAME parameter used to
