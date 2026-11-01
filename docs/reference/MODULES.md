@@ -36,6 +36,7 @@ Backtesting engine for strategy validation before live trading.
 | `settlement.py` | What happens to an option structure that reaches its expiry bell. |
 | `strict.py` | ONE switch for whether the research engine may substitute for a missing input. |
 | `study_harness.py` | The research "study harness" engine setup, defined once. |
+| `surface_features.py` | Features read off the fitted IV smile (research only): ATM level, 25-delta risk reversal and butterfly, term slope |
 | `walkforward.py` | Walk-forward backtester with multi-symbol support. |
 
 ## `bot/`

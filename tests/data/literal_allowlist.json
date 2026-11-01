@@ -605,6 +605,36 @@
    "category": "structural",
    "note": "named, documented study floors (W87a); W95: also STUDY_SCAN_INTERVAL_MINUTES = 60, a named study-harness constant; the engine does not read the scan interval yet (W96 plans that)"
   },
+  "src/ait/backtesting/surface_features.py::<module>": {
+   "values": [
+    60
+   ],
+   "category": "epsilon",
+   "note": "iterations of the strike-for-delta bisection (the interval shrinks by 2**-60: far below a cent)"
+  },
+  "src/ait/backtesting/surface_features.py::bf25": {
+   "values": [
+    0.5
+   ],
+   "category": "structural",
+   "note": "the average of the two wing IVs (x 0.5) in the butterfly definition"
+  },
+  "src/ait/backtesting/surface_features.py::strike_for_delta": {
+   "values": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "category": "structural",
+   "note": "the bisection midpoint (x 0.5) and the bound 0 < |delta| < 0.5 (an out-of-the-money option's delta is below one half)"
+  },
+  "src/ait/backtesting/surface_features.py::years": {
+   "values": [
+    365.0
+   ],
+   "category": "structural",
+   "note": "calendar days to years (days / 365), the convention of IVSurface.iv"
+  },
   "src/ait/backtesting/walkforward.py::WalkForwardBacktester._adaptive_range_threshold": {
    "values": [
     252,

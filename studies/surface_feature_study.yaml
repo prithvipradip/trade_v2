@@ -1,0 +1,20 @@
+# W118: do three IV-surface features predict the out-of-sample result of a QQQ iron condor, by DTE bucket?
+#
+#   python scripts/surface_feature_study.py --dry-run          # coverage only, computes no outcomes
+#   python scripts/surface_feature_study.py                    # the pre-registered run
+#
+# The rule, the panel, the folds and the decision rule are in PLAN.md "W118 AS PLANNED". Commit this file BEFORE the
+# run; do not edit it afterwards (a changed study is a new file).
+
+name: surface_feature_study
+question: >
+  Do the variance risk premium at the condor's horizon, the 7-to-30-day ATM term slope and the normalised 25-delta
+  risk reversal predict the hold-to-expiry result of a QQQ iron condor after friction, beyond IV rank and the ATM IV
+  level, in each DTE bucket (1-2, 3-10, 14-45)?
+rule: W118 AS PLANNED
+
+# Only the window end is set here (the overlay already sets history_start_date 2024-10-01 and pricing_source surface):
+# QQQ option bars on 2026-10-21 and 2026-10-22 are partial, so the window ends at the last complete session.
+settings:
+  backtest:
+    history_end_date: 2026-10-20
