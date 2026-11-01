@@ -42,6 +42,33 @@ The register of what research studies and measurements have shown, and whether e
 | F-005 | Fast-monitor tick latency | migrated, unreviewed | no |
 | F-006 | Order acknowledgement and fill times (entries) | migrated, unreviewed | no |
 | F-007 | Range-model confidence floor 0.65 versus 0.55 | migrated, unreviewed | no |
+| F-008 | IV-surface features versus the hold-to-expiry result of a QQQ iron condor, by DTE bucket | pre-registered | yes |
+
+## Study results
+
+### F-008  IV-surface features versus the hold-to-expiry result of a QQQ iron condor, by DTE bucket
+- Status: pre-registered        Citable: yes
+- Question: Do the variance risk premium at the condor's horizon (`vrp_h`), the 7-to-30-day ATM term slope (`term_slope`) and the normalised 25-delta risk reversal (`rr25_norm`) predict the hold-to-expiry result of a QQQ iron condor after friction, beyond IV rank and the ATM IV level, in each DTE bucket?
+- Rule: PLAN.md "W118 AS PLANNED" as amended by "W118 ADDENDUM 1" (both written before any outcome was computed)
+- Study file / script: studies/surface_feature_study.yaml / scripts/surface_feature_study.py --run
+- Run record: reports/runs/study_surface_feature_study_surface_feature_study_20261101_171235/   Commit: 38e82e3   Data span: 2024-10-01 to 2026-10-20 (warm-up to 2025-03-31, six quarterly test folds 2025-04-01 to 2026-10-20)   Epoch: surface IV fitted from the stored QQQ option bars; per-leg friction bands (the 0-2 DTE band extrapolated); hold-to-expiry intrinsic settlement; the QQQ option-bar backfill was still adding expiries after the window end during the run
+- Result: one synthetic condor per (session, target DTE), short strikes at |delta| 0.20, wing 0.35 x expected move, scored from real option-bar closes. Verdicts: bucket A (1-2 DTE) NOT SHOWN, bucket B (3-10 DTE) NOT SHOWN, bucket C (14-30 DTE) INSUFFICIENT. No feature passes. Spearman rho with the result per unit of risk (90% block-bootstrap interval; Holm family of 6 tests):
+
+  | bucket (n_eff) | feature | rho | 90% interval | p raw | p Holm | partial rho (p) | folds with expected sign |
+  |---|---|---|---|---|---|---|---|
+  | A (274.2) | `vrp_h` | +0.090 | [+0.015, +0.165] | 0.022 | 0.135 | +0.045 (0.178) | 6 / 6 |
+  | A | `term_slope` | +0.045 | [-0.031, +0.122] | 0.330 | 1.000 | +0.018 (0.738) | 4 / 6 |
+  | A | `rr25_norm` | -0.078 | [-0.155, +0.002] | 0.107 | 0.535 | -0.021 (0.622) | 5 / 6 |
+  | B (77.3) | `vrp_h` | -0.086 | [-0.161, -0.000] | 0.950 | 1.000 | -0.043 (0.768) | 2 / 6 |
+  | B | `term_slope` | -0.046 | [-0.122, +0.042] | 0.417 | 1.000 | -0.037 (0.653) | 5 / 6 |
+  | B | `rr25_norm` | -0.024 | [-0.150, +0.086] | 0.673 | 1.000 | +0.025 (0.757) | 4 / 6 |
+  | C (24.8, descriptive only) | `vrp_h` | -0.089 | [-0.231, +0.059] | 0.856 | - | +0.049 (0.490) | 3 / 6 |
+  | C | `term_slope` | -0.205 | [-0.303, -0.092] | 0.002 | - | -0.183 (0.026) | 5 / 6 |
+  | C | `rr25_norm` | -0.117 | [-0.251, +0.020] | 0.174 | - | -0.040 (0.554) | 6 / 6 |
+
+  `vrp_h` is one-sided (pre-stated direction positive), the others two-sided. Mean result per unit of risk at 1x friction: A -0.084, B -0.003, C +0.048. Wiring checks all passed (as-of mutation check; leaked canary significant in A and B; shuffled canary 3 of 20 in each; data-defect share 3.0% / 2.1% / 3.1%).
+- Caveats: About 18 months of test sessions, one underlying, one regime. Rows of adjacent sessions overlap (hence the block bootstrap, and `n_eff` counted in distinct sessions); bucket C is below the floor of 30 independent observations, so its figures, including the `term_slope` interval that excludes zero, are descriptive and are not a finding. Bucket A friction is extrapolated for 86.7% of entries. Settlement is intrinsic, with no assignment or pin modelling. The 0.35 wing, the 0.03 smile-fit limit and the 25% void limits are chosen values. The option-bar backfill was writing during the run: it did not change any entry or outcome, and an exploratory re-computation with the surface cut at the window end moved no verdict and no figure by more than 0.02 in rho (bucket C `term_slope` -0.211 against -0.205). A near miss, not a pass: `vrp_h` at 1-2 DTE has the expected sign in every fold, but the partial correlation controlling for IV rank and ATM IV level is +0.045.
+- Fed decision: none (a rerun of the same rule is registered for when bucket C reaches `n_eff` 30)      Superseded by: -
 
 ## Migrated, not yet reviewed
 
