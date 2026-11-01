@@ -5,7 +5,7 @@ Not for: how the system works ([GUIDE.md](GUIDE.md)), installing and first run (
 Limits, timers and ceilings these procedures refer to are generated tables in [GUIDE.md](GUIDE.md) sections 7 and 8; every setting is in [reference/SETTINGS_LIVE.md](reference/SETTINGS_LIVE.md). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 **Contents:** [Kill switches](#kill-switches-no-kill--9-needed) · [Alert → action](#alert--action) · [Books versus broker](#resolving-a-books-versus-broker-break) · [Manual intervention](#manual-intervention-procedure-closingadjusting-any-tracked-position-yourself) ·
-[Daily routine](#daily-2-minute-routine) · [Paper checkpoints](#paper-checkpoints) · [Deploy checklist](#deploy-checklist-every-deploy) · [Data catch-up](#data-catch-up-and-maintenance) · [Troubleshooting](#troubleshooting) ·
+[Daily routine](#daily-2-minute-routine) · [Paper checkpoints](#paper-checkpoints) · [Deploy checklist](#deploy-checklist-every-deploy) · [Data catch-up](#data-catch-up-and-maintenance) · [Economic calendar](#economic-calendar) · [Troubleshooting](#troubleshooting) ·
 [Quarterly drills](#quarterly-drills-scheduled--first-week-of-jan--apr--jul--oct) · [Go-live checklist](#go-live-day-checklist-from-planmd-gates--do-not-skip)
 
 ## Kill switches (no `kill -9` needed)
@@ -80,8 +80,8 @@ Every refusal below blocks **entries only**; open positions keep being managed u
 | `IV DATA OUTAGE — {symbol}` | IV rank could not be measured for that symbol | Check IB option-IV data for the symbol; clears itself |
 | `EARNINGS DATA UNAVAILABLE for {symbol}` / `DIVIDEND DATA UNAVAILABLE for {symbol}` | No confirmed calendar answer and no usable last-known-good | Check the data source; clears itself when a fetch succeeds |
 | `RANGE GATE UNAVAILABLE` | In enforce mode, the range model produced no prediction | Check `models/range.pkl` exists and loaded; re-run the retrain (below). Irrelevant in observe mode |
-| `ENTRY GATE BROKEN — the pre-event blackout check has failed N times` | The macro-calendar check is erroring; credit entries are refused | Read the error in the message; check the calendar tables in `src/ait/data/economic_calendar.py` |
-| `ECONOMIC CALENDAR NEARLY EXHAUSTED` | The hard-coded FOMC/CPI/NFP/GDP/PCE tables are about to run out; the event guards would go blind | Extend the tables in `src/ait/data/economic_calendar.py` |
+| `ENTRY GATE BROKEN — the pre-event blackout check has failed N times` | The macro-calendar check is erroring; credit entries are refused | Read the error in the message; check the stored calendar and the fallback lists ([Economic calendar](#economic-calendar)) |
+| `ECONOMIC CALENDAR NEARLY EXHAUSTED` | Either the macro-event calendar is about to run out and the event guards would go blind, or the bot is running on the hard-coded fallback lists because the stored official calendar is missing, unreadable, incomplete or older than 90 days (the log line `economic_calendar_table_unusable` or `economic_calendar_nearly_exhausted` says which) | Rebuild the stored calendar and restart the bot: [Economic calendar](#economic-calendar). The page text names exhaustion in both cases |
 | `COOLDOWN CHECK FAILED ({symbol})` | The post-stop re-entry guard could not run; credit entries blocked | Read the exception in the log; clears when it can run |
 
 ### Positions and exits
@@ -217,6 +217,24 @@ A green test suite is not a safe deploy: unit tests once passed and the deployed
 - **The history-table merge tool** (`scripts/unify_history_tables.py`) merged the old `research_*` copies into the shared tables. Dry run by default; `--apply` backs up, merges (additive; research rows win on overlap, live-only rows kept) and verifies; `--verify`
   re-checks any time; `--archive` renames `research_X` to `archive_w91_research_X` (refused unless verification passes); `--drop-archives` drops them. It refuses to write the real database while the supervisor/bot runs (`--allow-running` overrides). Order:
   merge, merge the code and restart the supervisor, one clean retrain and a research run, THEN archive, THEN drop. Do not run it during the Sunday 20:00 weekly backtest or an option-history refresh.
+- **Cleaning rows out of the history database** (`scripts/clean_history_db.py`; nothing else deletes history rows). `python scripts/clean_history_db.py list` shows rows, first and last date per table, symbol and `source` tag, and flags rows with no tag (`UNRECORDED`), a tag the code never writes (`FOREIGN_SOURCE`) and the `archive_w91_research_*` tables.
+  `delete --table <t>` takes `--symbol`, `--source <tag>` or `--source-null`, and `--before` / `--after` (both exclusive, compared on the day); it prints the exact row counts and deletes nothing until `--apply`. Only the tables a study reads (the registry in `data/research_inputs.py`) and the archive tables can be named, and a delete with no filter needs `--all-rows`.
+  `--apply` copies the database to `data/backups/historical_pre_clean_<time>.db` first, deletes in one transaction and writes `reports/clean_history_db_<time>.json`; to undo, stop the bot and copy the backup back over `data/historical.db`. It refuses (exit 3) while the supervisor holds `data/orchestrator.lock`, `data/bot_heartbeat` is fresh, a bot process is found or the process list cannot be read, and has no override: stop the bot first,
+  and run it outside the Sunday 20:00 weekly backtest and an option-history refresh. After deleting rows a study depends on, run `python scripts/research_preflight.py` to see what has to be backfilled.
+
+## Economic calendar
+
+The macro-event guards (no new credit entries on or the day before FOMC, CPI, jobs report, GDP advance estimate and PCE days) and the research macro gate read the **same stored calendar**, the `official_econ_calendar` table in `data/historical.db`. It is filled from the Fed, BLS and BEA release pages; with `FRED_API_KEY` in `.env` every date is also cross-checked against FRED's release dates (register a free key at fred.stlouisfed.org; the key is never printed or logged). Nothing refreshes it by itself.
+
+```
+python scripts/build_official_calendar.py            # dry run: fetch, reconcile, write reports/official_calendar_reconciliation_<date>.json
+python scripts/build_official_calendar.py --apply    # store it (refused while the reconciliation lists a disagreement)
+python scripts/build_official_calendar.py --apply --accept-official   # after reading the DISAGREE lines: the official date wins
+```
+
+Run it after BLS or BEA announce a reschedule, when BEA publishes the next year's schedule (the 2027 GDP and PCE dates are approximations until then), and at least every 90 days. The reconciliation compares the new dates with the stored Investing.com rows, the hard-coded fallback lists and FRED; an agreement loads silently, a disagreement is listed and blocks the write. FRED also lists dates of data revisions, so a date only FRED has is shown as information, not a block. A moved release replaces its old date (the rows from `--since` on are rewritten in one transaction).
+
+**The bot reads the table once, at start.** After a rebuild, restart the bot so the live guards use it; until then they keep the dates they loaded. If the table is missing, unreadable, incomplete, tagged by a non-official source or older than 90 days, the bot logs `economic_calendar_table_unusable` (critical), pages `ECONOMIC CALENDAR NEARLY EXHAUSTED` and runs on the hard-coded fallback lists in `src/ait/data/economic_calendar.py`, which carry the dates verified at the last change (2027 GDP and PCE are named there as unverified). The fallback can only add protection, never remove it, and exits are never blocked by it. Past the last date the table holds for one event type, the matching fallback dates continue that type.
 
 ## Troubleshooting
 

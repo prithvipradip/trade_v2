@@ -13,6 +13,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from ait.config.invariants_research import RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION
 from ait.config.settings import loaded_account_capital, loaded_cash_yield
 
 # W95: the cap on the Sharpe / Sortino annualization frequency: no strategy is treated as trading more often than once
@@ -313,6 +314,24 @@ class BacktestResult:
             "=" * 60,
         ]
         return "\n".join(line for line in lines if line is not None)
+
+
+def surface_pricing_stamp(declared: dict[str, int]) -> dict | None:
+    """How much of a run was priced from the real-bar IV surface, from its summed declared-model counts.
+
+    ``None`` when no leg went through the surface (``pricing_source: bs_legacy``). The per-leg fallback to the
+    legacy single-IV model is a declared model: it is counted and stamped here, never a refusal. ``exceeds_limit``
+    is True when the fallback share is above ``RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION`` (a fixed research limit);
+    the run record carries it and ``run_backtest.py`` prints it.
+    """
+    hit = int(declared.get("surface_legs_hit", 0))
+    miss = int(declared.get("surface_legs_miss", 0))
+    if hit + miss == 0:
+        return None
+    fraction = miss / (hit + miss)
+    return {"legs_priced": hit + miss, "from_surface": hit, "fell_back": miss,
+            "miss_fraction": round(fraction, 4), "limit": RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION,
+            "exceeds_limit": fraction > RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION}
 
 
 def annualization_factor(trades) -> float:

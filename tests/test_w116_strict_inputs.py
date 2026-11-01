@@ -123,7 +123,7 @@ class TestCalendarIsStoredOrRefused:
         with pytest.raises(ResearchDataUnavailable) as e:
             Backtester(data=_bars(), strategies=[IronCondor()], symbol="SPY", macro_event_gate=True,
                        friction_model="legacy", ex_div_entry_gate="off")
-        assert e.value.gaps[0].input == "econ_events"
+        assert e.value.gaps[0].input == "official_econ_calendar"
 
     def test_the_gate_off_explicitly_is_a_stated_decision(self):
         Backtester(data=_bars(), strategies=[IronCondor()], symbol="SPY", macro_event_gate=False,
@@ -235,19 +235,18 @@ class TestTheWalkForwardRefuses:
             wf._apply_research_calendar({"SPY": _bars()})
         assert "hard-coded" in e.value.gaps[0].found
 
-    def test_an_empty_econ_events_table_refuses(self, tmp_path):
+    def test_an_empty_official_calendar_table_refuses(self, tmp_path):
         HistoricalDataStore(db_path=tmp_path / "h.db")
         wf = _wf(tmp_path, macro_event_gate=True, macro_event_types=("FOMC",))
         with pytest.raises(ResearchDataUnavailable) as e:
             wf._apply_research_calendar({"SPY": _bars()})
-        assert "load_econ_calendar_csv.py" in e.value.gaps[0].remedy
+        assert "build_official_calendar.py" in e.value.gaps[0].remedy
 
     def test_data_that_starts_before_the_calendar_refuses_instead_of_being_trimmed(self, tmp_path):
         db = tmp_path / "h.db"
-        HistoricalDataStore(db_path=db)
-        with sqlite3.connect(db) as conn:
-            conn.execute("INSERT INTO econ_events (event_date, event, country, engine_event_type, source) "
-                         "VALUES ('2024-03-20', 'FOMC', 'United States', 'FOMC', 'INVESTING_CSV')")
+        HistoricalDataStore(db_path=db).save_official_econ_calendar(
+            [("2024-03-20", "14:00", "FOMC", "FED_FOMC_PAGES", "https://www.federalreserve.gov/x",
+              "2026-10-31T10:00:00-04:00", "ab")])
         wf = _wf(tmp_path, macro_event_gate=True, macro_event_types=("FOMC",))
         with pytest.raises(ResearchDataUnavailable) as e:
             wf._apply_research_calendar({"SPY": _bars()})

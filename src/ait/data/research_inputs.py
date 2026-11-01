@@ -333,37 +333,38 @@ def _check_dividends(conn, req, notes) -> list[DataGap]:
 
 
 def _check_econ(conn, req, notes) -> list[DataGap]:
-    from ait.data.historical import SOURCE_INVESTING_CSV
-    t = f"{req.table_prefix}econ_events"
-    remedy = "python scripts/load_econ_calendar_csv.py --csv <the Investing.com economic calendar export>"
+    """The macro gate reads the stored OFFICIAL calendar (Track D): the Fed / BLS / BEA pages (FRED where it fills
+    a gap), never the Investing.com export (that stays stored as the reconciliation baseline and for its numeric
+    actual / forecast / previous columns)."""
+    from ait.data.historical import OFFICIAL_CALENDAR_SOURCES
+    from ait.data.official_calendar import foreign_sources, span_summary, table_name, type_summary
+    t = table_name(req.table_prefix)
+    remedy = "python scripts/build_official_calendar.py --apply"
+    tags = ", ".join(OFFICIAL_CALENDAR_SOURCES)
     if not _has_table(conn, t):
-        return [_no_table("econ_events", t, None, "stored economic events", remedy)]
+        return [_no_table("official_econ_calendar", t, None, "the stored official economic calendar", remedy)]
     out = []
-    first, last, n = conn.execute(f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {t}").fetchone()
-    # the export must reach back to the window's start: an earlier session has no gate at all
+    first, _last, n = span_summary(conn, t)
+    # the calendar must reach back to the window's start: an earlier session has no gate at all
     if not n or date.fromisoformat(first) > req.window.start:
-        out.append(DataGap("econ_events", None, f"a calendar export that starts on or before {req.window.start}",
-                           f"{n} rows starting {first}" if n else "no rows", remedy))
+        out.append(DataGap("official_econ_calendar", None,
+                           f"an official calendar that starts on or before {req.window.start}",
+                           f"{n} rows starting {first}" if n else "no rows", remedy + f" --since {req.window.start}"))
     for etype in req.macro_event_types:
         required = (f"{etype} events inside {req.window.start}..{req.window.end}, the last no more than "
-                    f"{req.max_event_gap_days} days before the window ends, tagged {SOURCE_INVESTING_CSV}")
-        row = conn.execute(f"SELECT MIN(event_date), MAX(event_date), COUNT(*) FROM {t} WHERE engine_event_type=?",
-                           (etype,)).fetchone()
-        if not row or not row[2]:
-            out.append(DataGap("econ_events", etype, required, "no rows", remedy))
+                    f"{req.max_event_gap_days} days before the window ends, tagged one of {tags}")
+        tfirst, tlast, tn, inside = type_summary(conn, t, etype, req.window.start, req.window.end)
+        if not tn:
+            out.append(DataGap("official_econ_calendar", etype, required, "no rows", remedy))
             continue
-        inside = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE engine_event_type=? AND event_date>=? AND event_date<=?",
-                              (etype, str(req.window.start), str(req.window.end))).fetchone()[0]
-        newest = date.fromisoformat(row[1])
+        newest = date.fromisoformat(tlast)
         if not inside or (req.window.end - newest).days > req.max_event_gap_days:
-            out.append(DataGap("econ_events", etype, required,
-                               f"{row[2]} rows spanning {row[0]}..{row[1]} ({inside} inside the window)", remedy))
-    foreign = [r for r in conn.execute(
-        f"SELECT source, COUNT(*) FROM {t} WHERE engine_event_type IN ({','.join('?' * len(req.macro_event_types))}) "
-        f"AND source IS NOT ? GROUP BY source", (*req.macro_event_types, SOURCE_INVESTING_CSV))]
+            out.append(DataGap("official_econ_calendar", etype, required,
+                               f"{tn} rows spanning {tfirst}..{tlast} ({inside} inside the window)", remedy))
+    foreign = foreign_sources(conn, t, tuple(req.macro_event_types), OFFICIAL_CALENDAR_SOURCES)
     if foreign:
-        out.append(DataGap("econ_events", None, f"rows tagged {SOURCE_INVESTING_CSV}",
-                           "rows tagged " + ", ".join(f"{s} ({n})" for s, n in foreign), remedy))
+        out.append(DataGap("official_econ_calendar", None, f"rows tagged one of {tags}",
+                           "rows tagged " + ", ".join(f"{s} ({k})" for s, k in foreign), remedy))
     return out
 
 
@@ -431,16 +432,23 @@ def _check_intraday(conn, req, notes) -> list[DataGap]:
 def _check_option_bars(conn, req, notes) -> list[DataGap]:
     need = len(sessions_between(req.window.start, req.window.end))
     out = []
+    sessions = sessions_between(req.window.start, req.window.end)
     for sym in req.symbols:
-        remedy = f"python scripts/backfill_option_history.py --symbol {sym}"
+        # option bars exist for QQQ only; the other symbols fall to the second remedy
+        remedy = (f"python scripts/backfill_option_history.py --symbol {sym}, or set backtest.pricing_source to "
+                  f"bs_legacy (the legacy single-IV pricing)")
         required = f"option bars on at least {req.surface_min_coverage:.0%} of the {need} sessions"
         if not _has_table(conn, "option_daily_bars"):                 # the surface reads it WITHOUT the prefix
             out.append(_no_table("option_daily_bars", "option_daily_bars", sym, required, remedy))
             continue
-        days = conn.execute("SELECT COUNT(DISTINCT date) FROM option_daily_bars WHERE underlying=? AND date>=? "
-                            "AND date<=?", (sym, str(req.window.start), str(req.window.end))).fetchone()[0]
+        stored = {r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM option_daily_bars WHERE underlying=? AND date>=? AND date<=?",
+            (sym, str(req.window.start), str(req.window.end)))}
+        days = len(stored)
         if days < req.surface_min_coverage * need:
-            out.append(DataGap("option_daily_bars", sym, required, f"{days} sessions", remedy))
+            missing = [d for d in sessions if str(d) not in stored]
+            found = f"{days} sessions" + (f", first missing {missing[0]}" if missing else "")
+            out.append(DataGap("option_daily_bars", sym, required, found, remedy))
     return out
 
 
@@ -495,8 +503,8 @@ REGISTRY: tuple[ResearchInput, ...] = (
     ResearchInput("implied_vol", (("daily_prices", True),), lambda r: r.needs_iv and bool(r.symbols), _check_iv),
     ResearchInput("vix_family", (("daily_iv", True),), lambda r: bool(r.vix_symbols), _check_vix),
     ResearchInput("dividends", (("dividends", True),), lambda r: r.ex_div_gate, _check_dividends),
-    ResearchInput("econ_events", (("econ_events", True),), lambda r: r.macro_gate and bool(r.macro_event_types),
-                  _check_econ),
+    ResearchInput("official_econ_calendar", (("official_econ_calendar", True),),
+                  lambda r: r.macro_gate and bool(r.macro_event_types), _check_econ),
     ResearchInput("earnings", (("earnings_schedule", True),), lambda r: r.earnings_gate, _check_earnings),
     ResearchInput("friction_params", (("option_leg_spread_params", False), ("option_leg_spread_band_params", False)),
                   lambda r: r.friction_per_leg, _check_friction),

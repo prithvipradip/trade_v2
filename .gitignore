@@ -29,6 +29,7 @@ reports/**/run.log
 reports/daily_*.json
 reports/backtest_*.json
 reports/econ_calendar_audit_*.json
+reports/official_calendar_reconciliation_*.json
 
 # MLflow experiment tracking (data/mlflow.db + data/mlruns/ — covered by /data/ above)
 mlflow.db

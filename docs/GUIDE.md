@@ -528,7 +528,7 @@ The offline backtest has its own, separate learner that adapts between walk-forw
 | Fallback for quotes and bars | Yahoo Finance, after IB | The market-data service tries IB, then Yahoo, with explicit price-basis rules (unadjusted for dividends) so bars from different sources are not mixed silently. Never mock data. Research does not use this chain: it reads the stored IB history only and refuses to start when an input is missing ([RESEARCH_GUIDE.md](RESEARCH_GUIDE.md) section 10.3) |
 | Historical option bars | Polygon | Used only by the option-history backfill script for research, not by the live bot |
 | Macro (yield curve, dollar) | FRED CSV | Cross-asset features |
-| Calendars | Hard-coded economic calendar, earnings and dividend services with last-known-good caches, SEC EDGAR 8-K feed | Unknown data refuses entries rather than allowing them |
+| Calendars | The stored official economic calendar (Fed, BLS and BEA release pages; hard-coded lists as the declared fallback, see [RUNBOOK.md](RUNBOOK.md#economic-calendar)), earnings and dividend services with last-known-good caches, SEC EDGAR 8-K feed | Unknown data refuses entries rather than allowing them |
 
 Staleness is handled in layers: an in-memory TTL cache for quotes (shorter than the monitor cadence by design, so two consecutive ticks never read the same cached print), data-quality checks, and
 fail-closed gates. If IB is unavailable no new trade can be entered, but positions are still monitored from the last known prices.

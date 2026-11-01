@@ -30,8 +30,11 @@ backtest:
                                        # credit-spread wing and the debit-spread width (ait.risk.width_sizing).
 
   # --- W65/W91: research history (stored IB history in the shared tables; the retrain only appends) ---
-  history_start_date: 2024-01-01       # first day of the operator's economic-calendar CSV, so the research
-                                       # macro gate is ON in every window. Wins over history_days.
+  history_start_date: 2024-10-01       # first session with stored QQQ option bars (2024-09-30 is the first bar day), so
+                                       # every window can be priced from the real-bar surface (pricing_source below). The
+                                       # stored official calendar (build_official_calendar --since, default 2024-01-01)
+                                       # starts before it, so the research macro gate is ON in every window. Wins over
+                                       # history_days.
   history_days: 1826                   # legacy fallback span (no start date)
   research_history: true               # W91: read the stored history tables (was implied by research_table_prefix);
                                        # research_table_prefix is "" now = the one shared set of tables
@@ -57,7 +60,14 @@ backtest:
   friction_short_dte: true             # D8: a 0-6 DTE leg is charged at least the $0.01 floor until its band has 15
                                        # collected sessions (W76); a band with its own fit then switches to it. Before the
                                        # flip the fitted all-DTE model was EXTRAPOLATED below 11 DTE.
-                                       # pricing_source stays bs_legacy: D2 waits for the option-bar backfill.
+  pricing_source: surface              # D2: each condor leg's IV is the smile of its OWN expiry from the stored option bars,
+                                       # fit on the previous session (W75: median option-price error cut 19-49% out of
+                                       # sample, and the +1.4-1.9 vol-point richness bs_legacy carries at 3+ DTE removed).
+                                       # QQQ ONLY: SPY and IWM have no option bars, so a study naming them refuses at the
+                                       # preflight (backfill_option_history.py --symbol, or set bs_legacy in the study).
+                                       # A leg the surface cannot price falls back to bs_legacy per leg, is counted, and the
+                                       # run record flags a share above RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION. The schema
+                                       # default stays bs_legacy; registered studies pin it (study_harness.py).
 
   # --- W71c: the IV-rank RISE veto is OFF in research (operator decision D9, 2026-10-13) ---
   iv_rank_rise_gate: false             # WHAT: research-only veto. Blocks a neutral credit entry when the FeatureEngine

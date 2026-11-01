@@ -151,46 +151,86 @@ class TestDividends:
         assert "dividends" not in ri.check_research_inputs(_req(db)).checked
 
 
-class TestEconEvents:
-    def _seed(self, db, types=("FOMC", "CPI"), first="2021-12-01", last="2026-12-31", source=SOURCE_INVESTING_CSV,
+class TestOfficialCalendar:
+    """Track D: the macro gate's input is the stored OFFICIAL calendar (Fed / BLS / BEA / FRED tags)."""
+
+    def _seed(self, db, types=("FOMC", "CPI"), first="2021-12-01", last="2026-12-31", source="BLS_SCHEDULE",
               extra_rows=()):
         HistoricalDataStore(db_path=db)
         rows = [(d, t) for t in types for d in (first, last)] + list(extra_rows)
         for d, t in rows:
-            _sql(db, "INSERT INTO econ_events (event_date, event, country, engine_event_type, source) "
-                     "VALUES (?,?,?,?,?)", (d, f"{t} {d}", "United States", t, source))
+            _sql(db, "INSERT INTO official_econ_calendar (event_date, event_time_et, event_type, source, source_url, "
+                     "fetched_at, sha256) VALUES (?,?,?,?,?,?,?)",
+                 (d, "", t, source, "https://example.test", "2026-10-31T10:00:00-04:00", "ab"))
 
-    def test_events_inside_the_window_and_an_export_that_covers_it_pass(self, db):
+    def test_events_inside_the_window_and_a_calendar_that_covers_it_pass(self, db):
         self._seed(db, extra_rows=[("2023-06-14", "FOMC"), ("2023-06-13", "CPI")])
         assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))).ok
 
+    def test_every_official_tag_passes(self, db):
+        from ait.data.historical import OFFICIAL_CALENDAR_SOURCES
+        self._seed(db, types=("FOMC",), source=OFFICIAL_CALENDAR_SOURCES[0])
+        for i, tag in enumerate(OFFICIAL_CALENDAR_SOURCES[1:]):
+            self._seed_row(db, f"2023-06-{10 + i}", "FOMC", tag)
+        assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))).ok
+
+    def _seed_row(self, db, d, etype, tag):
+        _sql(db, "INSERT INTO official_econ_calendar (event_date, event_time_et, event_type, source, source_url, "
+                 "fetched_at, sha256) VALUES (?,?,?,?,?,?,?)", (d, "", etype, tag, "u", "2026-10-31T10:00:00", "ab"))
+
     def test_a_type_that_first_occurs_after_the_window_start_is_not_a_gap(self, db):
-        """The first FOMC of a year is weeks into it: the export's own start, not the type's, is the bound."""
+        """The first FOMC of a year is weeks into it: the calendar's own start, not the type's, is the bound."""
         self._seed(db, types=("FOMC",), first="2021-12-01", last="2026-12-31",
                    extra_rows=[("2022-07-27", "FOMC"), ("2023-09-20", "FOMC")])
         assert ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",),
                                              window=ri.Window(date(2022, 6, 1), LAST))).ok
 
+    def test_a_missing_table_is_a_gap_with_the_builder_as_the_remedy(self, db):
+        _sql(db, "DROP TABLE official_econ_calendar")
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))),
+                     "official_econ_calendar")
+        assert gaps and "build_official_calendar.py --apply" in gaps[0].remedy
+
     def test_a_type_with_no_rows_is_a_gap(self, db):
         self._seed(db, types=("FOMC",))
         gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "NFP"))),
-                     "econ_events")
-        assert any(g.symbol == "NFP" and "load_econ_calendar_csv.py" in g.remedy for g in gaps)
+                     "official_econ_calendar")
+        assert any(g.symbol == "NFP" and "build_official_calendar.py" in g.remedy for g in gaps)
 
-    def test_an_export_that_starts_after_the_window_start_is_a_gap(self, db):
+    def test_a_calendar_that_starts_after_the_window_start_is_a_gap(self, db):
         self._seed(db, first="2023-01-03", extra_rows=[("2023-06-14", "FOMC")])
-        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))), "econ_events")
-        assert any(g.symbol is None and "starts on or before" in g.required and "2023-01-03" in g.found for g in gaps)
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))),
+                     "official_econ_calendar")
+        assert any(g.symbol is None and "starts on or before" in g.required and "2023-01-03" in g.found
+                   and "--since" in g.remedy for g in gaps)
 
-    def test_a_type_whose_last_event_is_long_before_the_window_ends_is_a_gap(self, db):
+    def test_a_stale_type_whose_last_event_is_long_before_the_window_ends_is_a_gap(self, db):
         self._seed(db, types=("FOMC",), first="2021-12-01", last="2023-01-25", extra_rows=[("2025-01-01", "CPI")])
-        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))), "econ_events")
+        gaps = _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))),
+                     "official_econ_calendar")
         assert any(g.symbol == "FOMC" and "2023-01-25" in g.found for g in gaps)
 
     def test_a_foreign_tag_is_a_gap(self, db):
         self._seed(db, source="HARDCODED", extra_rows=[("2023-06-14", "FOMC"), ("2023-06-13", "CPI")])
         assert any("HARDCODED" in g.found for g in _gaps(
-            ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))), "econ_events"))
+            ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))),
+            "official_econ_calendar"))
+
+    def test_the_investing_export_is_no_longer_an_accepted_tag(self, db):
+        """INVESTING_CSV rows stay stored in econ_events (the reconciliation baseline); as a gate source they are
+        the wrong tag."""
+        self._seed(db, source=SOURCE_INVESTING_CSV, extra_rows=[("2023-06-14", "FOMC"), ("2023-06-13", "CPI")])
+        assert any("INVESTING_CSV" in g.found for g in _gaps(
+            ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC", "CPI"))),
+            "official_econ_calendar"))
+
+    def test_econ_events_alone_no_longer_satisfies_the_gate(self, db):
+        HistoricalDataStore(db_path=db)
+        for d in ("2021-12-01", "2026-12-31"):
+            _sql(db, "INSERT INTO econ_events (event_date, event, country, engine_event_type, source) "
+                     "VALUES (?,?,?,?,?)", (d, "FOMC", "United States", "FOMC", SOURCE_INVESTING_CSV))
+        assert _gaps(ri.check_research_inputs(_req(db, macro_gate=True, macro_event_types=("FOMC",))),
+                     "official_econ_calendar")
 
 
 class TestEarnings:
@@ -317,6 +357,8 @@ READERS = {
     "load_earnings_sessions": "earnings_schedule",
     "econ_events_span": "econ_events",
     "load_econ_events": "econ_events",
+    "official_econ_calendar_span": "official_econ_calendar",
+    "load_official_econ_calendar": "official_econ_calendar",
     "load_intraday": "intraday_prices",
     "load_intraday_range": "intraday_prices",
     "intraday_day_count": "intraday_prices",

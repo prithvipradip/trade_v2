@@ -277,7 +277,7 @@ class TestConfigKeys:
         # not in the live config.yaml.
         from ait.config.research import load_research_settings
         b = load_research_settings(str(ROOT / "config.yaml")).backtest
-        assert b.history_start_date == date(2024, 1, 1)
+        assert b.history_start_date == date(2024, 10, 1)        # the first session with stored QQQ option bars
         assert b.research_table_prefix == ""          # W91: the one shared set of tables
         assert b.research_history is True
         assert b.macro_event_types == ["FOMC", "CPI", "NFP", "PCE", "GDP"]
@@ -441,11 +441,17 @@ class TestEconomicCalendar:
         assert gdp == ["2024-01-25", "2024-04-25"]      # Q4 second/third estimates excluded
 
     def test_combined_release_is_one_event_date_in_the_calendar(self, csv_path, tmp_path):
+        """Track D: the research calendar is the stored OFFICIAL table (one row per date and type, so a combined
+        release such as the Oct+Nov 2025 NFP is one event); the Investing rows stay stored beside it."""
         from ait.data.economic_calendar import EventType, build_research_calendar
         mod = _load_script("load_econ_calendar_csv")
         df, _ = mod.normalize(csv_path)
         st = HistoricalDataStore(db_path=tmp_path / "h.db", table_prefix="research_")
         assert st.save_econ_events(df, SOURCE_INVESTING_CSV, "cal.csv", "abc") == len(df)
+        assert build_research_calendar(tmp_path / "h.db", "research_", ["NFP"]) is None   # not the gate source
+        rows = [(d, "08:30", "NFP", "BLS_SCHEDULE", "https://www.bls.gov/x", "2026-10-31T10:00:00-04:00", "ab")
+                for d in ("2024-01-05", "2025-12-16", "2025-12-16")]
+        st.save_official_econ_calendar(rows)
         cal = build_research_calendar(tmp_path / "h.db", "research_", ["NFP"])
         assert [e.date for e in cal._events] == [date(2024, 1, 5), date(2025, 12, 16)]
         assert all(e.event_type is EventType.NFP for e in cal._events)
@@ -466,8 +472,11 @@ class TestEconomicCalendar:
         from ait.data.economic_calendar import build_research_calendar
         mod = _load_script("load_econ_calendar_csv")
         df, _ = mod.normalize(csv_path)
-        HistoricalDataStore(db_path=tmp_path / "h.db", table_prefix="research_").save_econ_events(
-            df, SOURCE_INVESTING_CSV, "cal.csv", "abc")
+        st = HistoricalDataStore(db_path=tmp_path / "h.db", table_prefix="research_")
+        st.save_econ_events(df, SOURCE_INVESTING_CSV, "cal.csv", "abc")
+        st.save_official_econ_calendar([
+            (d, "", t, "BLS_SCHEDULE" if t != "FOMC" else "FED_FOMC_PAGES", "u", "2026-10-31T10:00:00-04:00", "ab")
+            for d, t in (("2024-01-11", "CPI"), ("2024-01-31", "FOMC"), ("2024-01-05", "NFP"))])
         full = build_research_calendar(tmp_path / "h.db", "research_", ["FOMC", "CPI", "NFP", "PCE", "GDP"])
         only = build_research_calendar(tmp_path / "h.db", "research_", ["CPI"])
         assert len(only._events) < len(full._events) and len(only._events) == 1
@@ -479,9 +488,9 @@ class TestEconomicCalendar:
         assert cal.days_until_next_event(date(2024, 1, 8)) == 3
         assert cal.days_until_next_event(date(2024, 1, 12)) is None
 
-    def test_default_calendar_is_still_the_hardcoded_live_list(self):
+    def test_default_calendar_is_the_declared_fallback_when_there_is_no_stored_calendar(self):
         from ait.data import economic_calendar as ec
-        assert ec.EconomicCalendar()._events is ec._ALL_EVENTS and len(ec._ALL_EVENTS) == 71
+        assert ec.EconomicCalendar()._events is ec._ALL_EVENTS and len(ec._ALL_EVENTS) == 73
 
     def test_engine_uses_an_injected_calendar_and_defaults_to_the_live_one(self):
         from ait.backtesting.engine import Backtester
@@ -501,8 +510,14 @@ class TestEconomicCalendar:
     def test_walkforward_trims_data_to_the_calendar_span_and_builds_it(self, csv_path, tmp_path):
         mod = _load_script("load_econ_calendar_csv")
         df, _ = mod.normalize(csv_path)
-        HistoricalDataStore(db_path=tmp_path / "h.db", table_prefix="research_").save_econ_events(
-            df, SOURCE_INVESTING_CSV, "cal.csv", "abc")
+        st = HistoricalDataStore(db_path=tmp_path / "h.db", table_prefix="research_")
+        st.save_econ_events(df, SOURCE_INVESTING_CSV, "cal.csv", "abc")
+        # Track D: the gate reads the official table; the same dates, taken from the Investing rows
+        # (the cleaned CSV agrees with the official pages everywhere they overlap)
+        ev = df[df.engine_event_type.notna()]
+        st.save_official_econ_calendar([
+            (r.event_date, "", r.engine_event_type, "BLS_SCHEDULE", "u", "2026-10-31T10:00:00-04:00", "ab")
+            for r in ev.itertuples()])
         bt = _wf(tmp_path, macro_event_types=("FOMC", "CPI", "NFP", "PCE", "GDP"))
         data = {"SPY": _ohlcv("2023-06-01", 400)}
         with capture_logs() as logs:

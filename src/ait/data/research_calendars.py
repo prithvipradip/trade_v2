@@ -6,7 +6,7 @@ fixtures. The live bot never imports this module (AST-guarded).
 
 Sources (PLAN.md 2026-10-17, W83a AS PLANNED + amendment 4):
 
-* FOMC: the Fed's per-year pages ``fomchistoricalYYYY.htm`` (2009-2020) and ``fomccalendars.htm``
+* FOMC (parsers now in ``official_calendar_sources``): the Fed's per-year pages ``fomchistoricalYYYY.htm`` (2009-2020) and ``fomccalendars.htm``
   (2021 onward). SCHEDULED meetings only; the decision day is the meeting's last day. Unscheduled
   meetings, cancelled meetings, conference calls and notation votes are excluded (their dates were not
   public in advance).
@@ -17,7 +17,6 @@ Sources (PLAN.md 2026-10-17, W83a AS PLANNED + amendment 4):
 """
 from __future__ import annotations
 
-import html as _html
 import re
 import xml.etree.ElementTree as ET
 from bisect import bisect_left, bisect_right
@@ -26,85 +25,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
+from ait.data.official_calendar_sources import (  # noqa: F401
+    _decision_day, _flat, parse_bls_archive, parse_fomc_calendars, parse_fomc_year_page)
+
 _ET = ZoneInfo("America/New_York")
-_MONTHS = {m: i for i, m in enumerate(
-    ("january february march april may june july august september october november december").split(), 1)}
-_MONTH_ABBR = {k[:3]: v for k, v in _MONTHS.items()}
 
-# ---------------------------------------------------------------------------------------------
-# FOMC
-# ---------------------------------------------------------------------------------------------
-
-def _flat(s: str) -> str:
-    return re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", s)).replace("\xa0", " ")).strip()
-
-
-def _decision_day(text: str, year: int) -> date | None:
-    """The LAST day of a meeting, from every heading form the Fed uses: 'January 26-27',
-    'March 16', 'July 31-August 1', 'April/May 30-1', 'Jan/Feb 31-1'."""
-    t = text.strip()
-    m = re.fullmatch(r"([A-Za-z]+)/([A-Za-z]+)\s+(\d{1,2})\s*-\s*(\d{1,2})", t)
-    if m:
-        month_s, day = m.group(2), int(m.group(4))
-    else:
-        m = re.fullmatch(r"([A-Za-z]+)\s+(\d{1,2})(?:\s*-\s*(?:([A-Za-z]+)\s+)?(\d{1,2}))?", t)
-        if not m:
-            return None
-        month_s, day = (m.group(3) or m.group(1)), int(m.group(4) or m.group(2))
-    month = _MONTH_ABBR.get(month_s[:3].lower())
-    return date(year, month, day) if month else None
-
-
-def parse_fomc_year_page(page: str, year: int) -> list[date]:
-    """Scheduled FOMC decision days from a ``fomchistoricalYYYY.htm`` page."""
-    heads = re.findall(r'<div class="panel-heading">\s*<h\d[^>]*>(.*?)</h\d>|<h5[^>]*>(.*?)</h5>',
-                       page, flags=re.S)
-    out = []
-    for a, b in heads:
-        h = _flat(a or b)
-        # Exclusion is STRUCTURAL: only '<date> Meeting - YYYY' headings whose date part parses are
-        # kept. 'March 15 (unscheduled) Meeting', 'March 17-18 (cancelled) Meeting', 'March 19
-        # (notation vote)' and '... Conference Call' never parse (W83a mutation check: a separate
-        # exclusion pattern was dead code and was removed).
-        m = re.fullmatch(rf"(.+?) Meeting - {year}", h)
-        if not m:
-            continue
-        d = _decision_day(m.group(1), year)
-        if d is not None:
-            out.append(d)
-    return sorted(set(out))
-
-
-def parse_fomc_calendars(page: str) -> dict[int, list[date]]:
-    """{year: scheduled decision days} from ``fomccalendars.htm`` (the recent years)."""
-    out: dict[int, list[date]] = {}
-    parts = re.split(r"(\d{4}) FOMC Meetings", page)
-    for i in range(1, len(parts) - 1, 2):
-        year, block = int(parts[i]), parts[i + 1]
-        rows = re.findall(r'fomc-meeting__month[^>]*><strong>([^<]+)</strong></div>\s*'
-                          r'<div class="fomc-meeting__date[^>]*>([^<]+)</div>', block)
-        days = []
-        for month_s, date_s in rows:
-            ds = date_s.strip()
-            if not re.fullmatch(r"\d{1,2}(?:-\d{1,2})?\*?", ds):     # '22 (notation vote)' never parses
-                continue
-            last_month = month_s.strip().split("/")[-1][:3].lower()
-            month = _MONTH_ABBR.get(last_month)
-            if month:
-                days.append(date(year, month, int(ds.rstrip("*").split("-")[-1])))
-        out[year] = sorted(set(days))
-    return out
-
-
-# ---------------------------------------------------------------------------------------------
-# BLS
-# ---------------------------------------------------------------------------------------------
-
-def parse_bls_archive(page: str, prefix: str) -> list[date]:
-    """Release dates from the BLS archive links ``<prefix>_MMDDYYYY.htm|pdf`` (cpi, empsit)."""
-    raw = set(re.findall(rf"/news\.release/archives/{re.escape(prefix)}_(\d{{8}})\.(?:htm|pdf)", page))
-    return sorted(date(int(s[4:]), int(s[:2]), int(s[2:4])) for s in raw)
-
+# The FOMC and BLS parsers moved to ait.data.official_calendar_sources (the one shared home, read by the
+# official-calendar builder and tests; Track D). Re-exported so the W83a build script and its tests keep
+# their import.
 
 # ---------------------------------------------------------------------------------------------
 # QQQ holdings

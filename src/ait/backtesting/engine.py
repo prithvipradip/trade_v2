@@ -177,7 +177,7 @@ class Backtester:
         # (positions.max_contracts_per_trade, config 1); None = uncapped.
         budget_aware_wings: bool = False,
         max_contracts_per_trade: int | None = None,
-        # W65: research macro calendar (EconomicCalendar built from the operator's CSV).
+        # W65: research macro calendar (EconomicCalendar built from the stored official calendar).
         # None = the hardcoded live calendar (legacy behaviour).
         economic_calendar: Any = None,
         # W66: live's IronCondor ignores market_direction entirely ("Iron condors work
@@ -814,10 +814,11 @@ class Backtester:
         if macro_event_gate and economic_calendar is None and self._strict:
             from ait.data.research_inputs import DataGap, ResearchDataUnavailable
             raise ResearchDataUnavailable([DataGap(
-                "econ_events", None, "a stored research calendar passed to the engine (the hard-coded live list "
-                "has no dates before 2026)", "none passed",
-                "set backtest.macro_event_types and load the events with scripts/load_econ_calendar_csv.py, or "
-                "switch the macro gate off explicitly (macro_event_gate=false)")], context="Backtester")
+                "official_econ_calendar", None, "a stored research calendar passed to the engine (the hard-coded "
+                "live list has no dates before 2026)", "none passed",
+                "set backtest.macro_event_types and build the calendar with scripts/build_official_calendar.py "
+                "--apply, or switch the macro gate off explicitly (macro_event_gate=false)")],
+                context="Backtester")
         if macro_event_gate:
             try:
                 from ait.data.economic_calendar import EconomicCalendar

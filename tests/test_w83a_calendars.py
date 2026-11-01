@@ -275,7 +275,13 @@ class TestScript:
 
 
 def test_the_live_tree_never_imports_the_calendars():
-    """AST: only research code (backtesting/, ml/, data/research_calendars.py itself) may import it."""
+    """AST: only research code (backtesting/, ml/, data/research_calendars.py itself) may import it.
+
+    Track D (deliberate update of this guard, not a bypass): the Fed and BLS parsers moved out of
+    research_calendars into ait.data.official_calendar_sources, the IO-free module the live economic calendar's
+    table shares with research (pinned by tests/test_w117_official_calendar.py). What stays here, and stays
+    research-only, is the strike-aware study's QQQ-holdings and earnings parsing; the import restriction below is
+    unchanged for it."""
     hits = []
     for p in (ROOT / "src" / "ait").rglob("*.py"):
         rel = p.relative_to(ROOT / "src" / "ait").as_posix()
@@ -296,3 +302,11 @@ def test_the_module_does_no_io():
     mods = {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     mods |= {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert not mods & {"urllib", "requests", "aiohttp", "socket", "sqlite3", "os", "pathlib", "http"}
+
+
+def test_the_fomc_and_bls_parsers_are_the_shared_ones():
+    """Track D: one definition of the Fed / BLS parsers; this module only re-exports them for the W83a script."""
+    from ait.data import official_calendar_sources as shared
+    assert rc.parse_fomc_year_page is shared.parse_fomc_year_page
+    assert rc.parse_fomc_calendars is shared.parse_fomc_calendars
+    assert rc.parse_bls_archive is shared.parse_bls_archive

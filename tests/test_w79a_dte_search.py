@@ -86,8 +86,11 @@ class TestOverlayDecisions:
         assert bt["engine_model"] == "realistic"
         assert bt["friction_short_dte"] is True
 
-    def test_d2_is_still_open(self):
-        assert "pricing_source" not in self._y("config_research.yaml")["backtest"]
+    def test_d2_is_decided_in_the_research_overlay_only(self):
+        bt = self._y("config_research.yaml")["backtest"]
+        assert bt["pricing_source"] == "surface"
+        assert str(bt["history_start_date"]) == "2024-10-01"     # the first session with stored QQQ option bars
+        assert "pricing_source" not in (self._y("config.yaml").get("backtest") or {})
 
     def test_the_live_config_carries_neither(self):
         bt = (self._y("config.yaml").get("backtest") or {})
@@ -99,7 +102,8 @@ class TestOverlayDecisions:
         use_research_config()
         b = load_settings().backtest
         assert (b.engine_model, b.friction_short_dte, b.pricing_source) == (
-            "realistic", True, "bs_legacy")
+            "realistic", True, "surface")
+        assert b.history_start_date == date(2024, 10, 1)
         assert b.dte_search.enabled is False            # a per-study switch, never the overlay
 
 

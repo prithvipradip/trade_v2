@@ -44,7 +44,8 @@ Every row of history stored in `data/historical.db` carries a `source` tag sayin
 | Dividends | `dividends` | `YAHOO_DIVIDENDS` | `backfill_dividends.py` |
 | Macro series (2- and 10-year yields, 10Y-2Y spread, broad dollar index) | `macro_series` | `FRED_CSV` | `backfill_macro_series.py` |
 | Earnings dates, QQQ holdings, econ schedule | `earnings_schedule`, `qqq_holdings`, `econ_schedule` | EDGAR / Fed / BLS tags | `build_research_calendars.py` |
-| Economic events | `econ_events` | `INVESTING_CSV` | `load_econ_calendar_csv.py` |
+| Economic calendar (FOMC, CPI, jobs report, GDP advance estimate, PCE): the macro gate's dates, and the live bot's | `official_econ_calendar` | `FED_FOMC_PAGES`, `BLS_SCHEDULE`, `BEA_SCHEDULE`, `FRED_RELEASE_DATES` | `build_official_calendar.py` ([RUNBOOK.md](RUNBOOK.md#economic-calendar)) |
+| Economic events (Investing.com export: the reconciliation baseline and the numeric actual, forecast and previous columns; the macro gate does not read it) | `econ_events` | `INVESTING_CSV` | `load_econ_calendar_csv.py` |
 
 Rows from before the source tags (old retired symbols in `daily_prices`) carry `NULL`; nothing new is written untagged. The history used to be kept twice (live tables and `research_*` copies); it is one set now.
 
@@ -129,9 +130,10 @@ module, run `python scripts/gen_docs.py`, and record the decision in `PLAN.md`; 
 | `IV_SCALE_MIN` | 0.5 | ratio | Lower clamp of the iv_floor / iv scaling applied to a builder's delta. Keeps one stale or extreme IV print from moving a strike by more than a factor of two. | backtesting/engine.py (_build_debit_position, _build_credit_position) |
 | `RESEARCH_MAX_NULL_IV_RUN_SESSIONS` | 3 | sessions | Longest run of consecutive sessions with no stored implied vol that a study may contain; an isolated gap is a counted no-entry day, a longer run (or a symbol with no stored IV) refuses the study. It is the line the stored history is checked AGAINST: if a study file could raise it, a study could be told to run on weeks of invented IV, which is the substitution the data contract exists to stop. | data/research_inputs.py (the implied-vol check); backtesting/preflight.py |
 | `RESEARCH_MAX_DIVIDEND_GAP_DAYS` | 100 | days | Longest gap after a symbol's last stored ex-dividend date for which the stored dividends still count as current for a window. Same reason: a stale dividend table silently turns the ex-dividend gate off at the tail of the window. | data/research_inputs.py (the dividends check); backtesting/preflight.py |
-| `RESEARCH_MAX_EVENT_GAP_DAYS` | 120 | days | Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current at the end of a window. Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window. | data/research_inputs.py (the econ_events check); backtesting/preflight.py |
+| `RESEARCH_MAX_EVENT_GAP_DAYS` | 120 | days | Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as current at the end of a window. Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window. | data/research_inputs.py (the official_econ_calendar check); backtesting/preflight.py |
 | `RESEARCH_MAX_MACRO_GAP_DAYS` | 5 | days | Longest stretch of calendar days inside a window, or at its end, without a stored observation of a macro series. FRED publishes on business days; a longer hole means missing data, which would otherwise be carried forward as if it were the market. | data/research_inputs.py (the macro_series check); data/macro_store.py |
 | `RESEARCH_MAX_MACRO_TAIL_DAYS` | 10 | days | How far before the end of a window the newest stored observation of a macro series may be. The broad dollar index is published about a week late, so a window ending today legitimately lags it; a longer lag means the backfill is stale. | data/research_inputs.py (the macro_series check); data/macro_store.py |
+| `RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION` | 0.1 | fraction of legs | Largest share of a run's surface-priced legs that may fall back to the legacy single-IV model before the run record flags the result as only partly surface-priced (the run is flagged and stamped, not refused). The per-leg fallback is a declared model so one thin strike does not stop a study, but a study whose legs mostly miss the surface is a legacy-priced study with a surface label; if a study file could raise the line, it could hide that. | backtesting/result.py (surface_pricing_stamp); backtesting/walkforward.py (data_contract); run_backtest.py |
 | `IV_SCALE_MAX` | 1.5 | ratio | Upper clamp of the same scaling. Same reason, other direction. | backtesting/engine.py |
 | `SETTLEMENT_LOSS_TOLERANCE` | 0.000001 | dollars | How far a settled gross loss may exceed the defined max loss before it is counted as over_max_loss. A floating-point tolerance, not a modelling choice; loosening it would hide a pricing bug. | backtesting/engine.py (_finish_settlement) |
 | `PROB_CLIP_EPS` | 0.0000001 | probability | Probabilities are clipped to [eps, 1 - eps] before log-loss. Numerical safety (log 0); not a modelling choice. | backtesting/walkforward.py (_prob_score_metrics) |
@@ -161,7 +163,10 @@ unseen. How to satisfy it, and what each category means, is a developer topic: [
 **Which engine runs?** `backtest.engine_model: realistic` (set in `config_research.yaml`). It prices and fills at live fidelity: fill-time spot, previous-session IV, listed session expiries, same-session exits, touch stops, and expiry
 settlement or assignment. The older `legacy` engine is kept byte-identical for reproducing old numbers.
 
-**How are options priced?** Black-Scholes from one stored IV per day plus a skew (`pricing_source: bs_legacy`). A fitted IV surface from real option bars is available (`pricing_source: surface`, QQQ only).
+**How are options priced?** `backtest.pricing_source: surface` (set in `config_research.yaml`; the schema default stays `bs_legacy`): each condor leg gets the implied vol of the smile fitted to its own expiry from the stored option bars, as of the previous session. Black-Scholes then prices it. The alternative, `bs_legacy`, uses one stored 30-day IV per day plus a skew with no DTE term.
+- **QQQ only.** The option bars exist for QQQ alone, and the default window (`backtest.history_start_date`) starts at the session after the first bar day. A study that names SPY or IWM while `pricing_source` is `surface` is refused by the preflight ([10.3](#103-the-research-data-contract-stored-inputs-or-no-study)) with two ways out: store their bars (`python scripts/backfill_option_history.py --symbol SPY`) or set `backtest.pricing_source: bs_legacy` in the study file.
+- **Registered studies stay on `bs_legacy`.** The scripts that share `study_harness.py` pin it so their reference numbers stay reproducible and so they can run on SPY and IWM.
+- **A leg the surface cannot price** (no smile for its expiry, or a strike outside the fitted range) falls back to the `bs_legacy` IV for that leg. This is a declared model: it is counted in the run record (`surface_legs_hit`, `surface_legs_miss`, and a `surface_pricing` stamp in the data contract), not a refusal. When more than the fixed limit `RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION` of the legs fell back, the stamp says `exceeds_limit`, `run_backtest.py` prints a warning and adds it to the parity warnings: read that run as only partly surface-priced.
 
 **What does a trade cost?** Commission plus fees per leg, entry and exit, and a fitted half-spread per leg (`friction_model: per_leg_usd`, with short-DTE bands). Debit structures also pay `backtest.slippage_pct` (iron condors do not).
 
@@ -322,7 +327,7 @@ excludes the live value (`wing_k`, `delta_short`). Other strategies have their o
 - **Always pass `--optimize-strict` for numbers you will quote.** Without it a window whose optimization fails runs the base config and the summary only reports a count (`optimization_failures`); with it the study stops.
 - **Reading the report:** a band is a *candidate* only if it holds a top-decile trial in at least two thirds of windows. Promotion also needs its parity band to PASS (`scripts/parity_replay.py`) and its friction band to be ACTIVE
   (`data/short_dte_collection_status.json`). The report prints a reminder; it does not check either.
-- **History limit:** the option-bar history is short (about two years when this was written; check the span of `option_daily_bars`), so a surface-priced study has only a handful of out-of-sample quarters. Use shorter training windows and/or pool symbols, and say so next to any number.
+- **History limit:** the option-bar history is short (about two years when this was written; check the span of `option_daily_bars`), so a surface-priced study has only a handful of out-of-sample quarters. Use shorter training windows, and say so next to any number. Pooling symbols is not available while `pricing_source` is `surface`: only QQQ has bars.
 
 `run_optimizer.py --apply` is refused unless `AIT_ALLOW_APPLY=1` is set (the parameters are in-sample only) and is refused with a study (parameters found under a study's settings are not promotable to the live config). It writes only four named parameters (`risk.min_confidence`, `exit.initial_stop_loss_pct`, `exit.trailing_stop_pct`, `exit.breakeven_trigger_pct`) into the config file named by `--config`, and it saves that file as plain YAML, which **drops every comment in it**: `config.yaml` is heavily commented, so back it up first or apply by hand.
 
@@ -363,7 +368,7 @@ or `sqlite:///data/mlflow.db`); a failure there never fails a run.
 ## 10. Research data: collection and calibration
 
 **Refreshing the shared history.** `scripts/backfill_historical_data.py` (daily bars, 5-minute bars, implied vol with `--mode iv`, the VIX family with `--mode vix`), `backfill_intraday.py`, `backfill_dividends.py`,
-`backfill_option_history.py` (Polygon option bars), `build_research_calendars.py` and `load_econ_calendar_csv.py` fill the tables in the provenance table above. The daily retrain keeps daily bars and implied vol fresh without a new job.
+`backfill_option_history.py` (Polygon option bars), `build_research_calendars.py`, `build_official_calendar.py` and `load_econ_calendar_csv.py` fill the tables in the provenance table above. The daily retrain keeps daily bars and implied vol fresh without a new job.
 
 ### 10.1 Short-DTE friction collection
 
@@ -429,16 +434,16 @@ The walk-forward runs the same check first thing, `run_backtest.py` prints it, a
 | Implied vol (each traded symbol) | A stored value on each session. An isolated missing session is a **no-entry day** (counted in the run's entry funnel as `builder:iv_missing`); a run of more than the fixed limit, or no IV at all, refuses. | `... --mode iv` |
 | VIX (`^VIX` for the context) | Every NYSE session of the context span, tagged `IB_INDEX_TRADES`. | `... --mode vix --symbols VIX` |
 | Dividends (when the ex-dividend gate is on) | Rows for each symbol, tagged `YAHOO_DIVIDENDS` (loaded once by the ingest script, then read from the store), the latest ex-date within the fixed gap of the window end. | `scripts/backfill_dividends.py --symbols <SYM>` |
-| Economic events (when the macro gate is on) | An export that starts on or before the window, and events of every configured type inside it. No hard-coded list. | `scripts/load_econ_calendar_csv.py --csv <export>` |
+| Economic calendar (when the macro gate is on) | Official calendar rows that start on or before the window, and events of every configured type inside it, the newest of each type within the fixed gap of the window end, every row tagged with an official source (`FED_FOMC_PAGES`, `BLS_SCHEDULE`, `BEA_SCHEDULE` or `FRED_RELEASE_DATES`). No hard-coded list, no Investing.com rows. The live bot reads the same table. | `scripts/build_official_calendar.py --apply` |
 | Earnings | `earnings_schedule` rows for the symbol, or the symbol listed in `backtest.earnings_exempt_symbols` (the index ETFs have none). | `scripts/build_research_calendars.py --what earnings` |
 | Per-leg friction (`friction_model: per_leg_usd`) | A fitted model for each symbol. | `scripts/calibrate_option_spreads.py --source ib-bars --symbols <SYM> ...` |
 | Macro series (the nine macro features are in the model) | The four FRED series, tagged `FRED_CSV`, from before the window to within a few days of its end, with no hole of more than a few days; joined with **one session of lag** (the value dated D-1 or earlier is the one known at D's open), as live's inference sees them. The broad dollar index is published about a week late, which the tail tolerance allows. | `scripts/backfill_macro_series.py` |
 | 5-minute bars (`backtest.intraday_features: true`) | Bars on at least `vlmc_min_coverage` of the sessions. Set the feature false to run on daily bars only; the choice is stated and logged, never made silently. | `... --mode intraday` |
-| Option bars (`pricing_source: surface`) | Bars for the symbol over the window; a leg the surface cannot price is counted in the run. | `scripts/backfill_option_history.py` |
+| Option bars (`pricing_source: surface`, the research default) | Bars for the symbol on every session of the window; the refusal names the first missing session. Only QQQ has them: SPY and IWM refuse until their bars are stored. A leg the surface cannot price is counted in the run. | `scripts/backfill_option_history.py --symbol <SYM>`, or set `backtest.pricing_source: bs_legacy` |
 
 Fixed limits (not configurable, listed in [section 4](#4-configuration-where-every-value-lives) under the fixed research limits): the longest run of sessions without IV, the longest dividend, macro-event and macro-series gaps.
 
-**Declared models.** Two behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, and a window whose ML model fails to train trades ungated. They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
+**Declared models.** Three behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, a window whose ML model fails to train trades ungated, and a leg the IV surface cannot price uses the legacy IV (flagged above a fixed share, [5](#5-the-engine)). They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
 
 **Macro features.** A research model sees the same nine macro inputs (yields, their spread, the dollar index and their changes) as the one that trades: real values, from the stored series, never constants. A model trained before this existed saw constants, so its results are not comparable (the before / after is in PLAN.md).
 
@@ -544,7 +549,7 @@ Without `--symbols` / `--strategies`, a run uses `backtest.default_symbols` (QQQ
 ## 14. Assumptions and known limits
 
 **Modelling assumptions** (what a research number takes for granted):
-- **Option prices are modelled**: Black-Scholes from one stored implied vol per day plus a skew, or a QQQ-only fitted surface; real quotes differ.
+- **Option prices are modelled**: Black-Scholes from a QQQ-only fitted IV surface (the default), or from one stored implied vol per day plus a skew when `pricing_source` is `bs_legacy`; real quotes differ.
 - **Costs are fitted, not measured per fill**: commission and fees per leg plus a fitted half-spread per leg; short-DTE bands are extrapolated until enough sessions are collected ([10.1](#101-short-dte-friction-collection)).
 - **Fills are modelled**: live market data is delayed (`AIT_MARKET_DATA_TYPE=4`), so there is no measured fill to compare except the few parity-replay trades.
 - **Decisions see the past only**: entries use history through the previous session (decision frame, [5](#5-the-engine)); the IV used is the previous session's.
@@ -553,8 +558,8 @@ Without `--symbols` / `--strategies`, a run uses `backtest.default_symbols` (QQQ
 - **The learner's size changes are part of the result** ([7](#7-the-learner)).
 
 **Known limits:**
-- **History is short and one regime.** The research calendar starts 2024-01-01. Results describe that period.
-- **One symbol has option history.** QQQ is the only symbol with the option bars an IV surface needs, and that history is short (about two years when this was written).
+- **History is short and one regime.** The default window (`backtest.history_start_date`) starts at the first session with stored QQQ option bars, which is after the economic calendar's first day. Results describe that period.
+- **One symbol has option history.** QQQ is the only symbol with the option bars an IV surface needs, and that history is short (about two years when this was written). SPY and IWM run only on `bs_legacy` until their bars are stored.
 - **The spread model is fitted on a limited sample.** Real fills differ.
 - **The learner's disable step is unreachable** with the shipped numbers ([7](#7-the-learner)).
 - **A single run is one draw.** Compare studies on the same windows and engine, and weigh differences against window-to-window noise.

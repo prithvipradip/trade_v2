@@ -28,7 +28,7 @@ import pandas as pd
 from ait.backtesting.engine import Backtester
 from ait.backtesting.learner import BacktestLearner
 from ait.backtesting.range_bank import RangeModelBank
-from ait.backtesting.result import BacktestResult
+from ait.backtesting.result import BacktestResult, surface_pricing_stamp
 from ait.backtesting.strict import resolve_strict  # W116
 from ait.config.invariants_research import PROB_CLIP_EPS  # W88a
 from ait.ml.feature_spec import FeatureSpec, spec_from_config  # W88d
@@ -3587,19 +3587,22 @@ class WalkForwardBacktester:
     def _apply_research_calendar(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         """W65: build the research macro calendar and keep the gate CONSISTENT.
 
-        When `macro_event_types` is set and `{prefix}econ_events` has rows, the macro
-        gate uses the operator's CSV calendar instead of the hardcoded 2026-27 list.
+        When `macro_event_types` is set and `{prefix}official_econ_calendar` has rows, the macro
+        gate uses that stored OFFICIAL calendar (Fed / BLS / BEA pages; Track D, formerly the
+        operator's Investing.com CSV) instead of the hardcoded 2026-27 list.
         Windows before the calendar's first date would have no gate at all (a mix of
         gated and ungated windows inside one run), so the data is trimmed to the
         calendar's span with an ERROR rather than silently mixed. No table / no rows
-        -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour)."""
+        -> WARNING and the legacy hardcoded calendar (pre-W65 behaviour); strict research
+        (the default) refuses instead: no hard-coded fallback in research."""
         cfg = self._config
         if not cfg.macro_event_gate:
             return data                                   # W116: gate off (stated): no calendar to build, nothing trimmed
         if self._strict and cfg.macro_event_types is None:
             from ait.data.research_inputs import DataGap, ResearchDataUnavailable
             raise ResearchDataUnavailable([DataGap(
-                "econ_events", None, "backtest.macro_event_types set, so the macro gate reads the stored calendar",
+                "official_econ_calendar", None,
+                "backtest.macro_event_types set, so the macro gate reads the stored calendar",
                 "macro_event_types is None: the gate would use the hard-coded 2026-27 list",
                 "set backtest.macro_event_types, or switch the macro gate off explicitly (macro_event_gate=false)")],
                 context="walk-forward calendar")
@@ -3609,7 +3612,7 @@ class WalkForwardBacktester:
         from ait.data.historical import HistoricalDataStore
         try:
             cal = build_research_calendar(self._db_path, self._table_prefix, cfg.macro_event_types)
-            span = HistoricalDataStore(self._db_path, self._table_prefix).econ_events_span()
+            span = HistoricalDataStore(self._db_path, self._table_prefix).official_econ_calendar_span()
         except Exception as exc:  # noqa: BLE001
             if self._strict:
                 raise
@@ -3619,13 +3622,14 @@ class WalkForwardBacktester:
             if self._strict:
                 from ait.data.research_inputs import DataGap, ResearchDataUnavailable
                 raise ResearchDataUnavailable([DataGap(
-                    "econ_events", None, "stored economic events for " + ", ".join(cfg.macro_event_types), "no rows",
-                    "python scripts/load_econ_calendar_csv.py --csv <the Investing.com economic calendar export>")],
+                    "official_econ_calendar", None,
+                    "stored official economic events for " + ", ".join(cfg.macro_event_types), "no rows",
+                    "python scripts/build_official_calendar.py --apply")],
                     context="walk-forward calendar")
             log.warning("research_calendar_empty", table_prefix=self._table_prefix,
-                        note="no econ_events rows; macro gate uses the hardcoded live "
-                             "calendar (2026+ only). Load the CSV with "
-                             "scripts/load_econ_calendar_csv.py")
+                        note="no official_econ_calendar rows; macro gate uses the hardcoded live "
+                             "calendar (2026+ only). Build the table with "
+                             "scripts/build_official_calendar.py --apply")
             return data
         self._research_calendar = cal
         first = pd.Timestamp(span[0])
@@ -3636,9 +3640,9 @@ class WalkForwardBacktester:
                 if self._strict:
                     from ait.data.research_inputs import DataGap, ResearchDataUnavailable
                     raise ResearchDataUnavailable([DataGap(
-                        "econ_events", sym, f"events from {idx[0].date()} (the first session of the data)",
+                        "official_econ_calendar", sym, f"events from {idx[0].date()} (the first session of the data)",
                         f"events start {span[0]}",
-                        "python scripts/load_econ_calendar_csv.py with an export that reaches back far enough, or "
+                        "python scripts/build_official_calendar.py --apply --since <an earlier date>, or "
                         "start the study later (backtest.history_start_date)")], context="walk-forward calendar")
                 log.error("macro_calendar_not_covering_span", symbol=sym,
                           data_start=str(idx[0].date()), calendar_start=span[0],
@@ -3688,7 +3692,8 @@ class WalkForwardBacktester:
                 for name, n in counts.items():
                     declared[name] = declared.get(name, 0) + int(n)
         return {"preflight": self._preflight_report.as_dict() if self._preflight_report is not None else None,
-                "declared_models": declared}
+                "declared_models": declared,
+                "surface_pricing": surface_pricing_stamp(declared)}      # None unless pricing_source is surface
 
     def _aggregate_funnel(self, by_window: "dict | None" = None) -> dict[str, dict[str, int]]:
         """W66: sum the per-window entry funnels into {symbol: {reason: days}}. W108 S1: ``by_window`` names another

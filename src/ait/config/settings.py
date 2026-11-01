@@ -988,8 +988,8 @@ class BacktestConfig(_StrictModel):
     history_start_date: date | None = Field(default=None,
         description="W65: first date of the research history. When set it wins over "
                     "history_days: the research loader trims frames to it and walk-forward "
-                    "windows start there. config.yaml pins 2024-01-01 = the first day of the "
-                    "operator's economic-calendar CSV, so the macro gate is ON in every window.")
+                    "windows start there. the research configuration pins 2024-01-01 = the first day of the "
+                    "stored official economic calendar, so the macro gate is ON in every window.")
     history_days: int = Field(default=1826, ge=400, le=6000,
         description="W65: calendar days of history a research run requests when no "
                     "history_start_date is set (legacy fallback). The walk-forward used to "
@@ -1353,7 +1353,8 @@ class BacktestConfig(_StrictModel):
                     "(8-14) and 49% (15-45) and removed the +1.4-1.9 vol-point richness "
                     "'bs_legacy' carries at 3+ DTE. QQQ only (the bars exist for QQQ); a "
                     "symbol or date without a smile falls back per leg and is counted. "
-                    "Operator-owned: default 'bs_legacy' so no study moves silently.")
+                    "Operator-owned: the schema default is 'bs_legacy' so no unconfigured "
+                    "run moves silently; the research overlay sets 'surface'.")
     expiry_guard_dte: int | None = Field(default=None, ge=0, le=45,
         description="W74: positions ENTERED with at most this many days to expiry are "
                     "exempt from the DTE-based closes (live rules 3/3a: DTE <= "

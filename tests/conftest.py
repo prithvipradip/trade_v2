@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -57,6 +59,19 @@ def _strict_inputs_for_marked_tests(request, monkeypatch):
     if request.node.get_closest_marker("strict_inputs") is not None:
         from ait.backtesting import strict
         monkeypatch.setattr(strict, "STRICT_INPUTS_DEFAULT", True)
+
+
+@pytest.fixture(autouse=True)
+def _live_economic_calendar_ignores_the_real_store(monkeypatch):
+    """Track D: ``EconomicCalendar()`` (live) reads ``data/historical.db`` relative to the working directory.
+    On the operator's checkout that file exists (and, once built, carries the official calendar), so a test that
+    builds the default calendar would silently depend on it. The suite points the default at a path that does not
+    exist, so the DECLARED FALLBACK (the hard-coded lists) is what every test sees, and the once-per-process
+    fallback alert is marked as already raised (no critical log per test). The tests that exercise the table or
+    the alert (tests/test_w117_official_calendar.py) pass ``db_path`` and reset the flag themselves."""
+    from ait.data import economic_calendar as ec
+    monkeypatch.setattr(ec, "default_live_db_path", lambda: Path("/nonexistent/ait-test/historical.db"))
+    monkeypatch.setattr(ec.EconomicCalendar, "_fallback_alerted", True)
 
 
 @pytest.fixture(autouse=True)

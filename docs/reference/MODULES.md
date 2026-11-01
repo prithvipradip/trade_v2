@@ -92,6 +92,8 @@ Backtesting engine for strategy validation before live trading.
 | `macro_store.py` | Stored macro series (the FRED yields and the dollar index) for research. |
 | `market_data.py` | Unified market data service with fallback chain. |
 | `multi_timeframe.py` | Multi-timeframe analysis — combines 5-min, daily, and weekly signals. |
+| `official_calendar.py` | The ONE reader of the stored official economic calendar (official_econ_calendar). |
+| `official_calendar_sources.py` | Parsers for the official economic-release calendars: Fed, BLS, BEA and FRED (pure; no network, no IO). |
 | `option_spread_sampler.py` | Pure helpers for sampling option bid/ask spreads from IB historical BID/ASK bars. |
 | `options_chain.py` | Options chain service — fetch, filter, and price options with Greeks. |
 | `quality.py` | Data quality validation — prevents trading on bad data. |

@@ -2,15 +2,22 @@
 
 Major economic releases (FOMC, CPI, NFP, GDP, PCE) cause massive IV crush
 and gap risk that can blow through iron condor wings in minutes. This module
-provides a hardcoded calendar (2026 confirmed; 2027-H1 APPROXIMATE — see the
-R16 #10 block below) of release dates so the bot can:
+lets the bot:
   - Skip opening new positions on event days and the day before
   - Close or avoid iron condors that would span these events
 
-Sources:
+Track D: ``EconomicCalendar()`` (live) reads the stored OFFICIAL calendar, the
+``official_econ_calendar`` table that ``scripts/build_official_calendar.py`` fills from the
+Fed / BLS / BEA release pages (FRED as the cross-check) — the same table the research gate reads. The
+hard-coded lists below are the DECLARED FALLBACK: used when the table is missing, unreadable, incomplete or
+stale (log.critical + the orchestrator's calendar page), and to extend a type past the table's last date
+(`_fallback_tail`). They carry the official dates verified on 2026-10-31; what could not be verified is
+named in UNVERIFIED_FALLBACK.
+
+Sources of the fallback lists:
   - FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm
-  - CPI/NFP: bls.gov/schedule/news_release/
-  - GDP/PCE: bea.gov/news/schedule
+  - CPI/NFP: bls.gov/schedule/news_release/ (+ the release archive for past dates)
+  - GDP/PCE: bea.gov/news/schedule/full (the 2027 schedule is not published yet)
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import Enum
+from pathlib import Path
 
 from ait.utils.logging import get_logger
 from ait.utils.time import today_et
@@ -61,10 +69,11 @@ _FOMC_2026 = [
 ]
 
 # CPI: released at 8:30 AM ET, typically second week of the month.
-# Source: BLS schedule (bls.gov/schedule/news_release/cpi.htm)
+# Source: BLS schedule (bls.gov/schedule/news_release/cpi.htm) and release archive. Track D: the Jan-2026
+# CPI is 02-13 (BLS moved it after the 2025 shutdown; this list said 02-11).
 _CPI_2026 = [
     date(2026, 1, 13),   # Dec 2025 data
-    date(2026, 2, 11),   # Jan 2026 data
+    date(2026, 2, 13),   # Jan 2026 data (BLS reschedule)
     date(2026, 3, 11),   # Feb 2026 data
     date(2026, 4, 10),   # Mar 2026 data
     date(2026, 5, 12),   # Apr 2026 data
@@ -78,10 +87,11 @@ _CPI_2026 = [
 ]
 
 # NFP (Employment Situation): released at 8:30 AM ET, typically first Friday.
-# Source: BLS schedule (bls.gov/schedule/news_release/empsit.htm)
+# Source: BLS schedule (bls.gov/schedule/news_release/empsit.htm) and release archive. Track D: the
+# Jan-2026 report is 02-11 (BLS rescheduled it after the 2025 shutdown; this list said 02-06).
 _NFP_2026 = [
     date(2026, 1, 9),    # Dec 2025 data
-    date(2026, 2, 6),    # Jan 2026 data
+    date(2026, 2, 11),   # Jan 2026 data (BLS reschedule)
     date(2026, 3, 6),    # Feb 2026 data
     date(2026, 4, 3),    # Mar 2026 data
     date(2026, 5, 8),    # Apr 2026 data
@@ -96,29 +106,33 @@ _NFP_2026 = [
 
 # GDP (Advance Estimate only — the first read is the big market mover).
 # Second and third estimates rarely move markets significantly.
-# Source: BEA schedule (bea.gov/news/schedule)
+# Source: BEA schedule (bea.gov/news/schedule/full). Track D: Q4-2025 advance was delayed to 02-20
+# (the shutdown); it was missing from this list.
 _GDP_2026 = [
+    date(2026, 2, 20),   # Q4 2025 advance (shutdown-delayed)
     date(2026, 4, 30),   # Q1 2026 advance
     date(2026, 7, 30),   # Q2 2026 advance
     date(2026, 10, 29),  # Q3 2026 advance
-    # Q4 2026 advance is in Jan 2027
+    # Q4 2026 advance is in Jan 2027 (_GDP_2027; the BEA 2027 schedule is not published yet)
 ]
 
 # PCE (Personal Income and Outlays — contains core PCE price index).
-# Released at 8:30 AM ET, typically last week of the month.
-# Source: BEA schedule (bea.gov/news/schedule)
-# Note: Some dates coincide with GDP releases (BEA bundles them).
+# Source: BEA schedule (bea.gov/news/schedule/full), ET release time 8:30 AM except 01-22 (10:00 AM).
+# Track D: BEA's 2026 dates follow the post-shutdown catch-up, NOT the "last Friday" pattern this list
+# used to assume (9 of its 12 dates were wrong). The two shutdown-combined releases are one event each.
+# Some dates coincide with GDP releases (BEA bundles them).
 _PCE_2026 = [
-    date(2026, 1, 30),   # Dec 2025 data
-    date(2026, 2, 27),   # Jan 2026 data
-    date(2026, 3, 27),   # Feb 2026 data
+    date(2026, 1, 22),   # Oct + Nov 2025 data (combined release)
+    date(2026, 2, 20),   # Dec 2025 data (same day as the Q4 2025 GDP advance)
+    date(2026, 3, 13),   # Jan 2026 data
+    date(2026, 4, 9),    # Feb 2026 data
     date(2026, 4, 30),   # Mar 2026 data (same day as GDP advance Q1)
-    date(2026, 5, 29),   # Apr 2026 data
-    date(2026, 6, 26),   # May 2026 data
-    date(2026, 7, 31),   # Jun 2026 data
-    date(2026, 8, 28),   # Jul 2026 data
-    date(2026, 9, 25),   # Aug 2026 data
-    date(2026, 10, 30),  # Sep 2026 data
+    date(2026, 5, 28),   # Apr 2026 data
+    date(2026, 6, 25),   # May 2026 data
+    date(2026, 7, 30),   # Jun 2026 data (same day as GDP advance Q2)
+    date(2026, 8, 26),   # Jul 2026 data
+    date(2026, 9, 30),   # Aug 2026 data
+    date(2026, 10, 29),  # Sep 2026 data (same day as GDP advance Q3)
     date(2026, 11, 25),  # Oct 2026 data
     date(2026, 12, 23),  # Nov 2026 data
 ]
@@ -129,36 +143,29 @@ _PCE_2026 = [
 # The 2026 tables end 2026-12-23 (PCE), so from 12-24 every macro guard went
 # silently blind while standard 14-45 DTE entries span the first 2027 NFP/CPI.
 #
-# !!! APPROXIMATE DATES — VERIFY BEFORE TRADING INTO THEM !!!
-# These follow the agencies' TYPICAL scheduling patterns, not confirmed
-# announcements:
-#   - NFP: first Friday of the month (2027-01-01 is a market-holiday Friday,
-#     so the Dec-2026 report shifts to the second Friday, Jan 8 — BLS-typical)
-#   - CPI: ~10th-13th of the month (BLS-typical)
-#   - PCE: ~last business Friday of the month (BEA-typical)
-#   - FOMC: Fed's tentative two-day meeting calendar (decision-day listed)
-#   - GDP: advance estimates ~end of Jan/Apr (BEA-typical)
-# Confirm against the primary sources before these dates matter:
-#   federalreserve.gov/monetarypolicy/fomccalendars.htm
-#   bls.gov/schedule/news_release/    bea.gov/news/schedule
+# VERIFIED against the official pages on 2026-10-31 (Track D): FOMC (the Fed's calendar page), CPI and NFP
+# (the BLS schedule pages). NOT YET PUBLISHED by BEA, so still APPROXIMATE (the agency's TYPICAL pattern,
+# and BEA's 2026 dates showed that pattern is unreliable): _GDP_2027 and _PCE_2027, named in
+# UNVERIFIED_FALLBACK. Replace them from bea.gov/news/schedule/full once BEA publishes the 2027 schedule
+# (scripts/build_official_calendar.py then loads them into the table, which wins over these lists).
 _FOMC_2027 = [
     date(2027, 1, 27),   # Jan 26-27 (tentative)
     date(2027, 3, 17),   # Mar 16-17 (tentative)
     date(2027, 4, 28),   # Apr 27-28 (tentative)
-    date(2027, 6, 16),   # Jun 15-16 (tentative)
+    date(2027, 6, 9),    # Jun 8-9 (tentative; this list said 06-16)
 ]
 
 _CPI_2027 = [
-    date(2027, 1, 13),   # Dec 2026 data (approximate)
-    date(2027, 2, 10),   # Jan 2027 data (approximate)
-    date(2027, 3, 10),   # Feb 2027 data (approximate)
-    date(2027, 4, 13),   # Mar 2027 data (approximate)
-    date(2027, 5, 12),   # Apr 2027 data (approximate)
-    date(2027, 6, 10),   # May 2027 data (approximate)
+    date(2027, 1, 13),   # Dec 2026 data
+    date(2027, 2, 11),   # Jan 2027 data (BLS schedule; this list said 02-10)
+    date(2027, 3, 10),   # Feb 2027 data
+    date(2027, 4, 13),   # Mar 2027 data
+    date(2027, 5, 12),   # Apr 2027 data
+    date(2027, 6, 10),   # May 2027 data
 ]
 
 _NFP_2027 = [
-    date(2027, 1, 8),    # Dec 2026 data (Jan 1 = holiday Friday -> 2nd Friday)
+    date(2027, 1, 8),    # Dec 2026 data (BLS: Jan 1 = holiday Friday -> 2nd Friday)
     date(2027, 2, 5),    # Jan 2027 data (first Friday)
     date(2027, 3, 5),    # Feb 2027 data (first Friday)
     date(2027, 4, 2),    # Mar 2027 data (first Friday)
@@ -167,8 +174,8 @@ _NFP_2027 = [
 ]
 
 _GDP_2027 = [
-    date(2027, 1, 28),   # Q4 2026 advance (approximate)
-    date(2027, 4, 29),   # Q1 2027 advance (approximate)
+    date(2027, 1, 28),   # Q4 2026 advance (UNVERIFIED: BEA has not published its 2027 schedule)
+    date(2027, 4, 29),   # Q1 2027 advance (UNVERIFIED)
 ]
 
 _PCE_2027 = [
@@ -180,6 +187,11 @@ _PCE_2027 = [
     date(2027, 5, 28),   # Apr 2027 data (last Friday)
     date(2027, 6, 25),   # May 2027 data (last Friday)
 ]
+
+# The fallback dates that are NOT confirmed by an official page (2026-10-31): tests/test_w117 pins that every
+# other fallback date equals the official schedule. Drop a list from here only when BEA's 2027 schedule
+# confirms it (the builder then stores the real dates and the table wins over these anyway).
+UNVERIFIED_FALLBACK: tuple[str, ...] = ("_GDP_2027", "_PCE_2027")
 
 
 def _build_event_list() -> list[EconomicEvent]:
@@ -205,6 +217,67 @@ def _build_event_list() -> list[EconomicEvent]:
 _ALL_EVENTS = _build_event_list()
 _EVENT_DATES: frozenset[date] = frozenset(e.date for e in _ALL_EVENTS)
 
+_DESCRIPTIONS = {
+    EventType.FOMC: "FOMC rate decision", EventType.CPI: "CPI release", EventType.NFP: "NFP jobs report",
+    EventType.GDP: "GDP advance estimate", EventType.PCE: "PCE release"}
+# The oldest the table's newest fetch may be before the live calendar stops trusting it (days). Dates move
+# (BLS and BEA rescheduled releases after the 2025 shutdown), so a calendar nobody has rebuilt for a quarter is
+# treated as unverified; the builder is run by the operator (RUNBOOK "Economic calendar").
+TABLE_MAX_AGE_DAYS = 90
+
+
+def default_live_db_path() -> Path:
+    """The history database the live bot opens: the SAME default as ``HistoricalDataStore()`` (bot/orchestrator
+    builds it with no argument), resolved here so the orchestrator needs no change."""
+    from ait.data.historical import DB_PATH
+    return DB_PATH
+
+
+def _fallback_tail(events: list[EconomicEvent]) -> list[EconomicEvent]:
+    """Hard-coded events of a type that fall AFTER the table's last event of that type. The table is
+    authoritative up to its own horizon (BEA publishes a year at a time, BLS about fourteen months); beyond it
+    an APPROXIMATE date still blocks entries on the likeliest day, which is the safer direction than leaving
+    the guard blind (an extra skipped day costs a day, a missed release costs a gap through a condor)."""
+    last: dict[EventType, date] = {}
+    for e in events:
+        last[e.event_type] = max(e.date, last.get(e.event_type, date.min))
+    return [e for e in _ALL_EVENTS if e.date > last.get(e.event_type, date.min)]
+
+
+def _load_live_table(db_path: Path, today: date) -> "tuple[list[EconomicEvent] | None, str]":
+    """(events, reason): the stored official calendar as events, or (None, why it cannot be used).
+
+    FAIL DIRECTION (stated, not incidental): any problem reading or trusting the table returns None and the
+    caller uses the declared hard-coded fallback. That is never LESS protective than before this table existed
+    (the guards still see every macro event on their list) and it never blocks an exit: the calendar only
+    gates ENTRIES, and nothing here raises. Unusable means: no file / table / rows, a type with no rows
+    (an incomplete build), a row tagged by a source that is not an official one, or a newest fetch older than
+    TABLE_MAX_AGE_DAYS."""
+    from ait.data.historical import OFFICIAL_CALENDAR_SOURCES
+    from ait.data.official_calendar import OFFICIAL_EVENT_TYPES, OfficialCalendarUnavailable, read_official_rows
+    try:
+        rows = read_official_rows(db_path)
+    except OfficialCalendarUnavailable as exc:
+        return None, f"unreadable: {exc}"
+    except Exception as exc:  # noqa: BLE001 - the live calendar must never raise into the entry loop
+        return None, f"unreadable: {type(exc).__name__}: {exc}"
+    missing = sorted(set(OFFICIAL_EVENT_TYPES) - {r.event_type for r in rows})
+    if missing:
+        return None, f"incomplete: no rows for {', '.join(missing)}"
+    foreign = sorted({r.source for r in rows} - set(OFFICIAL_CALENDAR_SOURCES))
+    if foreign:
+        return None, f"rows tagged by a non-official source: {', '.join(foreign)}"
+    try:
+        newest = max(date.fromisoformat(r.fetched_at[:10]) for r in rows)
+    except ValueError:
+        return None, "unreadable fetched_at timestamps"
+    age = (today - newest).days
+    if age > TABLE_MAX_AGE_DAYS:
+        return None, f"stale: last fetched {newest} ({age} days ago, limit {TABLE_MAX_AGE_DAYS})"
+    events = [EconomicEvent(r.event_date, EventType[r.event_type], f"{_DESCRIPTIONS[EventType[r.event_type]]} "
+                                                                   f"{r.event_date}") for r in rows]
+    return events, ""
+
 
 class EconomicCalendar:
     """Provides macro event awareness for the trading bot.
@@ -228,34 +301,75 @@ class EconomicCalendar:
     # calendar.
     STALENESS_ALARM_DAYS = 30
 
-    def __init__(self, events: "list[EconomicEvent] | None" = None) -> None:
-        # W65: `events=None` (live, the default) is the hardcoded 2026-27 calendar,
-        # unchanged. Research passes a calendar built from the operator's CSV
-        # (build_research_calendar) so past windows are gated on what actually
-        # happened, not only on 2026.
-        if events is None:
-            self._events = _ALL_EVENTS
-            self._event_dates = _EVENT_DATES
-        else:
+    def __init__(self, events: "list[EconomicEvent] | None" = None, *,
+                 db_path: "Path | None" = None) -> None:
+        # W65: `events=None` (live, the default) reads the stored official calendar; research passes a
+        # calendar built from the same table (build_research_calendar) so past windows are gated on what
+        # actually happened. Track D: `db_path` (default: the bot's own historical.db, resolved here) names
+        # the store the live calendar reads, READ-ONLY.
+        self._degraded = False
+        if events is not None:
+            self._source = "explicit"
             self._events = sorted(events, key=lambda e: e.date)
             self._event_dates = frozenset(e.date for e in self._events)
+        else:
+            path = Path(db_path) if db_path is not None else default_live_db_path()
+            loaded, reason = _load_live_table(path, today_et())
+            if loaded is None:
+                self._source = "fallback"
+                self._degraded = True
+                self._events = _ALL_EVENTS
+                self._event_dates = _EVENT_DATES
+                self._alert_fallback(path, reason)
+            else:
+                tail = _fallback_tail(loaded)
+                self._source = "table"
+                self._events = sorted(loaded + tail, key=lambda e: e.date)
+                self._event_dates = frozenset(e.date for e in self._events)
+                log.info("economic_calendar_loaded", source="official_econ_calendar", path=str(path),
+                         rows=len(loaded), first=str(min(e.date for e in loaded)),
+                         last=str(max(e.date for e in loaded)),
+                         fallback_tail={t.value: sum(e.event_type is t for e in tail)
+                                        for t in EventType if any(e.event_type is t for e in tail)})
         self._last_event_date: date = (
             max(e.date for e in self._events) if self._events else date.min
         )
 
     _exhausted_warned = False
+    _fallback_alerted = False
+
+    @property
+    def source(self) -> str:
+        """Where the events came from: 'table' (official_econ_calendar), 'fallback' (the declared
+        hard-coded lists, the table being unusable) or 'explicit' (a list the caller passed: research)."""
+        return self._source
 
     @property
     def exhausted_warned(self) -> bool:
-        """R17: True once `_warn_if_nearly_exhausted` has logged the
-        once-per-process staleness alarm. Polled by the orchestrator (whose
-        callers are async, unlike this class's) to actually page a human —
-        the log.critical() below alone never reached Telegram."""
-        return EconomicCalendar._exhausted_warned
+        """R17: True once `_warn_if_nearly_exhausted` has logged the once-per-process staleness alarm, OR
+        when this calendar is running on the hard-coded fallback (Track D). Polled by the orchestrator
+        (whose callers are async, unlike this class's) to actually page a human -- the log.critical() alone
+        never reached Telegram. The orchestrator's page text names the exhaustion; the log line
+        economic_calendar_table_unusable carries the actual reason."""
+        return EconomicCalendar._exhausted_warned or self._degraded
+
+    @classmethod
+    def _alert_fallback(cls, path: Path, reason: str) -> None:
+        """log.critical (once per process) that the live calendar is on the hard-coded fallback."""
+        if cls._fallback_alerted:
+            return
+        cls._fallback_alerted = True
+        log.critical(
+            "economic_calendar_table_unusable",
+            path=str(path), reason=reason, fallback="hardcoded_lists",
+            msg="the stored official economic calendar cannot be used; macro-event guards run on the "
+                "hard-coded fallback lists (verified 2026-10-31, 2027 GDP/PCE unverified). Rebuild it: "
+                "python scripts/build_official_calendar.py --apply (RUNBOOK 'Economic calendar'), then "
+                "restart the bot.")
 
     def _warn_if_nearly_exhausted(self, check_date: date) -> None:
-        """log.critical (once per process) when the hardcoded calendar has
-        fewer than STALENESS_ALARM_DAYS of future events left."""
+        """log.critical (once per process) when the calendar has fewer than STALENESS_ALARM_DAYS of
+        future events left."""
         if EconomicCalendar._exhausted_warned:
             return
         remaining = (self._last_event_date - check_date).days
@@ -265,12 +379,13 @@ class EconomicCalendar:
                 "economic_calendar_nearly_exhausted",
                 last_known_event=str(self._last_event_date),
                 days_of_coverage_left=remaining,
-                msg="hardcoded calendar has <"
+                source=self._source,
+                msg="the economic calendar has <"
                     f"{self.STALENESS_ALARM_DAYS} days of future events -- "
-                    "macro-event guards are about to go BLIND. Extend the "
-                    "_FOMC/_CPI/_NFP/_GDP/_PCE tables (2027-H1 dates are "
-                    "APPROXIMATE and must be verified against BLS/BEA/Fed "
-                    "schedules).",
+                    "macro-event guards are about to go BLIND. Rebuild the stored calendar "
+                    "(python scripts/build_official_calendar.py --apply) and, past the horizon the "
+                    "agencies have published, extend the _FOMC/_CPI/_NFP/_GDP/_PCE fallback tables "
+                    "(2027 GDP/PCE are UNVERIFIED approximations).",
             )
 
     def is_event_day(self, check_date: date | None = None) -> bool:
@@ -366,11 +481,12 @@ class EconomicCalendar:
 
 
 # ---------------------------------------------------------------------------
-# W65: research calendar from the operator's Investing.com CSV
+# W65: Investing.com CSV classification (the reconciliation baseline; no longer the gate source)
 # ---------------------------------------------------------------------------
 # The ONE definition of which CSV rows are the five engine event types, shared by
-# scripts/load_econ_calendar_csv.py (ingest) and the tests. Names are the exact
-# Investing.com event strings of the US releases (country == "United States").
+# scripts/load_econ_calendar_csv.py (ingest), scripts/build_official_calendar.py (the reconciliation
+# baseline) and the tests. Names are the exact Investing.com event strings of the US releases
+# (country == "United States"). Track D: the research GATE reads official_econ_calendar instead.
 ENGINE_EVENT_NAMES: dict[str, str] = {
     "Fed Interest Rate Decision": "FOMC",
     "U.S. Consumer Price Index (CPI) MoM": "CPI",
@@ -417,18 +533,19 @@ def derive_engine_event_types(df):
 
 
 def build_research_calendar(db_path, table_prefix: str, event_types) -> "EconomicCalendar | None":
-    """EconomicCalendar from `{prefix}econ_events`, or None when the table is empty.
+    """EconomicCalendar from `{prefix}official_econ_calendar`, or None when the table is empty.
 
-    One EconomicEvent per (date, type): the engine gates on dates, so a combined
-    release is a single event."""
+    Track D: the research gate reads the SAME stored official calendar the live bot reads (the Fed / BLS /
+    BEA pages, FRED where it filled a gap), no longer the Investing.com export. NO hard-coded fallback: a
+    table without rows returns None and the caller (strict research) refuses. One EconomicEvent per
+    (date, type): the engine gates on dates, so a combined release is a single event."""
     from ait.data.historical import HistoricalDataStore
 
     store = HistoricalDataStore(db_path=db_path, table_prefix=table_prefix)
-    df = store.load_econ_events(engine_event_types=list(event_types))
+    df = store.load_official_econ_calendar(event_types=list(event_types))
     if df.empty:
         return None
     events = []
-    for d, t in sorted({(date.fromisoformat(r.event_date), r.engine_event_type)
-                        for r in df.itertuples()}):
+    for d, t in sorted({(date.fromisoformat(r.event_date), r.event_type) for r in df.itertuples()}):
         events.append(EconomicEvent(d, EventType[t], f"{t} (research calendar)"))
     return EconomicCalendar(events=events)

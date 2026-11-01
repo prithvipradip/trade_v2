@@ -28,13 +28,13 @@ run_orchestrator.py:
 
 run_backtest.py:
   group: Entry point
-  what: "Walk-forward backtest of the iron-condor rules on the stored research history. Checks first that every input is stored (exit 2 listing each gap and its fix when one is not), prints the parity manifest and writes a run record."
+  what: "Walk-forward backtest of the iron-condor rules on the stored research history. Checks first that every input is stored (exit 2 listing each gap and its fix when one is not), prints the parity manifest (and a warning when a surface-priced run fell back to the legacy IV on too many legs) and writes a run record."
   when: "To test a change in research. --study-file records the run as a study."
   needs_ib: "no"
   writes: "reports/runs/<run_id>/run_record.json, and an MLflow run when MLflow is installed (--no-run-record skips both). Writes no database rows; the engine opens the history store, which creates any missing empty table in data/historical.db."
   example: "python run_backtest.py --symbols QQQ --study-file studies/_template.yaml"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#3-what-one-run-does)"
-  stamp: "1ab89666d69f"
+  stamp: "279b52473dac"
 
 run_optimizer.py:
   group: Entry point
@@ -239,12 +239,22 @@ scripts/build_research_calendars.py:
 scripts/load_econ_calendar_csv.py:
   group: Data
   what: "Loads the operator's Investing.com economic-calendar CSV into the econ_events table, normalised to US/Eastern with its provenance recorded."
-  when: "When you receive a new economic-calendar CSV."
+  when: "When you receive a new economic-calendar CSV. The macro gate no longer reads these rows (it reads the official calendar); they stay as the reconciliation baseline for build_official_calendar.py and for the numeric actual, forecast and previous columns."
   needs_ib: "no"
   writes: "econ_events in data/historical.db, and reports/econ_calendar_audit_<date>.json, which is written even with --dry-run (that stores no events)."
   example: "python scripts/load_econ_calendar_csv.py --csv <file> [--dry-run]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#10-research-data-collection-and-calibration)"
   stamp: "27b15f0cf240"
+
+scripts/build_official_calendar.py:
+  group: Data
+  what: "Builds the official economic calendar (FOMC, CPI, NFP, GDP advance estimate, PCE) that the live bot's macro-event guard and the research macro gate both read, from the Fed, BLS and BEA release pages; with FRED_API_KEY set it also cross-checks every date against FRED. Compares the result with the stored Investing.com rows, the live fallback lists and FRED, and refuses to write while they disagree."
+  when: "After a release date is moved or announced (BLS and BEA reschedule), when the BEA publishes next year's schedule, before the stored calendar is 90 days old, and whenever the bot logs economic_calendar_table_unusable. Dry run first and read the DISAGREE lines; restart the bot afterwards so the live calendar reloads."
+  needs_ib: "no"
+  writes: "official_econ_calendar in data/historical.db (--apply only: the rows from --since on are replaced in one transaction; --accept-official applies despite listed disagreements), a download cache under data/research_cache/official_calendar, and a reconciliation JSON under reports/ (written even on a dry run or a blocked run). Uses the network (federalreserve.gov, bls.gov, bea.gov; api.stlouisfed.org with a key); needs SEC_EDGAR_CONTACT as the User-Agent unless --offline. Exit 0 clean, 1 structural failure, 2 blocked by disagreements."
+  example: "python scripts/build_official_calendar.py [--since <date>] [--apply] [--accept-official] [--no-fred]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#economic-calendar)"
+  stamp: "8ad5117d34ed"
 
 scripts/calibrate_option_spreads.py:
   group: Data
@@ -265,6 +275,16 @@ scripts/backfill_mlflow.py:
   example: "python scripts/backfill_mlflow.py [--symbol QQQ]"
   explained: "-"
   stamp: "1508f374906f"
+
+scripts/clean_history_db.py:
+  group: Data
+  what: "Lists the rows of data/historical.db by table, symbol and source tag (first and last date, flags for rows with no tag, a tag the code never writes, and the archive_w91_research_* tables), and deletes a selection of rows from a registered research-input table or an archive table. Nothing else in the code base deletes history rows."
+  when: "To review what the database holds (`list`), or to remove rows you have decided are wrong: legacy rows with no source tag, a symbol you no longer use, a date range, the archive tables. Run `list` and the dry run first. It refuses to apply while the bot or supervisor may be running, and there is no override."
+  needs_ib: "no"
+  writes: "`list` and the dry run write only a report under reports/ (the database is opened read-only). `delete --apply` first copies data/historical.db to data/backups/historical_pre_clean_<time>.db, then deletes the selected rows in one transaction. An unfiltered delete needs --all-rows."
+  example: "python scripts/clean_history_db.py list; python scripts/clean_history_db.py delete --table daily_prices --symbol AAPL --source-null [--apply]"
+  explained: "[RUNBOOK.md](../RUNBOOK.md#data-catch-up-and-maintenance)"
+  stamp: "303b22837a2d"
 
 scripts/show_research_config.py:
   group: Research tool

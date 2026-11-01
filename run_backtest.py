@@ -294,12 +294,14 @@ def build_parity_manifest(args: argparse.Namespace) -> dict:
     for _k in ("expiry_guard_dte", "max_hold_fraction", "flatten_minutes_before_close"):
         backtest[_k] = getattr(_bt_cfg, _k, None)
     backtest["pricing_source"] = getattr(_bt_cfg, "pricing_source", "bs_legacy")
-    if backtest["pricing_source"] != "surface":
+    if backtest["pricing_source"] == "bs_legacy":
+        # The research default is the surface, so a run on bs_legacy was chosen (a study or an edit of the overlay).
+        # A surface run is judged AFTER the run, from the stamped share of legs that fell back (surface_pricing_notice).
         warnings.append(
             "pricing_source: 'bs_legacy' - leg IVs are one stored 30-day IV plus a skew with no DTE term. "
             "The real-bar surface cut median option-price error out-of-sample by 19% (1-2 DTE), 46% "
-            "(3-7), 43% (8-14) and 49% (15-45) on QQQ (W75); set backtest.pricing_source: surface in "
-            "config_research.yaml to use it (QQQ only; other symbols fall back per leg).")
+            "(3-7), 43% (8-14) and 49% (15-45) on QQQ (W75); the research default is the surface "
+            "(backtest.pricing_source in config_research.yaml; QQQ only, the one symbol with option bars).")
     if _engine_model != "realistic":
         warnings.append(
             "engine_model: 'legacy' - entries are priced at the DAILY close with same-day IV, "
@@ -543,6 +545,18 @@ def _write_run_record(args, study, settings, cfg, result, manifest) -> None:
         print(f"\n  ! run record not written ({type(exc).__name__}: {exc})")
 
 
+def surface_pricing_notice(data_contract: dict | None) -> str | None:
+    """The line to print when a surface-priced run fell back to the legacy IV on more legs than the fixed research
+    limit allows, read from the stamp in the run's data contract; None when the run is within the limit or was not
+    surface-priced. The run is flagged, not refused: the fallback is a declared model."""
+    stamp = (data_contract or {}).get("surface_pricing")
+    if not stamp or not stamp.get("exceeds_limit"):
+        return None
+    return (f"surface pricing: {stamp['fell_back']} of {stamp['legs_priced']} legs ({stamp['miss_fraction']:.1%}) fell "
+            f"back to the legacy single-IV model, above the fixed limit of {stamp['limit']:.0%} "
+            "(RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION); treat this result as only partly surface-priced.")
+
+
 def too_few_windows(n_windows: int, tuning) -> bool:
     """True when a run produced fewer walk-forward windows than ``backtest.walkforward_tuning.min_windows`` (W90e: was 3)."""
     return n_windows < int(tuning.min_windows)
@@ -714,6 +728,10 @@ async def run_backtest(args: argparse.Namespace) -> None:
     # Attach the parity manifest to the result object so any downstream JSON
     # serialization of this run (dashboards, experiment writers) carries it.
     result.parity_manifest = manifest
+    _surface_notice = surface_pricing_notice(getattr(result, "data_contract", None))
+    if _surface_notice:
+        manifest["parity_warnings"].append(_surface_notice)            # reaches the run record with the manifest
+        print(f"\n  !! {_surface_notice}")
 
     # Print results
     print(f"\n{result.summary()}")

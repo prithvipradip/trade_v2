@@ -41,6 +41,7 @@ SCHEMA = "ait.run_record/1"
 _DATE_COLUMNS: dict[str, str | None] = {
     "daily_prices": "date", "daily_iv": "date", "econ_schedule": "event_date", "dividends": "ex_date",
     "earnings_schedule": "event_session", "qqq_holdings": "filed_date", "econ_events": "event_date",
+    "official_econ_calendar": "event_date",
     "option_leg_spread_params": None, "option_leg_spread_band_params": None,
 }
 

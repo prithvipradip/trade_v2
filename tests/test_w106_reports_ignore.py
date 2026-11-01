@@ -20,6 +20,7 @@ IGNORED = [
     "reports/daily_20261028_163000.json",          # the supervisor's daily report
     "reports/backtest_20261025_200000.json",       # the supervisor's weekly backtest
     "reports/econ_calendar_audit_20261028.json",   # written by load_econ_calendar_csv (and its tests)
+    "reports/official_calendar_reconciliation_20261031.json",   # written by build_official_calendar
 ]
 KEPT = [
     "reports/some_study/entry_dte_18/results.md",

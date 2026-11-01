@@ -44,6 +44,15 @@ SOURCE_IB_BID_ASK_BARS = "IB_BID_ASK_BARS"  # W66: IB hourly BID+ASK bars of lis
 SOURCE_YAHOO_DIVIDENDS = "YAHOO_DIVIDENDS"  # W84: yfinance Ticker.dividends (ex-date, amount/share)
 SOURCE_FED_FOMC = "FED_FOMC_PAGES"          # W83a: federalreserve.gov FOMC meeting pages
 SOURCE_BLS_ARCHIVE = "BLS_RELEASE_ARCHIVE"  # W83a: bls.gov news-release archive links
+# Track D: the official_econ_calendar table (the ONE macro-event calendar live and research both read).
+# SOURCE_FED_FOMC above is the FOMC tag; BLS rows (CPI / NFP: archive links AND forward schedule pages) and
+# BEA rows (GDP advance / PCE: schedule page AND past-release pages) share one tag per agency, the row's
+# source_url says which page. FRED rows are only loaded where no agency page covers the date.
+SOURCE_BLS_SCHEDULE = "BLS_SCHEDULE"        # bls.gov release schedule + news-release archive (CPI, NFP)
+SOURCE_BEA_SCHEDULE = "BEA_SCHEDULE"        # bea.gov release schedule + past release pages (GDP advance, PCE)
+SOURCE_FRED_RELEASE_DATES = "FRED_RELEASE_DATES"   # St. Louis Fed /fred/release/dates (needs FRED_API_KEY)
+OFFICIAL_CALENDAR_SOURCES: tuple[str, ...] = (
+    SOURCE_FED_FOMC, SOURCE_BLS_SCHEDULE, SOURCE_BEA_SCHEDULE, SOURCE_FRED_RELEASE_DATES)
 SOURCE_EDGAR_N30B2 = "EDGAR_N30B2"          # W83a: QQQ trust annual Schedule of Investments
 SOURCE_EDGAR_NPORT = "EDGAR_NPORTP"         # W83a: QQQ trust NPORT-P quarterly holdings
 SOURCE_EDGAR_8K_202 = "EDGAR_8K_ITEM202"    # W83a: company 8-K Item 2.02 (results of operations)
@@ -128,6 +137,9 @@ class HistoricalDataStore:
         # reads them): scheduled FOMC / CPI / NFP dates, QQQ's reported top holdings, and mega-cap
         # earnings releases.
         self._econ_schedule_table = f"{table_prefix}econ_schedule"
+        # Track D: the official-source macro calendar (FOMC / CPI / NFP / GDP advance / PCE). Unlike the
+        # tables above it IS read by the live bot (EconomicCalendar, through its own read-only connection).
+        self._official_calendar_table = f"{table_prefix}official_econ_calendar"
         self._qqq_holdings_table = f"{table_prefix}qqq_holdings"
         self._earnings_schedule_table = f"{table_prefix}earnings_schedule"
         self._init_db()
@@ -317,6 +329,20 @@ class HistoricalDataStore:
                     source      TEXT NOT NULL,
                     source_url  TEXT NOT NULL,
                     PRIMARY KEY (event_date, event)
+                )
+            """)
+            # Track D. Additive and idempotent like every table here (the live bot also runs this init).
+            # One row per (date, type): the reconciled official date; event_time_et '' = not stated.
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._official_calendar_table} (
+                    event_date     TEXT NOT NULL,   -- ISO ET release date (FOMC: the decision day)
+                    event_time_et  TEXT NOT NULL DEFAULT '',   -- 'HH:MM' ET as the source states it
+                    event_type     TEXT NOT NULL,   -- FOMC | CPI | NFP | GDP (advance estimate) | PCE
+                    source         TEXT NOT NULL,   -- OFFICIAL_CALENDAR_SOURCES tag
+                    source_url     TEXT NOT NULL,
+                    fetched_at     TEXT NOT NULL,   -- ISO timestamp of the fetch
+                    sha256         TEXT NOT NULL,   -- of the fetched source document
+                    PRIMARY KEY (event_date, event_type)
                 )
             """)
             conn.execute(f"""
@@ -691,6 +717,39 @@ class HistoricalDataStore:
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(q + " ORDER BY event_date, event", params).fetchall()
         return [(date.fromisoformat(d), e) for d, e in rows]
+
+    def save_official_econ_calendar(self, rows: "list[tuple]", replace_from: date | None = None) -> int:
+        """Track D: upsert (event_date, event_time_et, event_type, source, source_url, fetched_at, sha256)
+        rows (see scripts/build_official_calendar.py). With ``replace_from``, first delete every stored row
+        on or after that date IN THE SAME TRANSACTION: a release the agency has since moved must not leave
+        its old date behind as a second event."""
+        payload = [(str(r[0]), str(r[1] or ""), str(r[2]), str(r[3]), str(r[4]), str(r[5]), str(r[6]))
+                   for r in rows]
+        with sqlite3.connect(self._db_path) as conn:
+            if replace_from is not None:
+                conn.execute(f"DELETE FROM {self._official_calendar_table} WHERE event_date >= ?",
+                             (str(replace_from),))
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {self._official_calendar_table} (event_date, event_time_et, "
+                f"event_type, source, source_url, fetched_at, sha256) VALUES (?,?,?,?,?,?,?)", payload)
+        return len(payload)
+
+    def load_official_econ_calendar(self, event_types: "list[str] | None" = None) -> pd.DataFrame:
+        """Track D: stored official calendar rows (all, or only the given event types), by date."""
+        q = f"SELECT * FROM {self._official_calendar_table}"
+        params: list = []
+        if event_types is not None:
+            q += " WHERE event_type IN (" + ",".join("?" * len(event_types)) + ")"
+            params += list(event_types)
+        with sqlite3.connect(self._db_path) as conn:
+            return pd.read_sql_query(q + " ORDER BY event_date, event_type", conn, params=params)
+
+    def official_econ_calendar_span(self) -> "tuple[str, str, int] | None":
+        """Track D: (first_date, last_date, rows) of the stored official calendar, or None when empty."""
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(f"SELECT MIN(event_date), MAX(event_date), COUNT(*) "
+                               f"FROM {self._official_calendar_table}").fetchone()
+        return None if not row or not row[2] else (row[0], row[1], int(row[2]))
 
     def save_qqq_holdings(self, rows: "list[tuple]", source: str) -> int:
         """W83a: upsert (report_date, filed_date, form, accession, rank, company_key, name,

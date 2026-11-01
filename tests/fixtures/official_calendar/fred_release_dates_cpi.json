@@ -1,0 +1,67 @@
+{
+ "realtime_start": "1776-07-04",
+ "realtime_end": "9999-12-31",
+ "order_by": "release_date",
+ "sort_order": "asc",
+ "count": 14,
+ "offset": 0,
+ "limit": 10000,
+ "release_dates": [
+  {
+   "release_id": 10,
+   "date": "2025-10-24"
+  },
+  {
+   "release_id": 10,
+   "date": "2025-12-18"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-01-13"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-02-13"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-03-11"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-04-10"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-05-12"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-06-10"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-07-14"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-08-12"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-09-11"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-10-14"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-11-10"
+  },
+  {
+   "release_id": 10,
+   "date": "2026-12-10"
+  }
+ ]
+}

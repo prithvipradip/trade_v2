@@ -52,6 +52,10 @@ RESEARCH_MAX_MACRO_GAP_DAYS = 5
 # How far before the end of a window the newest stored macro observation may be: the broad dollar index is published
 # about a week late, so the tail tolerance is wider than the gap tolerance inside a window.
 RESEARCH_MAX_MACRO_TAIL_DAYS = 10
+# The largest share of a run's surface-priced option legs that may fall back to the legacy single-IV model (a leg with
+# no fitted smile for its expiry, or a strike outside the fitted range). The fallback is a declared model, not a
+# refusal; above this share the run record flags the result as only partly surface-priced.
+RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION = 0.10
 
 RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
     Invariant(
@@ -88,7 +92,7 @@ RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
         "Longest stretch after a macro-event type's last stored event for which the stored calendar still counts as "
         "current at the end of a window.",
         "Same reason: a calendar that ends early silently turns the macro gate off for the rest of the window.",
-        "data/research_inputs.py (the econ_events check); backtesting/preflight.py"),
+        "data/research_inputs.py (the official_econ_calendar check); backtesting/preflight.py"),
     Invariant(
         "RESEARCH_MAX_MACRO_GAP_DAYS", RESEARCH_MAX_MACRO_GAP_DAYS, "days",
         "Longest stretch of calendar days inside a window, or at its end, without a stored observation of a macro series.",
@@ -101,6 +105,14 @@ RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
         "The broad dollar index is published about a week late, so a window ending today legitimately lags it; a "
         "longer lag means the backfill is stale.",
         "data/research_inputs.py (the macro_series check); data/macro_store.py"),
+    Invariant(
+        "RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION", RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION, "fraction of legs",
+        "Largest share of a run's surface-priced legs that may fall back to the legacy single-IV model before the "
+        "run record flags the result as only partly surface-priced (the run is flagged and stamped, not refused).",
+        "The per-leg fallback is a declared model so one thin strike does not stop a study, but a study whose "
+        "legs mostly miss the surface is a legacy-priced study with a surface label; if a study file could raise "
+        "the line, it could hide that.",
+        "backtesting/result.py (surface_pricing_stamp); backtesting/walkforward.py (data_contract); run_backtest.py"),
     Invariant(
         "IV_SCALE_MAX", IV_SCALE_MAX, "ratio",
         "Upper clamp of the same scaling.",

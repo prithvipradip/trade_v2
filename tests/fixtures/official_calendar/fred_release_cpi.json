@@ -1,0 +1,14 @@
+{
+ "realtime_start": "2026-10-31",
+ "realtime_end": "2026-10-31",
+ "releases": [
+  {
+   "id": 10,
+   "realtime_start": "2026-10-31",
+   "realtime_end": "2026-10-31",
+   "name": "Consumer Price Index",
+   "press_release": true,
+   "link": "http://www.bls.gov/cpi/"
+  }
+ ]
+}
