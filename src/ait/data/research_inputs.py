@@ -125,6 +125,36 @@ def required_window(*, today: date, days: int | None = None, start_date: date | 
     return Window(start_date, end)
 
 
+def surface_end_cap(db_path: "Path | str", symbols, today: date, max_tail_sessions: int) -> "date | None":
+    """The last day an unpinned surface-priced study can use, when the stored option bars end before the last
+    completed session by at most ``max_tail_sessions`` sessions; else ``None`` (nothing to cap, or too far behind: the
+    preflight then reports the gap and the backfill remedy). The cap is the OLDEST newest-bar date among ``symbols``,
+    so every symbol has bars on every day of the window's tail. Read-only; a missing database or table gives ``None``."""
+    last_done = last_completed_session(today)
+    try:
+        con = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        newest = []
+        for sym in symbols:
+            row = con.execute("SELECT MAX(date) FROM option_daily_bars WHERE underlying=? AND date<=?",
+                              (sym, str(last_done))).fetchone()
+            if not row or not row[0]:
+                return None
+            newest.append(date.fromisoformat(row[0]))
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    cap = min(newest) if newest else None
+    if cap is None or cap >= last_done:
+        return None
+    if len(sessions_between(cap + timedelta(days=1), last_done)) > max_tail_sessions:
+        return None
+    return last_session_on_or_before(cap)
+
+
 def prices_request(symbol: str, window: Window, db_path: "Path | str", table_prefix: str = "") -> "ResearchRequest":
     """A request that checks one symbol's daily bars only (what the loaders verify before they read)."""
     return ResearchRequest(window=window, symbols=(symbol,), db_path=db_path, max_null_iv_run=0,
