@@ -171,3 +171,63 @@ class TestSurfaceMissLimit:
                 sys.argv = old
         assert [w for w in manifest("bs_legacy")["parity_warnings"] if w.startswith("pricing_source")]
         assert not [w for w in manifest("surface")["parity_warnings"] if w.startswith("pricing_source")]
+
+
+class TestWindowEndsAtTheLastOptionBar:
+    """An unpinned surface study ends at the newest stored bar when the bars trail by at most the fixed tail."""
+    LAST_BAR = date(2024, 12, 20)
+
+    def _db(self, tmp_path):
+        db = tmp_path / "historical.db"
+        HistoricalDataStore(db_path=db).save_option_daily_bars("QQQ", _bars(ri.sessions_between(date(2024, 9, 30), self.LAST_BAR)))
+        return db
+
+    def test_the_limit_is_a_registered_fixed_research_limit(self):
+        by_name = {i.name: i for i in ri_limits.RESEARCH_INVARIANTS}
+        assert by_name["RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS"].value == ri_limits.RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS == 10
+
+    def test_a_short_lag_caps_the_window_at_the_newest_bar(self, tmp_path):
+        cap = ri.surface_end_cap(self._db(tmp_path), ("QQQ",), date(2024, 12, 31), 10)     # 5 sessions behind
+        assert cap == self.LAST_BAR
+
+    def test_a_longer_lag_than_the_limit_gives_no_cap(self, tmp_path):
+        assert ri.surface_end_cap(self._db(tmp_path), ("QQQ",), date(2025, 2, 3), 10) is None
+
+    def test_bars_that_are_current_need_no_cap(self, tmp_path):
+        assert ri.surface_end_cap(self._db(tmp_path), ("QQQ",), date(2024, 12, 23), 10) is None   # last session = 12-20
+
+    def test_a_symbol_without_bars_gives_no_cap_so_the_preflight_refuses(self, tmp_path):
+        assert ri.surface_end_cap(self._db(tmp_path), ("QQQ", "SPY"), date(2024, 12, 31), 10) is None
+
+    def test_a_missing_database_gives_no_cap(self, tmp_path):
+        assert ri.surface_end_cap(tmp_path / "nope.db", ("QQQ",), date(2024, 12, 31), 10) is None
+
+    def _bt(self, tmp_path, monkeypatch, *, end=None, source="surface"):
+        from types import SimpleNamespace
+
+        from ait.backtesting import walkforward as wf
+        monkeypatch.setattr(wf, "today_et", lambda: date(2024, 12, 31))
+        cfg = wf.WalkForwardConfig(history_end_date=end)
+        bt = wf.WalkForwardBacktester(symbols=["QQQ"], strategies=["iron_condor"], config=cfg,
+                                      db_path=self._db(tmp_path), strict_inputs=True)
+        return bt, cfg, SimpleNamespace(backtest=SimpleNamespace(pricing_source=source))
+
+    def test_the_backtester_ends_its_window_there_and_stamps_it(self, tmp_path, monkeypatch):
+        bt, cfg, settings = self._bt(tmp_path, monkeypatch)
+        bt._cap_window_at_last_option_bar(settings)
+        assert bt._config.history_end_date == self.LAST_BAR
+        assert cfg.history_end_date is None                          # the caller's config object is untouched
+        stamp = bt.data_contract()["window_end_capped"]
+        assert stamp == {"last_completed_session": "2024-12-30", "capped_to": "2024-12-20"}
+        bt._cap_window_at_last_option_bar(settings)                  # idempotent: the same cap, not a pin
+        assert bt._config.history_end_date == self.LAST_BAR and bt._config_uncapped is cfg
+
+    def test_a_pinned_end_is_never_moved(self, tmp_path, monkeypatch):
+        bt, _, settings = self._bt(tmp_path, monkeypatch, end=date(2024, 12, 30))
+        bt._cap_window_at_last_option_bar(settings)
+        assert bt._config.history_end_date == date(2024, 12, 30) and bt.data_contract()["window_end_capped"] is None
+
+    def test_a_legacy_priced_study_is_not_capped(self, tmp_path, monkeypatch):
+        bt, _, settings = self._bt(tmp_path, monkeypatch, source="bs_legacy")
+        bt._cap_window_at_last_option_bar(settings)
+        assert bt._config.history_end_date is None

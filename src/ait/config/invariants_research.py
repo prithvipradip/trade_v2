@@ -56,6 +56,10 @@ RESEARCH_MAX_MACRO_TAIL_DAYS = 10
 # no fitted smile for its expiry, or a strike outside the fitted range). The fallback is a declared model, not a
 # refusal; above this share the run record flags the result as only partly surface-priced.
 RESEARCH_MAX_SURFACE_LEG_MISS_FRACTION = 0.10
+# How many completed sessions at the end of a window may lack option bars when the study uses the surface and does not
+# pin its last day: the window then ends at the newest stored bar instead of refusing (the stored bars trail the daily
+# prices by the length of the option backfill). More missing sessions than this refuses, naming the backfill.
+RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS = 10
 
 RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
     Invariant(
@@ -113,6 +117,14 @@ RESEARCH_INVARIANTS: tuple[Invariant, ...] = (
         "legs mostly miss the surface is a legacy-priced study with a surface label; if a study file could raise "
         "the line, it could hide that.",
         "backtesting/result.py (surface_pricing_stamp); backtesting/walkforward.py (data_contract); run_backtest.py"),
+    Invariant(
+        "RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS", RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS, "sessions",
+        "How many completed sessions at the end of an unpinned surface-priced window may lack option bars before the "
+        "preflight refuses; within it the window ends at the newest stored bar and the run record says so.",
+        "Option bars are filled by a slow vendor backfill, so they trail the daily prices; ending the window at the "
+        "last bar prices every day in it from real bars, and a longer lag means the backfill has been missed. If a "
+        "study file could raise the line it could price a long tail from the fallback model.",
+        "data/research_inputs.py (surface_end_cap); backtesting/walkforward.py (research_request)"),
     Invariant(
         "IV_SCALE_MAX", IV_SCALE_MAX, "ratio",
         "Upper clamp of the same scaling.",

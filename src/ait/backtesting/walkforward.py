@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -1342,6 +1343,8 @@ class WalkForwardBacktester:
         self._declared_by_window: dict[int, dict[str, dict[str, int]]] = {}    # W116: declared-model counts
         self._macros_full: "dict[str, pd.Series] | None" = None                # W116: stored FRED series (lagged)
         self._preflight_report = None                                          # W116: set by run() under strict inputs
+        self._config_uncapped = self._config
+        self._end_capped: "dict | None" = None                                 # W117: the window ended at the last option bar
         # W67: {window_id: {symbol: {"usable": bool, "best_value": float, "best_n_trades": int}}}
         # for every per-window Optuna study, so a run whose studies never found a trading
         # trial says so in its summary instead of looking like an optimized result.
@@ -3693,7 +3696,8 @@ class WalkForwardBacktester:
                     declared[name] = declared.get(name, 0) + int(n)
         return {"preflight": self._preflight_report.as_dict() if self._preflight_report is not None else None,
                 "declared_models": declared,
-                "surface_pricing": surface_pricing_stamp(declared)}      # None unless pricing_source is surface
+                "surface_pricing": surface_pricing_stamp(declared),      # None unless pricing_source is surface
+                "window_end_capped": self._end_capped}                   # W117: None unless the window ended at the last option bar
 
     def _aggregate_funnel(self, by_window: "dict | None" = None) -> dict[str, dict[str, int]]:
         """W66: sum the per-window entry funnels into {symbol: {reason: days}}. W108 S1: ``by_window`` names another
@@ -3812,14 +3816,37 @@ class WalkForwardBacktester:
             fetch_days = max(fetch_days, cfg.history_days)
         return fetch_days
 
+    def _cap_window_at_last_option_bar(self, settings) -> None:
+        """An unpinned surface-priced study ends at the newest stored option bar when the bars trail the daily prices
+        by at most ``RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS`` sessions (more than that refuses at the preflight). A pinned
+        ``history_end_date`` is never moved. Idempotent: a cap set by an earlier call is recomputed, not kept."""
+        from ait.config.invariants_research import RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS
+        from ait.data.research_inputs import last_completed_session, surface_end_cap
+        if self._end_capped is not None:                      # an earlier call's cap: start again from the unpinned run
+            self._config, self._end_capped = self._config_uncapped, None
+        if not self._strict or self._config.history_end_date is not None or self._db_path is None:
+            return
+        if getattr(getattr(settings, "backtest", None), "pricing_source", None) != "surface":
+            return
+        today = today_et()
+        cap = surface_end_cap(self._db_path, self._symbols, today, RESEARCH_MAX_OPTION_BAR_TAIL_SESSIONS)
+        if cap is not None:
+            self._end_capped = {"last_completed_session": str(last_completed_session(today)), "capped_to": str(cap)}
+            self._config_uncapped = self._config              # the caller's own config object is never modified
+            self._config = copy.copy(self._config)
+            self._config.history_end_date = cap
+            log.warning("window_ended_at_last_option_bar", **self._end_capped,
+                        note="the option bars trail the daily prices; backfill_option_history.py --since-last closes it")
+
     def research_request(self):
         """W116: what this study needs from the history database (see ``ait.backtesting.preflight``)."""
         from ait.backtesting.preflight import build_request
-        cfg = self._config
         settings = self._settings
         if settings is None:
             from ait.config.settings import load_settings
             settings = load_settings()
+        self._cap_window_at_last_option_bar(settings)
+        cfg = self._config
         return build_request(
             symbols=self._symbols, db_path=self._db_path, table_prefix=self._table_prefix, today=today_et(),
             history_start_date=cfg.history_start_date, history_end_date=cfg.history_end_date,
