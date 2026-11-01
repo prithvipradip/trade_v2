@@ -488,13 +488,13 @@ scripts/narrow_wing_study.py:
 
 scripts/surface_feature_study.py:
   group: Study
-  what: "Walk-forward panel study of whether three IV-surface features (the variance risk premium at the condor's horizon, the 7-to-30-day ATM term slope, the normalised 25-delta risk reversal) predict the hold-to-expiry result of a QQQ iron condor after friction, by DTE bucket, scored from real option-bar closes under a pre-registered rule with block-bootstrap p-values, a Holm correction, an as-of mutation guard and leaked and shuffled canaries."
+  what: "Walk-forward panel study of whether three IV-surface features (the variance risk premium at the condor's horizon, the 7-to-30-day ATM term slope, the normalised 25-delta risk reversal) predict the hold-to-expiry result of a QQQ iron condor after friction, by DTE bucket, scored from real option-bar closes under a pre-registered rule with block-bootstrap p-values, a Holm correction, an as-of mutation guard and leaked and shuffled canaries. Opt-in extras: an exploratory 50%-take-profit scoring (--exploratory-tp, never part of the verdict) and a surface cut at the window end (--cut-surface-at-window-end)."
   when: "To decide whether a surface feature earns a place as an observe-mode gate or a model feature (the pre-registered rule is in the script docstring and PLAN.md)."
   needs_ib: "no"
-  writes: "reports/surface_feature_study/ (dry_run.json, results.json, results.md; statistics only), reports/surface_feature_study_SMOKE/ for --smoke, and with --run a run record under reports/runs/; the fitted surface is cached under data/research_cache/ (git-ignored). Opens data/historical.db read-only."
+  writes: "reports/surface_feature_study/ (dry_run.json, results.json, results.md; statistics only), reports/surface_feature_study_SMOKE/ for --smoke, reports/surface_feature_study_exploratory/ for --exploratory-tp, and with --run a run record under reports/runs/; the fitted surface is cached under data/research_cache/ (git-ignored). Opens data/historical.db read-only."
   example: "python scripts/surface_feature_study.py --dry-run"
   explained: "-"
-  stamp: "540a9cccca47"
+  stamp: "688348ca4c92"
 
 scripts/budget_ladder_study.py:
   group: Study

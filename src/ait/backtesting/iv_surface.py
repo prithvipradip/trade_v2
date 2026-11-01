@@ -178,6 +178,15 @@ class IVSurface:
     def smile(self, as_of: date, expiry: date) -> SmileFit | None:
         return self._fits.get((as_of, expiry))
 
+    def cut_expiries(self, last_expiry: date) -> "IVSurface":
+        """A new surface holding only the smiles of expiries on or before ``last_expiry`` (same lookup rules).
+
+        A study that pins its window end uses it so the surface cannot include expiries after that end. Their bars are
+        dated inside the window, so a backfill that is still adding them would otherwise move features that read the
+        longest maturities (``term_slope``, forward variance). Off unless a caller asks for it."""
+        keep = [f for f in self._fits.values() if f.expiry <= last_expiry]
+        return IVSurface(keep, clamp_margin=self._clamp_margin, max_stale_days=self._max_stale_days)
+
     def latest_on_or_before(self, d: date, max_stale_days: int | None = None) -> date | None:
         """The newest surface date <= ``d`` within ``max_stale_days`` calendar days (default: this surface's setting)."""
         if max_stale_days is None:
@@ -309,7 +318,12 @@ def build_or_load(db_path: str | Path, underlying: str, cache_dir: str | Path,
                 return IVSurface.from_frame(pd.read_parquet(data_p), **lookup_kw)
         except Exception:  # noqa: BLE001 - a corrupt cache is just rebuilt
             pass
-    surf = IVSurface.from_bars(load_bars(db_path, underlying), **kw)
+    bars = load_bars(db_path, underlying)
+    # The stamp describes what was LOADED, not what was counted before the load: a backfill that adds rows in between
+    # would otherwise leave a cache stamped older than its content. Rows that land after the load make the next call's
+    # count differ from this stamp, so it rebuilds (the safe direction).
+    stamp = {**stamp, "rows": int(len(bars)), "max_date": str(bars["date"].max()) if len(bars) else "None"}
+    surf = IVSurface.from_bars(bars, **kw)
     surf.to_frame().to_parquet(data_p)
     meta_p.write_text(json.dumps(stamp))
     return surf

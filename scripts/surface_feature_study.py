@@ -38,7 +38,7 @@ import math  # noqa: E402
 import sqlite3  # noqa: E402
 from bisect import bisect_right  # noqa: E402
 from collections import Counter  # noqa: E402
-from dataclasses import dataclass  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
 from datetime import date, timedelta  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -103,6 +103,7 @@ class Inputs:
     frame: pd.DataFrame                   # daily OHLC + implied_vol
     iv_rank: pd.Series
     nyse: list[date]                      # NYSE sessions covering the window plus 60 days
+    marks: dict = field(default_factory=dict)   # (date, expiry, right) -> (strikes, closes) of EVERY traded bar (exploratory exit)
 
 
 def load_friction(db_path: Path, bt) -> tuple[object, dict]:
@@ -123,7 +124,7 @@ def load_friction(db_path: Path, bt) -> tuple[object, dict]:
     return BandedFriction(LegSpreadModel.from_row(dict(row)), usable, bt.friction_extrapolated_floor_usd), report
 
 
-def load_inputs(db_path: Path) -> Inputs:
+def load_inputs(db_path: Path, *, cut_surface: bool = False, with_marks: bool = False) -> Inputs:
     from ait.backtesting.iv_surface import build_or_load, load_bars
     from ait.backtesting.replay import ResearchData
     from ait.config.settings import load_settings, loaded_surface_tuning
@@ -133,6 +134,8 @@ def load_inputs(db_path: Path) -> Inputs:
     settings = load_settings()
     bt, tuning = settings.backtest, loaded_surface_tuning()
     surface = build_or_load(db_path, SYMBOL, db_path.parent / "research_cache")
+    if cut_surface:                                       # opt-in: no expiry after the window end reaches any feature
+        surface = surface.cut_expiries(WINDOW_END)
     bars = load_bars(db_path, SYMBOL, date_to=WINDOW_END.isoformat())
     sessions = sorted(d for d in bars["date"].unique())
     spot = {d: float(v) for d, v in bars.groupby("date")["underlying_close"].first().items()}
@@ -144,11 +147,19 @@ def load_inputs(db_path: Path) -> Inputs:
         g = g.sort_values("strike")
         legs[(d, e, r)] = (g["strike"].to_numpy(dtype=float), g["close"].to_numpy(dtype=float))
 
+    marks = {}
+    if with_marks:                                        # every traded bar (no volume / price floor): a mark is a real close
+        traded = bars[(bars["date"] >= WINDOW_START) & (bars["expiry"] > bars["date"]) & (bars["expiry"] <= WINDOW_END)
+                      & bars["close"].notna()]
+        for (d, e, r), g in traded.groupby(["date", "expiry", "right"], sort=False):
+            g = g.sort_values("strike")
+            marks[(d, e, r)] = (g["strike"].to_numpy(dtype=float), g["close"].to_numpy(dtype=float))
+
     friction, friction_report = load_friction(db_path, bt)
     frame = ResearchData(str(db_path), SYMBOL).daily_frame()
     ranks = iv_rank_series(frame["implied_vol"])
     nyse = sessions_between(WINDOW_START - timedelta(days=10), WINDOW_END + timedelta(days=90))
-    return Inputs(surface, sessions, spot, legs, friction, friction_report, bt, tuning, frame, ranks, list(nyse))
+    return Inputs(surface, sessions, spot, legs, friction, friction_report, bt, tuning, frame, ranks, list(nyse), marks)
 
 
 # --------------------------------------------------------------------------- HAR volatility forecast (as of D-1)
@@ -537,12 +548,12 @@ def fold_train_cutoff(fold: int, nyse: list[date]) -> date:
     return nyse[max(bisect_left(nyse, FOLDS[fold][0]) - GAP_SESSIONS, 0)]
 
 
-def fold_frames(df: pd.DataFrame, feature: str, nyse: list[date]):
+def fold_frames(df: pd.DataFrame, feature: str, nyse: list[date], label: str = "pnl_1"):
     """Per test fold, with everything fitted on that fold's TRAINING rows only: the percentile-transformed feature and
     outcome residualised on the controls (for the partial correlation) and the tercile cut points of the feature.
 
     Yields (fold, test_rows_frame). The frame carries ``rf``, ``ry`` (residuals) and ``tercile`` (-1 bottom, 0, +1 top)."""
-    need = [feature, "pnl_1", *CONTROLS]
+    need = [feature, label, *CONTROLS]
     ok = df[need].replace([np.inf, -np.inf], np.nan).notna().all(axis=1)
     for fold in range(len(FOLDS)):
         cutoff = fold_train_cutoff(fold, nyse)
@@ -553,7 +564,7 @@ def fold_frames(df: pd.DataFrame, feature: str, nyse: list[date]):
         ctr_tr = np.column_stack([np.ones(len(train))] + [ecdf_transform(train[c].to_numpy(), train[c].to_numpy()) for c in CONTROLS])
         ctr_te = np.column_stack([np.ones(len(test))] + [ecdf_transform(train[c].to_numpy(), test[c].to_numpy()) for c in CONTROLS])
         res = {}
-        for name, col in (("rf", feature), ("ry", "pnl_1")):
+        for name, col in (("rf", feature), ("ry", label)):
             u_tr = ecdf_transform(train[col].to_numpy(), train[col].to_numpy())
             u_te = ecdf_transform(train[col].to_numpy(), test[col].to_numpy())
             beta, *_ = np.linalg.lstsq(ctr_tr, u_tr, rcond=None)
@@ -566,16 +577,16 @@ def fold_frames(df: pd.DataFrame, feature: str, nyse: list[date]):
 
 
 def analyse_feature(df: pd.DataFrame, feature: str, nyse: list[date], *, block_len: int, seed: int,
-                    n_boot: int | None = None) -> dict:
+                    n_boot: int | None = None, label: str = "pnl_1", label_2x: str = "pnl_2") -> dict:
     """Every statistic the decision rule needs for ONE feature in ONE bucket, on the pooled out-of-sample rows."""
     n_boot = BOOT_N if n_boot is None else n_boot
-    frames = [t for _, t in fold_frames(df, feature, nyse)]
+    frames = [t for _, t in fold_frames(df, feature, nyse, label)]
     if not frames:
         return {"feature": feature, "n_rows": 0, "tested": False}
     t = pd.concat(frames)
     t = t.sort_values("date")
     sess = pd.factorize(t["date"])[0]
-    x, y, rf, ry = (t[c].to_numpy(dtype=float) for c in (feature, "pnl_1", "rf", "ry"))
+    x, y, rf, ry = (t[c].to_numpy(dtype=float) for c in (feature, label, "rf", "ry"))
     expected_pos = feature in EXPECTED_SIGN
 
     def stats(idx: np.ndarray) -> np.ndarray:
@@ -585,12 +596,12 @@ def analyse_feature(df: pd.DataFrame, feature: str, nyse: list[date], *, block_l
     draws = block_bootstrap(stats, sess, block_len, n_boot, seed)
     direction = EXPECTED_SIGN.get(feature, 1 if rho >= 0 else -1)
     spread = {}
-    for col in ("pnl_1", "pnl_2"):
+    for col in (label, label_2x):
         top, bot = t.loc[t["tercile"] == 1, col], t.loc[t["tercile"] == -1, col]
         spread[col] = float(direction * (top.mean() - bot.mean())) if len(top) and len(bot) else float("nan")
     fold_signs = {}
     for f, g in t.groupby("fold"):
-        r = spearman(g[feature], g["pnl_1"]) if len(g) >= MIN_FOLD_ROWS else float("nan")
+        r = spearman(g[feature], g[label]) if len(g) >= MIN_FOLD_ROWS else float("nan")
         fold_signs[int(f)] = {"rho": r, "rows": int(len(g)), "same_sign": bool(r == r and np.sign(r) == direction)}
     return {
         "feature": feature, "tested": True, "n_rows": int(len(t)), "expected_positive": expected_pos, "direction": direction,
@@ -600,7 +611,7 @@ def analyse_feature(df: pd.DataFrame, feature: str, nyse: list[date], *, block_l
         "partial_ci90": [float(np.nanpercentile(draws[:, 1], 5)), float(np.nanpercentile(draws[:, 1], 95))],
         "p_partial": boot_p(draws[:, 1], expected_pos),
         "partial_same_sign": bool(partial == partial and rho == rho and np.sign(partial) == np.sign(rho)),
-        "tercile_spread_1x": spread["pnl_1"], "tercile_spread_2x": spread["pnl_2"],
+        "tercile_spread_1x": spread[label], "tercile_spread_2x": spread[label_2x],
         "folds_same_sign": int(sum(v["same_sign"] for v in fold_signs.values())), "folds": fold_signs,
         "pricing_resid_corr": spearman(t[feature], t["pricing_resid"]) if "pricing_resid" in t else float("nan"),
     }
@@ -622,6 +633,109 @@ def passes(res: dict, p_holm: float, blocked_by: str | None) -> tuple[bool, list
     if res["folds_same_sign"] < MIN_FOLDS_SAME_SIGN:
         fails.append(f"criterion 4: sign holds in {res['folds_same_sign']} of {len(FOLDS)} folds")
     return not fails, fails
+
+
+# --------------------------------------------------------------------------- exploratory: 50% take-profit exit
+
+TP_FRACTION = 0.5          # EXPLORATORY (not in the registered rule): close when the condor can be bought back for this share of the credit
+TP_NOTE = ("EXPLORATORY and post-hoc, not part of the registered rule and not a verdict: the same entries scored as if closed "
+           "at 50% of the credit, on the first later session on which all four legs have a traded bar and the condor's mark "
+           "is at or below that level. Sessions with a leg missing are skipped and counted, nothing is modelled; a leg that "
+           "did not trade is simply unpriced, so a profit target can be missed (the hit rate is a lower bound).")
+
+
+def _leg_close(marks: dict, t: date, expiry: date, right: str, strike: float) -> float | None:
+    arr = marks.get((t, expiry, right))
+    if arr is None:
+        return None
+    k, c = arr
+    i = int(np.searchsorted(k, strike))
+    return float(c[i]) if i < len(k) and k[i] == strike else None
+
+
+def attach_tp_exit(panel: pd.DataFrame, inp: Inputs) -> pd.DataFrame:
+    """Adds ``tp_hit``, ``tp_exit`` (date), ``tp_days_evaluable``, ``pnl_tp_1`` and ``pnl_tp_2`` (every friction term
+    doubled). A row that never reaches the target keeps its hold-to-expiry result. Needs ``inp.marks`` (``with_marks``)."""
+    bt, idx = inp.bt, {d: i for i, d in enumerate(inp.sessions)}
+    comm = 4 * bt.commission_per_contract / 100.0
+    hit, when, n_eval, p1, p2 = [], [], [], [], []
+    for r in panel.itertuples(index=False):
+        h, day, n = False, None, 0
+        a, b = r.pnl_1, r.pnl_2
+        if r.date in idx and r.expiry in idx:
+            for t in inp.sessions[idx[r.date] + 1:idx[r.expiry]]:      # sessions strictly between entry and expiry
+                q = (_leg_close(inp.marks, t, r.expiry, "P", r.p_short), _leg_close(inp.marks, t, r.expiry, "P", r.p_long),
+                     _leg_close(inp.marks, t, r.expiry, "C", r.c_short), _leg_close(inp.marks, t, r.expiry, "C", r.c_long))
+                if any(v is None for v in q):
+                    continue
+                n += 1
+                mark = (q[0] - q[1]) + (q[2] - q[3])
+                if mark <= TP_FRACTION * r.credit:
+                    dte_t = (r.expiry - t).days
+                    exit_cost = sum(inp.friction.half_spread_usd(v, dte_t)[0] for v in q) * bt.friction_exit_capture + comm
+                    base = r.entry_spread + r.entry_comm
+                    a = (r.credit - (base + exit_cost) - mark) / r.risk
+                    b = (r.credit - STRESS * (base + exit_cost) - mark) / r.risk
+                    h, day = True, t
+                    break
+        hit.append(h)
+        when.append(day)
+        n_eval.append(n)
+        p1.append(a)
+        p2.append(b)
+    out = panel.copy()
+    out["tp_hit"], out["tp_exit"], out["tp_days_evaluable"] = hit, when, n_eval
+    out["pnl_tp_1"], out["pnl_tp_2"] = p1, p2
+    return out
+
+
+def tp_exploratory(panel: pd.DataFrame, inp: Inputs) -> dict:
+    """Per bucket, on the out-of-sample rows: how often the target is reached, what the managed result is against
+    holding, and the same three features' correlations with the managed result (descriptive: no p-value is a verdict)."""
+    out: dict = {"note": TP_NOTE, "tp_fraction": TP_FRACTION, "buckets": {}}
+    for b in BUCKETS:
+        rows = panel[panel["bucket"] == b]
+        t = rows[rows["fold"].notna()]
+        e: dict = {"test_rows": int(len(t))}
+        if len(t):
+            e.update({
+                "tp_hit_rate": round(float(t["tp_hit"].mean()), 3),
+                "rows_with_no_priced_session": round(float((t["tp_days_evaluable"] == 0).mean()), 3),
+                "mean_priced_sessions_per_row": round(float(t["tp_days_evaluable"].mean()), 2),
+                "mean_pnl_per_risk_hold_1x": round(float(t["pnl_1"].mean()), 4),
+                "mean_pnl_per_risk_managed_1x": round(float(t["pnl_tp_1"].mean()), 4),
+                "mean_pnl_per_risk_managed_2x": round(float(t["pnl_tp_2"].mean()), 4)})
+            blk = int(t["hold_sessions"].max())
+            e["features"] = {}
+            for f in PRIMARY:
+                r = analyse_feature(rows, f, inp.nyse, block_len=blk, seed=BOOT_SEED, label="pnl_tp_1", label_2x="pnl_tp_2")
+                e["features"][f] = ({k: r[k] for k in ("rho", "rho_ci90", "p_raw", "partial_rho", "p_partial",
+                                                       "tercile_spread_1x", "tercile_spread_2x", "folds_same_sign")}
+                                    if r.get("tested") else {"tested": False})
+        out["buckets"][b] = e
+    return out
+
+
+def render_tp_markdown(rep: dict) -> str:
+    L = ["# W118 exploratory: 50% take-profit exit", "", rep["note"], ""]
+    for b, e in rep["buckets"].items():
+        L += [f"## Bucket {b} (target DTE {BUCKETS[b][0]}-{BUCKETS[b][1]})", ""]
+        if not e["test_rows"]:
+            L += ["no test rows", ""]
+            continue
+        L += [f"test rows {e['test_rows']}; target reached {e['tp_hit_rate']:.1%}; rows with no priced session "
+              f"{e['rows_with_no_priced_session']:.1%}; priced sessions per row {e['mean_priced_sessions_per_row']}",
+              f"mean result per unit of risk: hold {e['mean_pnl_per_risk_hold_1x']:+.4f}, managed {e['mean_pnl_per_risk_managed_1x']:+.4f} "
+              f"(2x friction {e['mean_pnl_per_risk_managed_2x']:+.4f})", "",
+              "| feature | rho (managed) | 90% interval | partial rho | spread 1x | spread 2x | folds same sign |", "|---|---|---|---|---|---|---|"]
+        for f, r in e["features"].items():
+            if r.get("tested") is False:
+                L.append(f"| {f} | not tested | | | | | |")
+            else:
+                L.append(f"| {f} | {r['rho']:+.3f} | [{r['rho_ci90'][0]:+.3f}, {r['rho_ci90'][1]:+.3f}] | {r['partial_rho']:+.3f} | "
+                         f"{r['tercile_spread_1x']:+.3f} | {r['tercile_spread_2x']:+.3f} | {r['folds_same_sign']}/{len(FOLDS)} |")
+        L.append("")
+    return "\n".join(L)
 
 
 # --------------------------------------------------------------------------- guards: as-of mutation, canaries
@@ -805,9 +919,16 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--smoke", action="store_true",
                       help="the whole pipeline with each bucket's outcomes SHUFFLED across rows: exercises every code path "
                            "without revealing any real feature-outcome relationship; writes to <out>_SMOKE, verdicts meaningless")
+    mode.add_argument("--exploratory-tp", action="store_true",
+                      help="EXPLORATORY, post-hoc, not part of the registered rule: the same panel scored with a 50%%-of-credit "
+                           "take-profit on real-bar marks (days with a leg missing are skipped, nothing is modelled); writes to "
+                           "<out>_exploratory and never touches the registered results")
     mode.add_argument("--run", action="store_true",
                       help="THE pre-registered run (commit the script and studies/surface_feature_study.yaml first)")
     ap.add_argument("--db", default=str(ROOT / "data" / "historical.db"))
+    ap.add_argument("--cut-surface-at-window-end", action="store_true",
+                    help="build the surface only from expiries on or before the window end (off by default; the registered "
+                         "run did not use it). A study that wants a frozen, fully reproducible surface turns it on and says so.")
     ap.add_argument("--out", default=str(OUT_BASE))
     args = ap.parse_args(argv)
 
@@ -823,7 +944,7 @@ def main(argv: list[str] | None = None) -> int:
         max_event_gap_days=RESEARCH_MAX_EVENT_GAP_DAYS, friction_per_leg=True, friction_bands=True, surface=True),
         context="surface_feature_study")
 
-    inp = load_inputs(db)
+    inp = load_inputs(db, cut_surface=args.cut_surface_at_window_end, with_marks=args.exploratory_tp)
     assert inp.friction.default is not None and inp.friction.bands, "per-leg friction model / bands did NOT load"
     panel, miss, per_target = build_entries(inp)
     out = Path(args.out)
@@ -836,6 +957,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     panel, lost = attach_outcomes(panel, inp)
+    if args.exploratory_tp:
+        panel = attach_tp_exit(panel, inp)
+        rep = tp_exploratory(panel, inp)
+        out = out.with_name(out.name + "_exploratory")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "tp_exit.json").write_text(json.dumps(rep, indent=2, default=str))
+        md = render_tp_markdown(rep)
+        (out / "tp_exit.md").write_text(md)
+        print(md)
+        print(f"wrote {out / 'tp_exit.json'} and {out / 'tp_exit.md'}")
+        return 0
     if args.smoke:
         out = out.with_name(out.name + "_SMOKE")
         rng = np.random.default_rng(BOOT_SEED)

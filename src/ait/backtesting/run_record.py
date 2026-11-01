@@ -41,7 +41,7 @@ SCHEMA = "ait.run_record/1"
 _DATE_COLUMNS: dict[str, str | None] = {
     "daily_prices": "date", "daily_iv": "date", "econ_schedule": "event_date", "dividends": "ex_date",
     "earnings_schedule": "event_session", "qqq_holdings": "filed_date", "econ_events": "event_date",
-    "official_econ_calendar": "event_date",
+    "official_econ_calendar": "event_date", "option_daily_bars": "date",
     "option_leg_spread_params": None, "option_leg_spread_band_params": None,
 }
 
@@ -103,7 +103,11 @@ def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str],
     read-only connection. Missing tables are reported, not raised.
 
     W91: `as_of` (backtest.history_end_date) restricts the close series to dates <= as_of, so a study that
-    pinned its end date keeps a stable hash while the shared tables grow; it is recorded in the output."""
+    pinned its end date keeps a stable hash while the shared tables grow; it is recorded in the output.
+
+    W118: ``option_daily_bars`` is fingerprinted too (whole table: rows and date span; and per symbol: rows, newest
+    bar date, and rows dated <= ``as_of``). A backfill that lands while a study reads (it adds expiries after the
+    window end, whose bars are dated inside it) changes these numbers, so the record shows which state was read."""
     db = Path(db_path)
     out: dict[str, Any] = {"db": str(db), "tables": {}, "closes": {}}
     if as_of is not None:
@@ -135,6 +139,21 @@ def data_fingerprint(db_path: str | Path, table_prefix: str, symbols: list[str],
                 rows = []
             h = hashlib.sha256("\n".join(f"{d}|{c}" for d, c in rows).encode()).hexdigest()
             out["closes"][sym] = {"rows": len(rows), "sha256": h}
+        bars: dict[str, Any] = {}
+        for sym in symbols:
+            try:
+                n, last = con.execute(f"SELECT COUNT(*), MAX(date) FROM {table_prefix}option_daily_bars WHERE underlying=?",
+                                      (sym,)).fetchone()
+                entry: dict[str, Any] = {"rows": n, "last": last}
+                if as_of is not None:
+                    entry["rows_to_as_of"] = con.execute(
+                        f"SELECT COUNT(*) FROM {table_prefix}option_daily_bars WHERE underlying=? AND date <= ?",
+                        (sym, str(as_of))).fetchone()[0]
+            except sqlite3.Error:
+                continue                                  # no option-bar table in this store: nothing to fingerprint
+            bars[sym] = entry
+        if bars:
+            out["option_bars"] = bars
     finally:
         con.close()
     return out

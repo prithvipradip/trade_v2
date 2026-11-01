@@ -43,6 +43,7 @@ The register of what research studies and measurements have shown, and whether e
 | F-006 | Order acknowledgement and fill times (entries) | migrated, unreviewed | no |
 | F-007 | Range-model confidence floor 0.65 versus 0.55 | migrated, unreviewed | no |
 | F-008 | IV-surface features versus the hold-to-expiry result of a QQQ iron condor, by DTE bucket | pre-registered | yes |
+| F-009 | The F-008 condors scored with a 50%-of-credit take-profit (exploratory) | exploratory | no |
 
 ## Study results
 
@@ -69,6 +70,24 @@ The register of what research studies and measurements have shown, and whether e
   `vrp_h` is one-sided (pre-stated direction positive), the others two-sided. Mean result per unit of risk at 1x friction: A -0.084, B -0.003, C +0.048. Wiring checks all passed (as-of mutation check; leaked canary significant in A and B; shuffled canary 3 of 20 in each; data-defect share 3.0% / 2.1% / 3.1%).
 - Caveats: About 18 months of test sessions, one underlying, one regime. Rows of adjacent sessions overlap (hence the block bootstrap, and `n_eff` counted in distinct sessions); bucket C is below the floor of 30 independent observations, so its figures, including the `term_slope` interval that excludes zero, are descriptive and are not a finding. Bucket A friction is extrapolated for 86.7% of entries. Settlement is intrinsic, with no assignment or pin modelling. The 0.35 wing, the 0.03 smile-fit limit and the 25% void limits are chosen values. The option-bar backfill was writing during the run: it did not change any entry or outcome, and an exploratory re-computation with the surface cut at the window end moved no verdict and no figure by more than 0.02 in rho (bucket C `term_slope` -0.211 against -0.205). A near miss, not a pass: `vrp_h` at 1-2 DTE has the expected sign in every fold, but the partial correlation controlling for IV rank and ATM IV level is +0.045.
 - Fed decision: none (a rerun of the same rule is registered for when bucket C reaches `n_eff` 30)      Superseded by: -
+
+### F-009  The F-008 condors scored with a 50%-of-credit take-profit (exploratory)
+- Status: exploratory        Citable: no
+- Question: Do the F-008 conclusions change if each condor is closed early once it can be bought back for half its credit, instead of held to expiry?
+- Rule: exploratory (written and run after F-008; it is not part of the F-008 rule and cannot change its verdicts)
+- Study file / script: scripts/surface_feature_study.py --exploratory-tp (no study file, no run record)
+- Run record: none   Commit: the W118 follow-up entry in PLAN.md   Data span: as F-008 (test rows 2025-04-01 to 2026-10-20)   Epoch: as F-008, with the QQQ option-bar backfill still running
+- Result: the same entries as F-008, closed on the first later session on which all four legs have a traded bar and the condor's mark is at or below 50% of the credit, otherwise held to expiry; exit friction and commissions charged at that session. Marks are real bar closes; a session with a leg missing is skipped and nothing is modelled. Test rows:
+
+  | bucket | target reached | rows with no priced session | mean result per unit of risk, hold | managed, 1x friction | managed, 2x friction |
+  |---|---|---|---|---|---|
+  | A (1-2 DTE) | 6.9% | 62.9% | -0.084 | -0.071 | -0.127 |
+  | B (3-10 DTE) | 58.8% | 0.0% | -0.003 | -0.0004 | -0.034 |
+  | C (14-30 DTE) | 74.4% | 0.1% | +0.048 | +0.022 | -0.0004 |
+
+  Spearman rho of each F-008 feature with the managed result (90% block-bootstrap interval): A `vrp_h` +0.084 [+0.008, +0.159], `term_slope` +0.031, `rr25_norm` -0.085 [-0.162, -0.008]; B `vrp_h` -0.068, `term_slope` -0.026, `rr25_norm` +0.004 (every interval spans zero); C `vrp_h` -0.033, `term_slope` -0.101 [-0.203, -0.010], `rr25_norm` -0.072. Bucket C `term_slope` is -0.205 with hold-to-expiry (F-008).
+- Caveats: Exploratory and post-hoc, chosen after the F-008 result was known, with no multiplicity control; not a finding. A leg that did not trade is unpriced, so the target can be missed (the reached rate is a lower bound), and for 1-2 DTE there is at most one session between entry and expiry, which is why most bucket A rows have no priced session and the managed result there is mostly the hold result. Taking profit at 50% lowers the mean result in bucket C in this sample. Bucket C remains below the floor of 30 independent observations (F-008), so its figures are descriptive.
+- Fed decision: none      Superseded by: -
 
 ## Migrated, not yet reviewed
 

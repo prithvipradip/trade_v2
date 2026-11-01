@@ -61,19 +61,36 @@ def _no_earnings(*_a, **_k) -> set:
 
 def run(config=None, data=None):
     """Run the REAL ``WalkForwardBacktester.run`` on the fixture, offline: the VIX / SPY context loader returns an empty
-    frame and the engine's earnings-date lookup (a yfinance request; ETFs have none) an empty set. Both restored after."""
+    frame and the engine's earnings-date lookup (a yfinance request; ETFs have none) an empty set. Both restored after.
+
+    The run happens in a TEMPORARY working directory holding only a copy of the two config files. The store paths are
+    relative (``data/historical.db``) and the fixture's symbols are called SPY and QQQ, so on a box that has the real
+    store the engine would read real stored IV, calendars and bars for them and the record could never match (it
+    matched on a clean checkout, which has no ``data/``). The golden itself is unchanged."""
+    import os
+    import shutil
+    import tempfile
+
     import ait.data.market_data as md
     from ait.backtesting.engine import Backtester
     from ait.backtesting.walkforward import WalkForwardBacktester
+    repo = Path(__file__).resolve().parents[2]
     saved_loader, saved_earnings = md.load_daily_ohlcv, Backtester.__dict__["_load_earnings_dates"]
     md.load_daily_ohlcv = _empty_context
     Backtester._load_earnings_dates = staticmethod(_no_earnings)
-    try:
-        bt = WalkForwardBacktester(list(SYMBOLS), ["iron_condor"], config=config or make_config())
-        return asyncio.run(bt.run(data=data if data is not None else make_data()))
-    finally:
-        md.load_daily_ohlcv = saved_loader
-        Backtester._load_earnings_dates = saved_earnings
+    saved_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory(prefix="w108s1_") as tmp:
+        for name in ("config.yaml", "config_research.yaml"):
+            if (repo / name).is_file():
+                shutil.copy(repo / name, Path(tmp) / name)
+        os.chdir(tmp)
+        try:
+            bt = WalkForwardBacktester(list(SYMBOLS), ["iron_condor"], config=config or make_config())
+            return asyncio.run(bt.run(data=data if data is not None else make_data()))
+        finally:
+            os.chdir(saved_cwd)
+            md.load_daily_ohlcv = saved_loader
+            Backtester._load_earnings_dates = saved_earnings
 
 
 _TRADE_KEYS = ("symbol", "strategy", "entry_date", "exit_date", "exit_reason", "contracts", "pnl", "max_loss",

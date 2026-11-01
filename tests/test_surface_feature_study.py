@@ -398,3 +398,176 @@ def test_asof_mutation_check_passes_for_the_real_feature_code_and_catches_a_leak
 
     monkeypatch.setattr(sf, "compute_features", leaky_smile)
     assert not sf.asof_mutation_check(inp, panel, n_samples=1)["ok"]
+
+
+# --------------------------------------------------------------------------- shared-code fixes found by the first run
+
+def test_surface_cache_stamp_describes_what_was_loaded_when_rows_land_between_the_count_and_the_load(tmp_path, monkeypatch):
+    """A backfill that appends rows after ``build_or_load`` counted but before it loads must not leave a cache stamped
+    older than its content: the stamp is taken from the loaded bars, and the very next call is a cache hit."""
+    import json
+    import sqlite3
+    from ait.backtesting import iv_surface as ivs
+    from tests.test_w75_iv_surface import DATES, _write_db, make_bars
+
+    bars = make_bars(DATES)
+    db, cache = _write_db(tmp_path / "h.db", bars), tmp_path / "cache"
+    real_load = ivs.load_bars
+
+    def a_backfill_lands_first(*a, **k):
+        c = sqlite3.connect(db)
+        c.execute("INSERT INTO option_daily_bars (underlying, expiry, right, strike, date, dte, close, volume,"
+                  " underlying_close, iv, iv_outcome, risk_free_rate) VALUES "
+                  "('QQQ','2025-03-20','P',490,'2025-03-10',10,0.5,100,500,0.2,'solved',0.05)")
+        c.commit()
+        c.close()
+        return real_load(*a, **k)
+
+    monkeypatch.setattr(ivs, "load_bars", a_backfill_lands_first)
+    ivs.build_or_load(db, "QQQ", cache)
+    stamp = json.loads((cache / "iv_surface_QQQ.json").read_text())
+    with sqlite3.connect(db) as c:
+        n, last = c.execute("SELECT COUNT(*), MAX(date) FROM option_daily_bars WHERE underlying='QQQ'").fetchone()
+    assert stamp["rows"] == n == len(bars) + 1 and stamp["max_date"] == last
+
+    def must_not_reload(*a, **k):
+        raise AssertionError("rebuilt although the cache matches the table")
+    monkeypatch.setattr(ivs, "load_bars", must_not_reload)
+    ivs.build_or_load(db, "QQQ", cache)
+
+
+def test_run_record_fingerprints_the_option_bars_and_a_landing_backfill_changes_it(tmp_path):
+    import sqlite3
+    from ait.backtesting import run_record as rr
+
+    db = tmp_path / "h.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE option_daily_bars (underlying TEXT, option_ticker TEXT, date TEXT)")
+    rows = [("QQQ", "a", "2026-10-19"), ("QQQ", "b", "2026-10-19"), ("QQQ", "c", "2026-10-20"),
+            ("QQQ", "d", "2026-10-21"), ("SPY", "e", "2026-10-19")]
+    con.executemany("INSERT INTO option_daily_bars VALUES (?,?,?)", rows)
+    con.commit()
+    con.close()
+    before = db.stat().st_mtime_ns
+    fp = rr.data_fingerprint(db, "", ["QQQ", "SPY"], as_of="2026-10-20")
+    assert db.stat().st_mtime_ns == before                                          # read-only
+    assert fp["tables"]["option_daily_bars"] == {"rows": 5, "first": "2026-10-19", "last": "2026-10-21"}
+    assert fp["option_bars"]["QQQ"] == {"rows": 4, "last": "2026-10-21", "rows_to_as_of": 3}
+    assert fp["option_bars"]["SPY"] == {"rows": 1, "last": "2026-10-19", "rows_to_as_of": 1}
+    con = sqlite3.connect(db)                                                       # a backfill adds a late expiry's bars
+    con.execute("INSERT INTO option_daily_bars VALUES ('QQQ','f','2026-10-20')")    # dated inside the window
+    con.commit()
+    con.close()
+    after = rr.data_fingerprint(db, "", ["QQQ", "SPY"], as_of="2026-10-20")
+    assert after["option_bars"]["QQQ"]["rows_to_as_of"] == 4 and after != fp
+    assert "option_bars" not in rr.data_fingerprint(tmp_path / "missing.db", "", ["QQQ"])      # no store: nothing to report
+    other = tmp_path / "o.db"
+    sqlite3.connect(other).close()
+    assert "option_bars" not in rr.data_fingerprint(other, "", ["QQQ"])                        # no option table: key absent
+
+
+# --------------------------------------------------------------------------- opt-in surface cut and the exploratory exit
+
+def test_cut_expiries_keeps_only_smiles_up_to_the_end_and_changes_nothing_inside():
+    from ait.backtesting.iv_surface import IVSurface
+    from tests.test_w75_iv_surface import DATES, S0, make_bars
+
+    surf = IVSurface.from_bars(make_bars(DATES))
+    d, last = DATES[0], DATES[0] + timedelta(days=5)
+    cut = surf.cut_expiries(last)
+    assert cut.expiries(d) == [e for e in surf.expiries(d) if e <= last] and len(cut) < len(surf)
+    inside = d + timedelta(days=3)
+    assert cut.iv(d, inside, 505.0, S0) == surf.iv(d, inside, 505.0, S0)
+    late = d + timedelta(days=9)                                         # past the cut: no own smile, flat from the last kept expiry
+    assert cut.iv(d, late, 505.0, S0) != surf.iv(d, late, 505.0, S0)
+    everything = surf.cut_expiries(d + timedelta(days=400))
+    assert len(everything) == len(surf) and everything.iv(d, late, 505.0, S0) == surf.iv(d, late, 505.0, S0)
+
+
+def _tp_inputs(marks):
+    return SimpleNamespace(
+        sessions=[date(2025, 5, 1), date(2025, 5, 2), date(2025, 5, 5), date(2025, 5, 6), date(2025, 5, 7)],
+        marks=marks, friction=_Frame(0.01),
+        bt=SimpleNamespace(commission_per_contract=0.65, friction_exit_capture=1.0))
+
+
+def _tp_marks(by_day):
+    """{day: (short put, long put, short call, long call)} -> the dict the exit reads (put strikes 95/90, call 105/110)."""
+    out = {}
+    for day, q in by_day.items():
+        if q[0] is not None:
+            out[(day, date(2025, 5, 7), "P")] = (np.array([90.0, 95.0]), np.array([q[1], q[0]]))
+            out[(day, date(2025, 5, 7), "C")] = (np.array([105.0, 110.0]), np.array([q[2], q[3]]))
+    return out
+
+
+def _tp_panel(pnl_1=0.123):
+    return pd.DataFrame([dict(date=date(2025, 5, 1), expiry=date(2025, 5, 7), p_short=95.0, p_long=90.0, c_short=105.0,
+                              c_long=110.0, credit=1.00, risk=4.00, entry_spread=0.04, entry_comm=0.026,
+                              pnl_1=pnl_1, pnl_2=pnl_1 - 0.05)])
+
+
+D2, D5, D6 = date(2025, 5, 2), date(2025, 5, 5), date(2025, 5, 6)
+EXIT_COSTS = 0.04 + 0.026                                                 # four legs at 0.01, four commissions of 0.0065
+
+
+def test_take_profit_exits_on_the_first_priced_session_at_or_below_half_the_credit():
+    marks = _tp_marks({D2: (0.60, 0.10, 0.55, 0.10),                      # mark 0.95: not yet
+                       D5: (0.35, 0.05, 0.30, 0.05),                      # mark 0.55: not yet ... then
+                       D6: (0.20, 0.05, 0.15, 0.05)})                     # mark 0.25: first at or below 0.50
+    out = sf.attach_tp_exit(_tp_panel(), _tp_inputs(marks)).iloc[0]
+    assert out["tp_hit"] and out["tp_exit"] == D6 and out["tp_days_evaluable"] == 3
+    assert out["pnl_tp_1"] == pytest.approx((1.00 - (0.066 + EXIT_COSTS) - 0.25) / 4.00)
+    assert out["pnl_tp_2"] == pytest.approx((1.00 - 2 * (0.066 + EXIT_COSTS) - 0.25) / 4.00)
+
+
+def test_take_profit_boundary_is_inclusive_and_later_sessions_are_ignored_once_hit():
+    marks = _tp_marks({D2: (0.75, 0.50, 0.75, 0.50),                      # mark exactly 0.50 = half the credit: a hit
+                       D5: (0.05, 0.01, 0.05, 0.01)})                     # even better, but after the exit
+    out = sf.attach_tp_exit(_tp_panel(), _tp_inputs(marks)).iloc[0]
+    assert out["tp_hit"] and out["tp_exit"] == D2 and out["tp_days_evaluable"] == 1
+    assert out["pnl_tp_1"] == pytest.approx((1.00 - (0.066 + EXIT_COSTS) - 0.50) / 4.00)
+
+
+def test_take_profit_skips_sessions_with_a_leg_missing_and_counts_only_the_priced_ones():
+    marks = _tp_marks({D2: (0.60, 0.10, 0.55, 0.10), D5: (0.20, 0.05, 0.15, 0.05), D6: (0.20, 0.05, 0.15, 0.05)})
+    del marks[(D5, date(2025, 5, 7), "C")]                                # the 5th: no call bars traded: unpriced, skipped
+    out = sf.attach_tp_exit(_tp_panel(), _tp_inputs(marks)).iloc[0]
+    assert out["tp_hit"] and out["tp_exit"] == D6 and out["tp_days_evaluable"] == 2          # D2 and D6 were priced
+
+
+def test_a_row_that_never_reaches_the_target_keeps_its_hold_to_expiry_result():
+    marks = _tp_marks({D2: (0.60, 0.10, 0.55, 0.10), D5: (0.55, 0.10, 0.50, 0.10)})        # marks 0.95 and 0.85
+    out = sf.attach_tp_exit(_tp_panel(0.123), _tp_inputs(marks)).iloc[0]
+    assert not out["tp_hit"] and out["tp_exit"] is None and out["tp_days_evaluable"] == 2
+    assert out["pnl_tp_1"] == 0.123 and out["pnl_tp_2"] == pytest.approx(0.073)
+    none = sf.attach_tp_exit(_tp_panel(0.5), _tp_inputs({})).iloc[0]                         # no priced session at all
+    assert not none["tp_hit"] and none["tp_days_evaluable"] == 0 and none["pnl_tp_1"] == 0.5
+
+
+def test_a_different_label_changes_the_statistics_but_the_default_is_the_registered_one():
+    df = _panel_for_folds(signal=0.5, n_per_day=2)
+    kw = dict(block_len=5, seed=3, n_boot=150)
+    a = sf.analyse_feature(df, "vrp_h", NYSE, **kw)
+    b = sf.analyse_feature(df, "vrp_h", NYSE, label="pnl_1", label_2x="pnl_2", **kw)
+    for k in ("rho", "rho_ci90", "p_raw", "partial_rho", "tercile_spread_1x", "tercile_spread_2x", "folds_same_sign"):
+        assert a[k] == b[k], k
+    df["other"] = -df["pnl_1"]
+    c = sf.analyse_feature(df, "vrp_h", NYSE, label="other", label_2x="other", **kw)
+    assert c["rho"] == pytest.approx(-a["rho"])
+
+
+def test_exploratory_report_is_labelled_and_statistics_only():
+    df = _panel_for_folds(signal=0.5, n_per_day=1, hold=5, bucket="B")
+    df["pnl_tp_1"], df["pnl_tp_2"] = df["pnl_1"] + 0.1, df["pnl_2"] + 0.1
+    df["tp_hit"], df["tp_days_evaluable"] = df["pnl_1"] > 0, 3
+    old = sf.BOOT_N
+    try:
+        sf.BOOT_N = 150
+        rep = sf.tp_exploratory(df, SimpleNamespace(nyse=NYSE))
+    finally:
+        sf.BOOT_N = old
+    assert rep["buckets"]["A"]["test_rows"] == 0 and rep["buckets"]["B"]["test_rows"] > 0
+    assert 0 < rep["buckets"]["B"]["tp_hit_rate"] < 1 and set(rep["buckets"]["B"]["features"]) == set(sf.PRIMARY)
+    md = sf.render_tp_markdown(rep)
+    assert "EXPLORATORY" in md and "not part of the registered rule" in md and "credit" not in md.replace("of the credit", "")
