@@ -19660,3 +19660,74 @@ Written before the first edit. Items from the 2026-10-25 register "STILL OPEN" l
 ## 2026-10-31 - NOTE for @prithvipradip: what changed on `prithvi/w106-w108` after the PR was opened (appended at the operator's request)
 
 The six commits `b36510b`..`40a6aee` sit on top of your `ce4c43b`; the entry above has the detail. What needs your eyes: (1) W106 item 1 (deleting the four unread settings) is reverted by the operator's decision; the earlier W106 AS BUILT entry still describes the deletion, and the entry above supersedes it. (2) Two of your tests changed because the behaviour they pinned changed: the W106 "a bar without an underlying close counts as empty" test (the contract is now asked again) and the W108 4b "snap overshoot is refused" test (the 6-wide wing is now built; a second test keeps the refusal for a grid where no listed wing fits). (3) The only section 3 files touched are `execution/executor.py` (two leg-shape table entries) and `config.yaml` (your two inert `strategy_risk` rows). Please confirm or push back on (1) and (2) before the merge.
+
+
+---
+
+## 2026-11-02 - W119 AS PLANNED (pre-registration, written BEFORE the harness exists or any run): does an earlier condor exit beat the touch stop? `condor_defense` CLOSE at 0.40 delta against touch-only, with one distance rule as a secondary arm; this entry on `prithvi/w106-w108`; the harness on its own branch off `main`; the run on the Mac (the data)
+
+**Why.** Prithvi asked after the latest live losses: we could see the underlying moving toward the short strike, so why did the bot not exit earlier? It saw the moves; no exit rule acts before the touch. Live today exits a condor only at take-profit (about 40%) or `short_strike_touch`; `credit_loss_limit` is 0 (R6 / R12-B1: every flat level underperformed touch-close), and `condor_defense.enabled` is false (W107 decision brief item 1: "No backtest of the layer exists; the 0.40-delta CLOSE fires before the touch stop and wants a harness sweep before it is enabled"). This wave is that sweep.
+
+**The live evidence so far (Windows box, account DUN603821, closes since 2026-08-01; spot from `intraday_prices`, 5-minute bars).** 14 closes, 9 wins, +$856.77. Exploratory only: it motivates the question and decides nothing.
+
+| Entry | Symbol | P&L | Credit -> exit debit | Spot path | Trading days within 1% of a short strike before the touch |
+|---|---|---|---|---|---|
+| 08-17 | QQQ | -$272.29 | 6.12 -> 8.76 | -1.4% on day 2, then a 4-day drift down | 2 (0.64%, 0.74%) |
+| 09-17 | QQQ | -$503.32 | 4.99 -> 9.94 | a weekend gap up of 1.0%, then a rally through the short call on 09-21 | 0 (no rule short of the touch had time) |
+| 10-09 | QQQ | -$533.98 | 8.00 -> 13.29 | a 4-day slide, a gap down to 0.20% from the short put on 10-15, a bounce, the touch on 10-16 | 1 |
+| 10-19 | IWM | -$87.26 | 1.94 -> 2.74 | a week-long grind up | 3 (0.44% to 0.98%) |
+
+- The touch stop bought each condor back at 1.4 to 2.0x the credit, a loss of 0.4 to 1.0x the credit. The defined maximum (`capital_at_risk`) was $1,206 to $5,700 a condor.
+- 3 of the 10 winners also came within 1% of a short strike. QQQ entered 09-28 came within **0.02%** and closed **+$201.72**; any close-to-the-strike rule would have turned it into a loss.
+- Realized volatility rose on the same days spot moved toward the strike (25% annualized on 08-18, 30% on 10-15, from 5-minute bars), so it added little beyond the distance itself. The highest readings were on the touch days (49% on 08-24, 34% on 09-21). No volatility trigger is registered here. These figures exclude overnight gaps and the last half hour of most sessions (the stored bars lack it).
+- What an early exit would have COST at those moments is unknown: the Windows store has no option marks for them. That is the number this study supplies.
+
+**Question.** On the research engine, with the live condor rules and the stored option bars, does closing a condor when its tested short leg reaches |delta| >= 0.40 (`condor_defense` CLOSE) make more money than holding to the touch stop, once the winners it cuts are counted?
+
+**Arms.** Entries, sizing, take-profit, friction and the touch stop are identical in every arm; the touch stop stays on as the backstop in B and C.
+- **A, control (live today):** touch stop only; `condor_defense` off.
+- **B, primary:** `condor_defense.enabled` with the shipped `close_delta_threshold: 0.40` and `side` as shipped. The engine calls the live `ait.execution.condor_defense.evaluate_condor_defense` (no second implementation), giving it the engine's own per-leg marks for that step as `option_marks`. Only a CLOSE verdict acts; a ROLL verdict is a hold (roll fills have never been exercised, W107 item 1). The exit is priced and costed like any other engine exit.
+- **C, secondary (exploratory, decides nothing):** close when spot is within 0.5% of either short strike. One registered value, no sweep.
+- **Not registered:** other delta thresholds (0.35, 0.45) and other distances. Any run of them is labelled exploratory in the RESULTS entry and cannot change the decision.
+
+**Data and engine (the defaults on `main` as of `3130006`).**
+- QQQ, `iron_condor` only, `backtest.pricing_source: surface`, `history_start_date: 2024-10-01` (W117 E).
+- Walk-forward 126 / 63 / 63 / gap 5, window pinned to the last session with complete option bars (W117 follow-up). The W116 preflight must pass, or the study does not start.
+- The fitted per-leg friction from the Mac's configuration; the exit-ladder parity (W101) as on `main`.
+- SPY and IWM are added only if their surface coverage passes the preflight. The SPY option backfill on the Windows box is at 14% (22,479 of 158,926 contracts) and will not get there soon.
+- The exit-check step (daily and/or the W74 intraday scan) is the engine's existing one, used unchanged in every arm; the AS BUILT entry states which it is.
+
+**Pairing.** An earlier exit frees a slot, so later entries can differ between arms. Trades are paired across arms by (symbol, entry session, short strikes, expiry); the unpaired trades of each arm are reported separately with their P&L.
+
+**Primary statistic.** Per paired trade, `pnl_B - pnl_A`. The mean of that difference, with a 90% confidence interval from a bootstrap that resamples whole walk-forward windows (10,000 resamples, fixed seed recorded in the run record).
+
+**Decision rule (fixed now).**
+- **B HELPS** if paired trades >= 30, the CI's lower bound is > 0, and B's total dollar P&L over all its trades (W108 S1 dollar path) is >= A's.
+- **B HURTS** if paired trades >= 30 and the CI's upper bound is < 0.
+- **INSUFFICIENT** otherwise, including fewer than 30 paired trades. W118 bucket C (14-30 DTE, QQQ, same history) was INSUFFICIENT, so this outcome is likely; it is recorded as is, and the threshold is not lowered after the fact.
+- No outcome switches anything on. HELPS is evidence for the W107 item 1 decision. Enabling stays the operators' call, and it waits for the end of the W110 paper epoch, so live exits do not change mid-epoch.
+
+**Reported with the result (descriptive).**
+- For each arm: trades, win rate, profit factor, total and worst-trade P&L, max drawdown.
+- For B and C: the count of early exits; the winners cut (A won, the arm exited at a loss) and the dollars they gave up; the losers saved (A lost, the arm lost less) and the dollars saved; the average debit of an early exit against the touch exit of the same trade.
+- The count of B CLOSE verdicts that the touch stop would have pre-empted on the same step.
+
+**Wiring checks (pre-registered; any failure makes the run VOID, as W109's did).**
+1. With the new flags off, the engine reproduces the trade list of the current default walk-forward exactly (a golden record; the harness off is byte-identical).
+2. Arm B records at least one CLOSE. Every B early exit of a paired trade is on or before A's exit of that trade.
+3. For each B CLOSE, the delta passed to the decision recomputes from the logged leg marks and spot to within 0.005.
+
+**Harness (to build on its own branch `w119-exit-arms` off `main`, each change with an executing test proven red first).**
+- An engine option for `condor_defense` close, default off, calling `evaluate_condor_defense` with the engine's per-leg marks.
+- An engine option for the distance close, default off.
+- Both threaded through `walkforward.py` as explicit keywords, so the W66 / W67 / W68 keyword guards and the W88e literal census keep passing.
+- `scripts/exit_arms_study.py`, with `--study-file` and a run record through `scripts/study_cli.py`, a catalogue entry, and the arms and pairing above.
+- No live file changes. `execution/condor_defense.py` is read, not edited. Any section 3 file touched is listed for the operator before merging.
+
+**Known limits, stated now.**
+- No rule short of the touch could have saved a gap through the strike (09-21). A daily exit step cannot see an intraday approach that reverses the same session.
+- Live computes the 0.40 delta from delayed IBKR marks and a fresher spot (13543 note 3), so it is noisier near the line than the research delta; the study cannot measure that noise.
+- Surface pricing runs from 2024-10-01 on QQQ only, so the sample is about two years of one symbol. A `bs_legacy` run from 2010 may be attached as exploratory, but it cannot decide, because Black-Scholes marks are the thing an exit-cost question cannot trust.
+- The live sample stays the final judge (R9: 50 closes is statistically weak on its own).
+
+**Owner.** Prithvi wrote the question and this registration (Windows box). The harness and the run need the Mac's data: whoever builds it appends AS BUILT, then RESULTS, below this entry.
