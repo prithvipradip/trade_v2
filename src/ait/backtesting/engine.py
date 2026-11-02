@@ -1191,7 +1191,11 @@ class Backtester:
                             self._reject("meta_label")
                             continue
                 except Exception:
-                    pass  # meta-labeler errors are non-fatal
+                    # Fail-OPEN on purpose, exactly as live: a meta-labeler that cannot answer vetoes nothing. A real
+                    # failure is already logged where it happens (MetaLabeler.predict logs `meta_label_predict_failed`
+                    # and returns None); this guard only covers a malformed return value. The range gate above is the
+                    # opposite on purpose: no verdict from it fails CLOSED. Pinned by tests/test_meta_label_gate_fail_open.py.
+                    pass
 
             strategy = self._select_strategy(direction, hist_dec, confidence, features_df)
             if strategy is None:
