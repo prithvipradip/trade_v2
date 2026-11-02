@@ -44,6 +44,7 @@ ENGINE_REJECT_REASONS: dict[str, GateRow] = dict([
        "ml.entry_gates_enabled is false; research gates_mode decides)"),
     _g("range_gate_no_predictor", TWIN, "range model gate (observe live; gates_mode decides)"),
     _g("range_gate_below_threshold", TWIN, "range model gate (observe live; gates_mode decides)"),
+    _g("range_gate_error", TWIN, "range model gate when predict() raised: no verdict, so it fails closed (gates_mode decides; live's handling above its predict call was not examined)"),
     _g("meta_label", TWIN, "meta-label gate (orchestrator)"),
     _g("iv_rank_unknown", TWIN, "fails closed on an unmeasurable rank"),
     _g("iv_rank_floor", TWIN, "condor builder floor AIT_IRON_CONDOR_IV_FLOOR"),

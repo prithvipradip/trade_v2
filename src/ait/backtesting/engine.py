@@ -955,6 +955,16 @@ class Backtester:
         return recent_losing_days(
             today, lambda d: SimpleNamespace(trades_taken=entries.get(d, 0), total_pnl=pnl.get(d, 0.0)))
 
+    def _note_range_gate_error(self, exc: Exception, today: Any, strategy: str) -> None:
+        """Log a range model that raised during predict(): a warning the FIRST time in this engine, debug after, so a
+        broken model is visible without one line per day. The per-day count is the funnel (``range_gate_error``)."""
+        first = not getattr(self, "_range_gate_error_logged", False)
+        self._range_gate_error_logged = True
+        (log.warning if first else log.debug)(
+            "range_gate_predict_failed", date=str(today), strategy=strategy, error=f"{type(exc).__name__}: {exc}",
+            gates_mode=self._gates_mode,
+            action="entry blocked (fail closed)" if self._gates_mode == "enforce" else "observed: would block")
+
     def _would_reject(self, reason: str) -> None:
         """W67: observe mode -- the gate WOULD have rejected this day but did not.
 
@@ -1348,8 +1358,21 @@ class Backtester:
                                 float(rp.probability_in_range), 4)
                             confidence = _p_range
                             _size_range_prob = _p_range
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - never swallowed: see below
+                        # No verdict was recorded, so the gate has no evidence, and a gate without evidence fails
+                        # CLOSED (the absent-model branch above, an abstaining model and one under the floor all
+                        # block). This handler used to be ``pass``: an error inside predict() made the gate vanish
+                        # and the entry flowed on as if the model had approved it, with nothing recorded anywhere.
+                        # A verdict already recorded (a would-reject, or a pass) is left as it is.
+                        if _entry_decision["range_gate"].get("pass") is None:
+                            self._note_range_gate_error(exc, today_date, strategy)
+                            _entry_decision["range_gate"] = {
+                                "prob": None, "threshold": self._range_min_confidence, "pass": False,
+                                "error": type(exc).__name__}
+                            if self._gates_mode == "enforce":
+                                self._reject("range_gate_error")
+                                continue
+                            self._would_reject("range_gate_error")
 
             # Realized-vol entry gate: neutral credit structures cannot profit
             # during high-volatility regimes (e.g. tariff shocks, VIX > 40).

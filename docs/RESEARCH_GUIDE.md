@@ -185,6 +185,7 @@ settlement or assignment. The older `legacy` engine is kept byte-identical for r
 | `no_strategy` | The selector found no allowed structure |
 | `iv_rank_floor` / `iv_rank_cap` / `iv_rank_unknown` | IV rank below the condor floor, above the credit cap, or not measurable (fails closed) |
 | `range_gate_below_threshold` | The range model's P(stay in range) is under `ml.range_min_confidence` (only when `gates_mode: enforce`) |
+| `range_gate_no_predictor` / `range_gate_error` | The range model is missing for the window (its training failed), or raised an error while predicting that day. Both fail closed (only when `gates_mode: enforce`; [6](#6-the-models-in-research)) |
 | `macro_event` | An FOMC/CPI/NFP/PCE/GDP event is within `risk.pre_event_blackout_days` |
 | `ex_div_entry` | A short call could be assigned early before an ex-dividend date (live's rule) |
 | `max_concurrent` | `backtest.max_concurrent_positions` already open |
@@ -217,7 +218,7 @@ that happens per horizon, and it is worth reading before enforcing the gate.
 research-versus-live difference; the parity manifest shows it. Why live observes: [MODELS.md](MODELS.md) "Gating: observe and enforce".
 
 **What if a model fails to train in a window?** It depends on the model.
-- **Range model: the window is blocked, not ungated.** When training was attempted and failed (no usable cross-validated accuracy, an error, or the window skipped), the out-of-sample run raises the range floor to a level no probability can reach. Under `enforce` every condor entry is rejected (funnel name `range_gate_no_predictor`); under `observe` it is logged as a would-reject and the entry goes ahead ([observe / enforce](GLOSSARY.md)). The summary's range-model block lists each window's status, marks blocked windows, and warns when no window trained, because such a run says nothing about the range gate. Only a study that turns window models off (`train_window_models: false`, the ablation arms) runs ungated, by design.
+- **Range model: the window is blocked, not ungated.** When training was attempted and failed (no usable cross-validated accuracy, an error, or the window skipped), the out-of-sample run raises the range floor to a level no probability can reach. Under `enforce` every condor entry is rejected (funnel name `range_gate_no_predictor`); under `observe` it is logged as a would-reject and the entry goes ahead ([observe / enforce](GLOSSARY.md)). The summary's range-model block lists each window's status, marks blocked windows, and warns when no window trained, because such a run says nothing about the range gate. Only a study that turns window models off (`train_window_models: false`, the ablation arms) runs ungated, by design. A range model that trained but raises an error while predicting a given day is treated the same way for that day: rejected as `range_gate_error` under `enforce`, a would-reject under `observe`, and the first error per engine is logged as `range_gate_predict_failed`.
 - **Direction model:** the day's direction falls back to a simple rule on recent returns and is counted (`direction_fallback_days`).
 - **Meta-labeler:** if it could not be trained, it simply does not gate.
 
@@ -527,7 +528,7 @@ funnel** (why days did not trade), a buy-and-hold benchmark, and per-window rows
 
 **Why did a window or a symbol not trade?** Read the summary from the top:
 1. **The range-model block.** A window whose status is not `ok` is blocked ([6](#6-the-models-in-research)); that is about training, not the market. If no window trained, the run says nothing about the range gate.
-2. **The entry funnel.** It counts the days each gate removed. `range_gate_no_predictor` leads back to step 1. `range_gate_below_threshold` means the range model gave no probability that day (it abstained: no cross-validated edge over the base rate, see [5](#5-the-engine)) or its probability was under `ml.range_min_confidence`. The `builder` lines say why a structure could not be built.
+2. **The entry funnel.** It counts the days each gate removed. `range_gate_no_predictor` leads back to step 1. `range_gate_below_threshold` means the range model gave no probability that day (it abstained: no cross-validated edge over the base rate, see [5](#5-the-engine)) or its probability was under `ml.range_min_confidence`. `range_gate_error` means the range model raised an error that day: look for the log event `range_gate_predict_failed`; it is a fault to fix, not a market signal. The `builder` lines say why a structure could not be built.
 3. **The observe-mode line.** "Gates in observe mode would also have rejected" lists blocks that did not apply because `gates_mode` is `observe`; they explain the gap between "would have traded" and "did".
 4. **The window count.** Fewer windows than `walkforward_tuning.min_windows` prints a warning that points at the log events `walk_forward_too_few_windows` and `range_model_absent_blocking_oos`.
 
