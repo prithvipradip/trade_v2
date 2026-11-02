@@ -248,6 +248,17 @@ class TestEconCalendarExhaustionNotifies:
 # --- [5] .env must be able to override the protective defaults -------------
 
 class TestDotenvPrecedence:
+    @pytest.fixture(autouse=True)
+    def _restore_environ(self):
+        """``apply_runtime_env_defaults()`` writes AIT_IC_WING_K and the other contract variables straight into
+        ``os.environ``. ``monkeypatch.delenv(..., raising=False)`` on a variable that is absent records nothing, so
+        nothing undoes those writes and ``AIT_IC_WING_K=1.2`` stayed in the process for every later test (until a
+        later file happened to reset it). Snapshot the whole environment and put it back."""
+        saved = dict(os.environ)
+        yield
+        os.environ.clear()
+        os.environ.update(saved)
+
     def test_env_file_overrides_hardcoded_default(self, tmp_path, monkeypatch):
         import ait.config.runtime_env as mod
 
