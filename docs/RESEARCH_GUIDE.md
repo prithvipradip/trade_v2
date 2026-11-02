@@ -86,6 +86,12 @@ Rows from before the source tags (old retired symbols in `daily_prices`) carry `
 
 Nothing from a test slice ever reaches the training of its own window.
 
+**Why do the steps run in this order?**
+- **The range model comes before the search.** Every trial in the search is an engine run that applies the range gate, so it is handed the window's range model (trained on the training slice, and once per horizon if the entry DTE is searched). The search tunes parameters against the gate the test slice will meet.
+- **The meta-labeler comes after the search.** It learns from a shadow run over the training slice built with the parameters the search chose, so it describes the configuration that will trade. Trained earlier, it would describe another one.
+- **The test slice comes last, with everything frozen.** The out-of-sample run receives the direction model, the range model, the meta-labeler and the chosen parameters; nothing is refitted on it.
+- **What the search does not see.** Trial engines get the range model only: no direction model and no meta-labeler. A trial takes each day's direction from a simple rule on recent returns (counted as `direction_fallback_days`), while the test slice uses the window's direction model. This matters for condors because the research selector trades them on neutral days only ([11](#11-research-vs-live)).
+
 ---
 
 ## 4. Configuration: where every value lives
@@ -209,6 +215,11 @@ that happens per horizon, and it is worth reading before enforcing the gate.
 
 **Do the models gate entries in research?** `backtest.gates_mode` decides. `enforce` (research's setting): the range floor blocks entries. `observe` (live's shipped mode): the models predict and log but never block. This is a deliberate
 research-versus-live difference; the parity manifest shows it. Why live observes: [MODELS.md](MODELS.md) "Gating: observe and enforce".
+
+**What if a model fails to train in a window?** It depends on the model.
+- **Range model: the window is blocked, not ungated.** When training was attempted and failed (no usable cross-validated accuracy, an error, or the window skipped), the out-of-sample run raises the range floor to a level no probability can reach. Under `enforce` every condor entry is rejected (funnel name `range_gate_no_predictor`); under `observe` it is logged as a would-reject and the entry goes ahead ([observe / enforce](GLOSSARY.md)). The summary's range-model block lists each window's status, marks blocked windows, and warns when no window trained, because such a run says nothing about the range gate. Only a study that turns window models off (`train_window_models: false`, the ablation arms) runs ungated, by design.
+- **Direction model:** the day's direction falls back to a simple rule on recent returns and is counted (`direction_fallback_days`).
+- **Meta-labeler:** if it could not be trained, it simply does not gate.
 
 **Can I change a model setting for one study?** Yes: hyperparameters (`ml.hyperparams`, `ml.meta_label_hyperparams`), feature windows and per-feature switches (`ml.features`) go in the study file (or the overlay). Loading a model trained under other
 windows or switches is refused and it is retrained; the run record stores the feature-spec hash and the resolved feature list. A study that changes a feature looks like:
@@ -445,7 +456,7 @@ The walk-forward runs the same check first thing, `run_backtest.py` prints it, a
 
 Fixed limits (not configurable, listed in [section 4](#4-configuration-where-every-value-lives) under the fixed research limits): the longest run of sessions without IV, the longest dividend, macro-event and macro-series gaps.
 
-**Declared models.** Three behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, a window whose ML model fails to train trades ungated, and a leg the IV surface cannot price uses the legacy IV (flagged above a fixed share, [5](#5-the-engine)). They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
+**Declared models.** Three behaviours are modelling assumptions, not missing data, and stay: open positions are re-marked from a blend of the entry IV and realized volatility, a day with no model direction (the direction model failed to train, or a search trial, which has none) takes its direction from a simple rule on recent returns (a failed range model is different: it blocks the window, [6](#6-the-models-in-research)), and a leg the IV surface cannot price uses the legacy IV (flagged above a fixed share, [5](#5-the-engine)). They are named here so nobody finds them later, and their counts are in the run record. A friction band with too few collected sessions is priced by the all-DTE model at the extrapolation floor, as before, and is reported as extrapolated.
 
 **Macro features.** A research model sees the same nine macro inputs (yields, their spread, the dollar index and their changes) as the one that trades: real values, from the stored series, never constants. A model trained before this existed saw constants, so its results are not comparable (the before / after is in PLAN.md).
 
@@ -514,6 +525,12 @@ funnel** (why days did not trade), a buy-and-hold benchmark, and per-window rows
 4. **The run record.** Is the tree dirty? Is the data span what you expected?
 5. **Comparability.** Numbers made before a research default changed are not comparable (for example, when `max_concurrent_positions` changed).
 
+**Why did a window or a symbol not trade?** Read the summary from the top:
+1. **The range-model block.** A window whose status is not `ok` is blocked ([6](#6-the-models-in-research)); that is about training, not the market. If no window trained, the run says nothing about the range gate.
+2. **The entry funnel.** It counts the days each gate removed. `range_gate_no_predictor` leads back to step 1. `range_gate_below_threshold` means the range model gave no probability that day (it abstained: no cross-validated edge over the base rate, see [5](#5-the-engine)) or its probability was under `ml.range_min_confidence`. The `builder` lines say why a structure could not be built.
+3. **The observe-mode line.** "Gates in observe mode would also have rejected" lists blocks that did not apply because `gates_mode` is `observe`; they explain the gap between "would have traded" and "did".
+4. **The window count.** Fewer windows than `walkforward_tuning.min_windows` prints a warning that points at the log events `walk_forward_too_few_windows` and `range_model_absent_blocking_oos`.
+
 **How is Sharpe annualized?** By the square root of the trades per year the sample actually made, capped at 252 (one trade per trading day). The cap is a fixed convention (`SHARPE_ANNUALIZATION_CAP` in `backtesting/result.py`), not a setting:
 it decides how every reported Sharpe and Sortino is annualized, so a study that could change it would make reported numbers incomparable across runs.
 
@@ -563,6 +580,7 @@ Without `--symbols` / `--strategies`, a run uses `backtest.default_symbols` (QQQ
 - **History is short and one regime.** The default window (`backtest.history_start_date`) starts at the first session with stored QQQ option bars, which is after the economic calendar's first day. Results describe that period.
 - **One symbol has option history.** QQQ is the only symbol with the option bars an IV surface needs, and that history is short (about two years when this was written). SPY and IWM run only on `bs_legacy` until their bars are stored.
 - **The spread model is fitted on a limited sample.** Real fills differ.
+- **The search does not see every model the test slice uses.** Trial engines apply the range model only: direction comes from a simple rule and there is no meta-labeler, while the out-of-sample run uses all three ([3](#3-what-one-run-does)). Read a window's in-sample search score with that in mind.
 - **The learner's disable step is unreachable** with the shipped numbers ([7](#7-the-learner)).
 - **A single run is one draw.** Compare studies on the same windows and engine, and weigh differences against window-to-window noise.
 - **Research never promotes anything.** A finding changes live only through a registered `PLAN.md` wave and the operator's decision.
