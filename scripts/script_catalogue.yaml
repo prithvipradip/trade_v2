@@ -783,3 +783,13 @@ scripts/backfill_macro_series.py:
   example: "python scripts/backfill_macro_series.py [--db-path data/historical.db] [--dry-run]"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#103-the-research-data-contract-stored-inputs-or-no-study)"
   stamp: "c9248ae6a3d3"
+
+scripts/fractal_ablation_study.py:
+  group: Study
+  what: "Ablation of the fractal columns on the range model. Each arm is a study file that switches a block of fractal columns off; the dry run reports windows, input coverage, each arm's feature list and spec hash, and the time of one training, without computing any score."
+  when: "Before and during the pre-registered fractal-ablation study (its rule is in the audit register); only --dry-run exists so far."
+  needs_ib: "no"
+  writes: "nothing persistent (model artifacts go to a temporary directory that is deleted); history database opened read-only"
+  example: "python scripts/fractal_ablation_study.py --dry-run"
+  explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#5-the-engine)"
+  stamp: "93d4eceb0cf6"

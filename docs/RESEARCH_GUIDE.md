@@ -206,6 +206,7 @@ model; any other DTE is rounded **up** to a bucket in `RANGE_HORIZON_BUCKETS` an
 the live `models/range.pkl` is never touched. `python scripts/range_horizon_study.py --symbol QQQ` measures out-of-sample skill, abstention and reliability per horizon (read-only; artifacts go to a temporary directory).
 **Abstention is not a bug:** when no ensemble member has cross-validated edge over the base rate the model returns no probability, and the engine's range gate then rejects (enforce) or would-reject (observe); the study reports how often
 that happens per horizon, and it is worth reading before enforcing the gate.
+**Which inputs earn their place.** `python scripts/fractal_ablation_study.py --dry-run` lists the arms of the fractal-column ablation (each arm is a study file under `studies/` that switches a block of columns off with `ml.features.<group>.use.<column>: false`), the windows and input coverage of each stage, each arm's feature list and spec hash, and the time of one training; it computes no score (read-only).
 
 ---
 
