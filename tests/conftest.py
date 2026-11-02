@@ -104,6 +104,30 @@ def _neutralise_simulated_capital(monkeypatch):
     monkeypatch.setenv("AIT_SIMULATED_CAPITAL", "0")
 
 
+@pytest.fixture(autouse=True)
+def _process_wide_option_caches_do_not_outlive_a_test():
+    """``ait.data.options_chain`` resolves the liquidity thresholds (``_liquidity_thresholds``) and the Black-Scholes
+    rate (``_risk_free_rate``) ONCE per process, from ``load_settings()`` and the environment at that moment. That is
+    right for the live bot and wrong for a suite: the first test that touches a contract decides for every later one.
+    Measured: ``test_hot_path_smoke`` runs under ``monkeypatch.chdir(tmp_path)``, so ``load_settings()`` found no
+    ``config.yaml`` and the cache froze the strict last-resort thresholds (volume 50, open interest 100, spread 0.15)
+    for the rest of the process; ``test_the_builder_selects_with_the_named_delta`` (spread 0.18) then saw every contract
+    as illiquid and failed, but only in a file selection that omitted the few files that clear the cache themselves.
+    ``_risk_free_rate`` has the same shape. Clearing both before and after each test makes every test resolve from its
+    own state; within a test the caches still behave as in production. The tests that clear them on purpose stay valid."""
+    from ait.data import options_chain as oc
+
+    def _clear() -> None:
+        # A test may have replaced one of them with a plain function (monkeypatch.setattr(OC, "_risk_free_rate", ...)),
+        # still in place when this teardown runs; the next test's setup clears the real cache once the patch is undone.
+        for name in ("_liquidity_thresholds", "_risk_free_rate"):
+            getattr(getattr(oc, name), "cache_clear", lambda: None)()
+
+    _clear()
+    yield
+    _clear()
+
+
 from ait.config.settings import (
     AccountConfig,
     MLConfig,
