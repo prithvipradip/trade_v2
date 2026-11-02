@@ -657,8 +657,15 @@ class TestUnparseableExitTime:
         with sqlite3.connect(st._db_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM exit_outbox").fetchone()[0] == 0
 
-    def test_a_normal_row_is_unaffected(self, tmp_path):
-        st = self._closed_with(tmp_path, now_et().replace(hour=9, minute=40).isoformat())
+    def test_a_normal_row_is_unaffected(self, tmp_path, monkeypatch):
+        # The drain books a row only once its exit_time is older than a 120 s grace (state.pending_exit_bookings), so a row
+        # stamped "today 09:40 ET" is invisible to it until 09:42 ET: with the real clock this test failed on every run
+        # before then. Freeze the clock at 11:00 ET of the real ET date (both places now_et is imported from) so the row
+        # is a normal, already-closed one whatever time the suite runs.
+        frozen = now_et().replace(hour=11, minute=0, second=0, microsecond=0)
+        monkeypatch.setattr("ait.bot.state.now_et", lambda: frozen)
+        monkeypatch.setattr("ait.utils.time.now_et", lambda: frozen)
+        st = self._closed_with(tmp_path, frozen.replace(hour=9, minute=40).isoformat())
         o = _w14_orch(st)
         asyncio.run(o._drain_exit_outbox())
         assert st.get_daily_stats().total_pnl == pytest.approx(-150.0)
