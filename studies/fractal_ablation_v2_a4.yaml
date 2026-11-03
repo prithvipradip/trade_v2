@@ -1,0 +1,20 @@
+# W119 S1 v2: does any block of the fractal columns change the out-of-sample Brier score of the seed-averaged range model? Arm a4.
+#
+#   python scripts/fractal_ablation_study.py --run-v2 --arm a4 --label v2_base
+#
+# The rule, the arms, the windows and the decision rule are in PLAN.md "W119 S1 v2 AS PLANNED". Commit this file BEFORE the
+# run; do not edit it afterwards (a changed study is a new file).
+
+name: fractal_ablation_v2_a4
+question: >
+  Arm a4: the multiscale block off. Does the out-of-sample Brier score of the 5-seed average range model change (abstention scored as the training in-range rate)?
+rule: W119 S1 v2 AS PLANNED
+
+settings:
+  ml:
+    features:
+      fractal:
+        use:
+          hurst_short: false
+          hurst_long: false
+          hurst_scale_spread: false

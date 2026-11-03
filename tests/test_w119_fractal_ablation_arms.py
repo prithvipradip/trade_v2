@@ -125,3 +125,36 @@ def test_deep_merge_keeps_siblings_and_overrides_leaves():
     m = _load_script()
     out = m._deep_merge({"ml": {"features": {"fractal": {"use": {"a": False}}}}}, {"ml": {"hyperparams": {"random_state": 7}}})
     assert out["ml"]["features"]["fractal"]["use"] == {"a": False} and out["ml"]["hyperparams"]["random_state"] == 7
+
+
+# ---- S1 v2 ----------------------------------------------------------------------------------------------------------
+def test_v2_study_files_match_the_v2_arm_table():
+    m = _load_script()
+    assert set(m.ARMS_V2) == {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a0c", "a5c"}
+    for arm, groups in m.ARMS_V2.items():
+        study = yaml.safe_load(m.study_path_v2(arm).read_text())
+        assert study["name"] == f"fractal_ablation_v2_{arm}" and study["rule"] == "W119 S1 v2 AS PLANNED"
+        assert _switched_off(study) == {g: set(cols) for g, cols in groups.items()}, arm
+        hp = ((study.get("settings") or {}).get("ml") or {}).get("hyperparams") or {}
+        assert (hp == {"colsample_bytree": 1.0}) == (arm in m.V2_CONTROLS), arm
+
+
+def test_v2_cell_scores_ensemble_and_theta_rounding():
+    import numpy as np
+    m = _load_script()
+    s = m.cell_scores([0.5, 0.5, 0.5, 0.5], [1, 0, 1, 0])
+    assert abs(s["brier"] - 0.25) < 1e-12 and abs(s["log_loss"] - np.log(2.0)) < 1e-9      # a coin-flip forecast
+    ens = m.ensemble_probs([[0.2, 0.8], [0.4, 0.6]])
+    assert np.allclose(ens, [0.3, 0.7])
+    assert m.theta_from_se(0.0004) == 0.001 and m.theta_from_se(0.00025) == 0.0005 and m.theta_from_se(0.0011) == 0.0025
+    assert m.theta_from_se(0.0) == 0.0
+
+
+def test_v2_classification_follows_the_sign_convention_positive_means_removal_hurts():
+    m = _load_script()
+    assert m.classify_v2(+0.004, 0.05, 0.002, 38) == "KEEP"
+    assert m.classify_v2(-0.004, 0.05, 0.002, 38) == "REMOVAL OK"
+    assert m.classify_v2(+0.004, 0.20, 0.002, 38) == "NOT SHOWN"
+    assert m.classify_v2(+0.001, 0.01, 0.002, 38) == "NOT SHOWN"
+    assert m.classify_v2(+0.004, 0.01, 0.002, m.MIN_WINDOWS - 1) == "INSUFFICIENT"
+    assert set(m.SEEDS_A).isdisjoint(m.SEEDS_B) and len(m.SEEDS_A) == len(m.SEEDS_B) == 5

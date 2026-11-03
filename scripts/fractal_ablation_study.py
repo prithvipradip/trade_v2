@@ -14,6 +14,13 @@ switches. Like ``scripts/range_horizon_study.py`` (W78) this is read-only: ``dat
     python scripts/fractal_ablation_study.py --check-engine                   # wiring check W-1 (one real walk-forward window)
     python scripts/fractal_ablation_study.py --report --label base            # statistics, verdicts, wiring checks
 
+    python scripts/fractal_ablation_study.py --run-v2 --arm a2 [--seeds 42 7 11 23 101] --label v2_base   # S1 v2: seed-averaged, climatology-imputed
+    python scripts/fractal_ablation_study.py --noise-pilot                    # S1 v2 noise pilot: baseline only, two seed sets, no arm difference
+    python scripts/fractal_ablation_study.py --report-v2 --label v2_base --theta 5=0.0010 30=0.0015   # S1 v2 statistics (needs the registered thetas)
+
+S1 v2 (PLAN.md "W119 S1 v2 AS PLANNED") replaces the per-window Brier skill by the absolute Brier score of a seed-averaged model,
+scores abstention as the training in-range rate, and sizes its threshold from the noise pilot before any arm is scored.
+
 PLAN.md "W119 S1 ADDENDUM 1" (QQQ is the primary verdict, SPY and IWM replicate) and "ADDENDUM 2" (the S1a start, the S1b
 window rule, the canary numbers) amend the registered rule before any scoring. One process per arm: the arm's study file is
 read BEFORE the settings freeze (a frozen configuration ignores any later overlay).
@@ -709,6 +716,345 @@ def check_engine(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------------------------------------------------
+# S1 v2 (PLAN.md "W119 S1 v2 AS PLANNED"): seed-averaged arms, absolute Brier, abstention scored as climatology
+# --------------------------------------------------------------------------------------------------------------------
+V2_HORIZONS = (5, 30)
+SEEDS_A = (42, 7, 11, 23, 101)           # the registered five seeds
+SEEDS_B = (13, 17, 19, 29, 31)           # the disjoint set of the noise pilot
+V2_THETA_MAX = 0.005                     # a horizon whose theta exceeds this is UNDERPOWERED and not run
+V2_THETA_STEP = 0.0005
+LEAK_MIN_BRIER_DROP = 0.05               # W-4 v2 (chosen): the LEAKED canary must lower the Brier by at least this
+CONTROL_TOLERANCE = 1e-9                 # the deterministic control: colsample 1.0, constant columns removed
+# arm -> {group: columns switched off} (study files studies/fractal_ablation_v2_<arm>.yaml); a0c / a5c also set colsample_bytree 1.0
+ARMS_V2: dict[str, dict[str, tuple[str, ...]]] = {a: ARMS[a][1] for a in ("a0", "a1", "a2", "a3", "a4", "a5", "a6")}
+ARMS_V2["a0c"] = {}
+ARMS_V2["a5c"] = ARMS["a5"][1]
+V2_CONTROLS = ("a0c", "a5c")
+
+
+def study_path_v2(arm: str) -> Path:
+    return STUDIES / f"fractal_ablation_v2_{arm}.yaml"
+
+
+def removed_columns_v2(arm: str) -> tuple[str, ...]:
+    return tuple(c for cols in ARMS_V2[arm].values() for c in cols)
+
+
+def cell_scores(p_days, y_days) -> dict:
+    """Brier score and log loss of one window's probabilities (absolute units; no skill ratio)."""
+    import numpy as np
+    p = np.clip(np.asarray(p_days, dtype=float), 1e-6, 1.0 - 1e-6)
+    y = np.asarray(y_days, dtype=float)
+    return {"brier": float(np.mean((p - y) ** 2)),
+            "log_loss": float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))}
+
+
+def ensemble_probs(per_seed: list):
+    """Mean over seeds of each seed's probability for every test day (an abstaining seed already carries the prior)."""
+    import numpy as np
+    return np.mean(np.asarray(per_seed, dtype=float), axis=0)
+
+
+def theta_from_se(se: float) -> float:
+    """theta = 2 x the null standard error, rounded UP to V2_THETA_STEP."""
+    import math
+    return round(math.ceil(2.0 * se / V2_THETA_STEP - 1e-12) * V2_THETA_STEP, 6)
+
+
+def classify_v2(mean: float, p_adj: float, theta: float, n_windows: int) -> str:
+    """KEEP: removing the block raises the mean Brier by >= theta; REMOVAL OK: lowers it by >= theta (one-sided Holm p < ALPHA)."""
+    if n_windows < MIN_WINDOWS:
+        return "INSUFFICIENT"
+    if mean >= theta and p_adj < ALPHA:
+        return "KEEP"
+    if mean <= -theta and p_adj < ALPHA:
+        return "REMOVAL OK"
+    return "NOT SHOWN"
+
+
+def run_arm_v2(args: argparse.Namespace, arm_override: str | None = None, seeds_override=None, label_override: str | None = None,
+               symbols_override=None, file_tag: str | None = None) -> int:
+    import numpy as np
+    import pandas as pd
+
+    from ait.backtesting.replay import ResearchData
+    from ait.backtesting.walkforward import WalkForwardBacktester
+    from ait.config.research import load_study, use_research_config
+    from ait.data.macro_store import load_macro_series
+    from ait.data.market_data import load_daily_ohlcv
+    from ait.data.research_inputs import Window
+    from ait.ml.feature_spec import FeatureSpec
+    from ait.ml.features import FeatureEngine
+    from ait.ml.range_predictor import RangePredictor
+
+    warnings.filterwarnings("ignore")
+    arm = arm_override or args.arm
+    seeds = tuple(seeds_override or args.seeds or SEEDS_A)
+    label = label_override or args.label
+    study = load_study(study_path_v2(arm))
+    settings = use_research_config(str(ROOT / "config.yaml"), study=study)         # the arm's study is merged BEFORE the freeze
+    spec = FeatureSpec.from_config(settings.ml.features)
+    names = spec.feature_names(None)
+    hp0 = settings.ml.hyperparams
+    _install_canary(args.canary)
+    db = Path(args.historical_db)
+    stage = "S1a"
+    start = pd.Timestamp(STAGE_START[stage]).date()
+    end = pd.Timestamp(args.end_date).date()
+    vix = load_daily_ohlcv("^VIX", db_path=db, start_date=start, end_date=end)
+    spy = load_daily_ohlcv("SPY", db_path=db, start_date=start, end_date=end)
+    macros = load_macro_series(db, Window(start, end), "")
+    symbols = symbols_override or args.symbols or list(SYMBOLS)
+    horizons = args.horizons or list(V2_HORIZONS)
+    tmp = Path(tempfile.mkdtemp(prefix=f"w119_s1v2_{arm}_"))
+    records: list[dict] = []
+    t_start = time.perf_counter()
+    try:
+        for sym in symbols:
+            frame = ResearchData(str(db), sym).daily_frame()
+            ohlcv = frame[["Open", "High", "Low", "Close", "Volume"]].dropna().loc[str(start):str(end)]
+            wins = [(i, w) for i, w in enumerate(windows(len(ohlcv)), 1)
+                    if ohlcv.index[w[2]] >= pd.Timestamp(STAGE_TEST_FROM[stage])]
+            if args.max_windows:
+                wins = wins[-args.max_windows:]
+            fe = FeatureEngine()
+            for wi, (a, b, c, d) in wins:
+                train_df, test_df, ctx = ohlcv.iloc[a:b], ohlcv.iloc[c:d], ohlcv.iloc[a:d]
+                tr_ctx = market_context(vix, spy, macros, train_df.index)
+                oos_ctx = market_context(vix, spy, macros, ctx.index)
+                feats = None if args.canary == "leaked" else fe.compute(ctx, market_context=oos_ctx, symbol=sym)
+                for h in horizons:
+                    _CANARY["h"] = h
+                    thr = float(WalkForwardBacktester._adaptive_range_threshold(train_df, horizon_days=h))
+                    ytr = labels(train_df["Close"].to_numpy(dtype=float), h, thr)
+                    prior = float(np.nanmean(ytr)) if np.isfinite(ytr).any() else 0.5
+                    feats_h = feats if feats is not None else fe.compute(ctx, market_context=oos_ctx, symbol=sym)
+                    y = labels(test_df["Close"].to_numpy(dtype=float), h, thr)
+                    rows = [k for k in range(len(test_df) - h) if feats_h is not None and test_df.index[k] in feats_h.index]
+                    rec = {"symbol": sym, "window": wi, "test_start": str(test_df.index[0].date()),
+                           "test_end": str(test_df.index[-1].date()), "h": h, "threshold": round(thr, 5),
+                           "prior": prior, "n_days": len(rows), "seeds": list(seeds)}
+                    if len(rows) < 10:
+                        records.append({**rec, "status": "no_feature_rows"})
+                        continue
+                    yy = np.asarray([y[k] for k in rows], dtype=float)
+                    per_seed_p, per_seed_brier, abstain = [], [], []
+                    for sd in seeds:
+                        hp = hp0.model_copy(update={"random_state": int(sd)})
+                        rp = RangePredictor(threshold_pct=thr, horizon_days=h, hyperparams=hp,
+                                            model_dir=tmp / f"{sym}_{wi}_{h}_{sd}")
+                        accs = rp.train(train_df, symbol=sym, market_context=tr_ctx)
+                        ps, n_none = [], 0
+                        for k in rows:
+                            pred = rp.predict_from_features(feats_h.loc[test_df.index[k]], symbol=sym) \
+                                if (accs and rp.is_trained) else None
+                            if pred is None:
+                                n_none += 1
+                                ps.append(prior)                 # abstention scored as the training in-range rate
+                            else:
+                                ps.append(float(pred.probability_in_range))
+                        per_seed_p.append(ps)
+                        per_seed_brier.append(cell_scores(ps, yy)["brier"])
+                        abstain.append(n_none == len(rows) or n_none > 0)
+                    ens = cell_scores(ensemble_probs(per_seed_p), yy)
+                    records.append({**rec, "status": "scored", "base_rate": float(yy.mean()),
+                                    "brier": ens["brier"], "log_loss": ens["log_loss"],
+                                    "brier_by_seed": per_seed_brier, "abstain_by_seed": abstain})
+                print(f"  {arm} {sym} window {wi} done ({time.perf_counter() - t_start:.0f}s)", flush=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    out = OUT_DIR / label
+    out.mkdir(parents=True, exist_ok=True)
+    meta = {"arm": arm, "design": "v2", "seeds": list(seeds), "canary": args.canary, "end_date": args.end_date,
+            "spec_hash": spec.spec_hash(), "n_features": len(names), "features": names,
+            "colsample_bytree": float(hp0.colsample_bytree), "symbols": symbols, "horizons": horizons,
+            "max_windows": args.max_windows, "seconds": round(time.perf_counter() - t_start, 1)}
+    fname = file_tag or f"{arm}{'_' + args.canary if args.canary else ''}"
+    (out / f"{fname}.json").write_text(json.dumps({"meta": meta, "records": records}, indent=1))
+    scored = sum(1 for r in records if r["status"] == "scored")
+    print(f"{arm} (v2): {scored} scored of {len(records)} cells, {len(seeds)} seeds, {meta['seconds']}s -> {out}")
+    return 0
+
+
+def noise_pilot(args: argparse.Namespace) -> int:
+    """The S1 v2 noise pilot: the baseline arm only, QQQ, two disjoint 5-seed sets. It computes NO arm difference."""
+    import numpy as np
+    class _A: pass
+    a = _A()
+    for k, v in vars(args).items():
+        setattr(a, k, v)
+    a.canary, a.max_windows = None, args.max_windows
+    for tag, seeds in (("A", SEEDS_A), ("B", SEEDS_B)):
+        rc = run_arm_v2(a, arm_override="a0", seeds_override=seeds, label_override="v2_pilot", symbols_override=[PRIMARY],
+                        file_tag=f"pilot_{tag}")
+        if rc:
+            return rc
+    out = OUT_DIR / "v2_pilot"
+    docA = json.loads((out / "pilot_A.json").read_text())
+    docB = json.loads((out / "pilot_B.json").read_text())
+    A = {(r["window"], r["h"]): r["brier"] for r in docA["records"] if r["status"] == "scored"}
+    B = {(r["window"], r["h"]): r["brier"] for r in docB["records"] if r["status"] == "scored"}
+    lines = ["# S1 v2 noise pilot (baseline arm, QQQ, seed set A minus seed set B; no arm difference computed)\n"]
+    thetas = {}
+    for h in sorted({k[1] for k in A}):
+        ws = sorted(w for (w, hh) in A if hh == h and (w, h) in B)
+        d = np.asarray([A[(w, h)] - B[(w, h)] for w in ws])
+        boot = block_bootstrap_means(d)
+        se = float(np.std(boot, ddof=1))
+        th = theta_from_se(se)
+        thetas[h] = {"n_windows": len(d), "null_mean": float(d.mean()), "null_sd_per_window": float(d.std(ddof=1)),
+                     "se_of_mean": se, "theta": th, "underpowered": th > V2_THETA_MAX,
+                     "null_mean_within_theta": abs(float(d.mean())) <= th}
+        lines.append(f"- h={h}: {len(d)} windows; null mean {d.mean():+.5f} (within theta: {abs(d.mean()) <= th}); per-window sd {d.std(ddof=1):.5f}; "
+                     f"SE of the mean {se:.5f}; theta = {th:.4f} -> {'UNDERPOWERED (above %.3f)' % V2_THETA_MAX if th > V2_THETA_MAX else 'usable'}")
+    (out / "pilot.json").write_text(json.dumps(thetas, indent=1))
+    (out / "pilot.md").write_text("\n".join(lines))
+    print("\n".join(lines))
+    return 0
+
+
+def _brier_table(doc: dict, key: str = "brier"):
+    """{(symbol, window, h): value} for the scored cells of a v2 file."""
+    return {(r["symbol"], r["window"], r["h"]): r[key] for r in doc["records"] if r["status"] == "scored"}
+
+
+def _abstain_free(doc: dict):
+    """{(symbol, window, h)} cells where no seed abstained."""
+    return {(r["symbol"], r["window"], r["h"]) for r in doc["records"] if r["status"] == "scored" and not any(r["abstain_by_seed"])}
+
+
+def report_v2(args: argparse.Namespace) -> int:
+    import numpy as np
+    thetas = {int(k.split("=")[0]): float(k.split("=")[1]) for k in (args.theta or [])}
+    if not thetas:
+        print("--theta H=value (the thetas registered after the noise pilot) is required", file=sys.stderr)
+        return 1
+    label_dir = OUT_DIR / args.label
+    docs = {arm: _load_arm(label_dir, arm) for arm in ARMS_V2}
+    have = {a for a, d in docs.items() if d}
+    if "a0" not in have:
+        print(f"no baseline arm file in {label_dir}", file=sys.stderr)
+        return 1
+    lines = [f"# W119 S1 v2 report: {args.label} (theta per horizon: {thetas})\n"]
+    voids: list[str] = []
+    base_feats = set(docs["a0"]["meta"]["features"])
+    lines.append("## Wiring check W-2: recorded feature sets\n")
+    for arm in sorted(have):
+        gone = base_feats - set(docs[arm]["meta"]["features"])
+        ok = gone == set(removed_columns_v2(arm))
+        lines.append(f"- {arm}: {len(gone)} removed, spec hash {docs[arm]['meta']['spec_hash']}, colsample {docs[arm]['meta']['colsample_bytree']}: {'OK' if ok else 'MISMATCH -> VOID'}")
+        if not ok:
+            voids.append(f"W-2 {arm}")
+    base = _brier_table(docs["a0"])
+    base_free = _abstain_free(docs["a0"])
+    arms = [a for a in ("a1", "a2", "a3", "a4", "a5", "a6") if a in have]
+    lines.append("\n## Change in Brier when a block is removed (arm minus baseline; positive = removal hurts), QQQ primary\n")
+    lines.append("| arm | removed | h | theta | QQQ windows | mean change | adj. p | verdict (QQQ) | SPY / IWM change | replication | pooled 3-symbol | abstention-free windows: change (n) | log-loss change |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    cells, family = {}, []
+    for arm in arms:
+        tbl = _brier_table(docs[arm])
+        for h in sorted(thetas):
+            ws = sorted(w for (s_, w, hh) in base if s_ == PRIMARY and hh == h and (PRIMARY, w, h) in tbl)
+            d = np.asarray([tbl[(PRIMARY, w, h)] - base[(PRIMARY, w, h)] for w in ws])
+            if len(d) == 0:
+                continue
+            mean = float(d.mean())
+            direction = +1 if mean >= 0 else -1
+            p = one_sided_p(d, null=direction * thetas[h], direction=direction)
+            cells[(arm, h)] = {"d": d, "mean": mean, "direction": direction, "p": p}
+            family.append((arm, h))
+    padj = dict(zip(family, holm([cells[k]["p"] for k in family]))) if family else {}
+    results = {}
+    for arm in arms:
+        tbl = _brier_table(docs[arm])
+        ll_tbl, ll_base = _brier_table(docs[arm], "log_loss"), _brier_table(docs["a0"], "log_loss")
+        free = _abstain_free(docs[arm])
+        for h in sorted(thetas):
+            if (arm, h) not in cells:
+                continue
+            c = cells[(arm, h)]
+            verdict = classify_v2(c["mean"], padj[(arm, h)], thetas[h], len(c["d"]))
+            rep, ok_rep = [], []
+            for sym in ("SPY", "IWM"):
+                ws = sorted(w for (s_, w, hh) in base if s_ == sym and hh == h and (sym, w, h) in tbl)
+                d2 = np.asarray([tbl[(sym, w, h)] - base[(sym, w, h)] for w in ws])
+                if len(d2) >= 2:
+                    p2 = one_sided_p(d2, null=0.0, direction=c["direction"])
+                    rep.append(f"{sym} {d2.mean():+.5f} ({len(d2)})")
+                    ok_rep.append((np.sign(d2.mean()) == c["direction"], p2))
+                else:
+                    rep.append(f"{sym} n/a")
+                    ok_rep.append((False, 1.0))
+            replicated = (all(s_ for s_, _ in ok_rep) and any(p2 < ALPHA for _, p2 in ok_rep)) if verdict in ("KEEP", "REMOVAL OK") else None
+            wsp = sorted({w for (_s, w, hh) in base if hh == h and all((sy, w, h) in tbl and (sy, w, h) in base for sy in SYMBOLS)})
+            dp = np.asarray([np.mean([tbl[(sy, w, h)] - base[(sy, w, h)] for sy in SYMBOLS]) for w in wsp])
+            wf = sorted(w for (s_, w, hh) in base_free if s_ == PRIMARY and hh == h and (PRIMARY, w, h) in free)
+            df = np.asarray([tbl[(PRIMARY, w, h)] - base[(PRIMARY, w, h)] for w in wf])
+            wl = sorted(w for (s_, w, hh) in ll_base if s_ == PRIMARY and hh == h and (PRIMARY, w, h) in ll_tbl)
+            dl = np.asarray([ll_tbl[(PRIMARY, w, h)] - ll_base[(PRIMARY, w, h)] for w in wl])
+            lines.append(f"| {arm} | {len(removed_columns_v2(arm))} | {h} | {thetas[h]:.4f} | {len(c['d'])} | {c['mean']:+.5f} | {padj[(arm, h)]:.3f} | {verdict} | "
+                         f"{' / '.join(rep)} | {'-' if replicated is None else ('REPLICATED' if replicated else 'NOT REPLICATED')} | "
+                         f"{(f'{dp.mean():+.5f} ({len(dp)})' if len(dp) else 'n/a')} | {(f'{df.mean():+.5f} ({len(df)})' if len(df) else 'n/a')} | "
+                         f"{(f'{dl.mean():+.5f}' if len(dl) else 'n/a')} |")
+            results[f"{arm}_h{h}"] = {"verdict": verdict, "mean": c["mean"], "p_adj": padj[(arm, h)], "n": len(c["d"]), "theta": thetas[h]}
+    # W-3 default sampling and the deterministic control
+    if "a5" in arms:
+        lines.append("\n### Wiring check W-3 (default column sampling): arm a5, two constant columns removed\n")
+        for h in sorted(thetas):
+            if ("a5", h) not in cells:
+                continue
+            c = cells[("a5", h)]
+            ok = abs(c["mean"]) < thetas[h] and padj[("a5", h)] >= ALPHA
+            lines.append(f"- h={h}: mean change {c['mean']:+.5f} (theta {thetas[h]:.4f}), adj. p {padj[('a5', h)]:.3f}: {'OK' if ok else 'FAILED -> S1a VOID'}")
+            if not ok:
+                voids.append(f"W-3 h={h}")
+    if "a0c" in have and "a5c" in have:
+        lines.append("\n### Deterministic control: colsample_bytree 1.0, same seeds; arm a5c must equal arm a0c cell by cell\n")
+        t0 = {(r["symbol"], r["window"], r["h"]): r["brier_by_seed"] for r in docs["a0c"]["records"] if r["status"] == "scored"}
+        t5 = {(r["symbol"], r["window"], r["h"]): r["brier_by_seed"] for r in docs["a5c"]["records"] if r["status"] == "scored"}
+        keys = sorted(set(t0) & set(t5))
+        worst = max((max(abs(x - y) for x, y in zip(t0[k], t5[k])) for k in keys), default=float("nan"))
+        ok = keys and worst <= CONTROL_TOLERANCE
+        lines.append(f"- {len(keys)} cells compared: worst per-seed Brier difference {worst:.3e} (tolerance {CONTROL_TOLERANCE:g}): {'OK' if ok else 'FAILED -> VOID'}")
+        if not ok:
+            voids.append("deterministic control")
+    # W-4 canaries (single seed 42), compared with the baseline's seed-42 member Brier over the same cells
+    for kind in ("leaked", "shuffled"):
+        doc = _load_arm(label_dir, "a0", kind) or _load_arm(OUT_DIR / f"v2_canary_{kind}", "a0", kind)
+        if not doc:
+            continue
+        i42 = docs["a0"]["meta"]["seeds"].index(42) if 42 in docs["a0"]["meta"]["seeds"] else None
+        if i42 is None:
+            continue
+        b42 = {(r["symbol"], r["window"], r["h"]): r["brier_by_seed"][i42] for r in docs["a0"]["records"] if r["status"] == "scored"}
+        ctab = {(r["symbol"], r["window"], r["h"]): r["brier_by_seed"][0] for r in doc["records"] if r["status"] == "scored"}
+        lines.append(f"\n### Wiring check W-4: {kind.upper()} canary (QQQ, seed 42): canary minus baseline Brier\n")
+        for h in sorted(thetas):
+            ws = sorted(w for (s_, w, hh) in ctab if s_ == PRIMARY and hh == h and (PRIMARY, w, h) in b42)
+            d = np.asarray([ctab[(PRIMARY, w, h)] - b42[(PRIMARY, w, h)] for w in ws])
+            if len(d) == 0:
+                continue
+            ok = d.mean() <= -LEAK_MIN_BRIER_DROP if kind == "leaked" else d.mean() >= -thetas[h]
+            lines.append(f"- h={h}: mean change {d.mean():+.5f} over {len(d)} windows: {'OK' if ok else 'FAILED -> VOID'}")
+            if not ok:
+                voids.append(f"W-4 {kind} h={h}")
+    lines.append("\n## Reported only\n")
+    for arm in sorted(have):
+        rec = docs[arm]["records"]
+        ab = [any(r["abstain_by_seed"]) for r in rec if r["status"] == "scored" and r["symbol"] == PRIMARY]
+        lines.append(f"- {arm}: {sum(1 for r in rec if r['status'] == 'scored')} scored cells; QQQ cells with at least one abstaining seed "
+                     f"{sum(ab)} of {len(ab)}; {docs[arm]['meta']['seconds']}s")
+    lines.append("\n## Verdict\n")
+    lines.append("VOID: " + ", ".join(voids) if voids else "No wiring check failed (W-1 and W-5 are separate commands).")
+    text = "\n".join(lines)
+    (label_dir / "report_v2.md").write_text(text)
+    (label_dir / "results_v2.json").write_text(json.dumps(results, indent=1))
+    print(text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="coverage, arms, counts and one training time; computes no score")
@@ -716,7 +1062,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report", action="store_true", help="statistics, verdicts and wiring checks for --label")
     ap.add_argument("--check-asof", action="store_true", help="wiring check W-5")
     ap.add_argument("--check-engine", action="store_true", help="wiring check W-1 (runs one real walk-forward window)")
-    ap.add_argument("--arm", choices=sorted(ARMS))
+    ap.add_argument("--run-v2", action="store_true", help="S1 v2: score one arm (needs --arm; seed-averaged, climatology-imputed)")
+    ap.add_argument("--noise-pilot", action="store_true", help="S1 v2 noise pilot (baseline arm, QQQ, two disjoint seed sets)")
+    ap.add_argument("--report-v2", action="store_true", help="S1 v2 statistics for --label (needs --theta)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None, help="S1 v2 seeds (default: the registered five)")
+    ap.add_argument("--theta", nargs="+", default=None, metavar="H=VALUE", help="S1 v2 theta per horizon, e.g. 5=0.0010 30=0.0015")
+    ap.add_argument("--arm", choices=sorted(set(ARMS) | set(ARMS_V2)))
     ap.add_argument("--seed", type=int, default=None, help="ml.hyperparams.random_state for the stress repeat (base run: the config value, 42)")
     ap.add_argument("--canary", choices=("leaked", "shuffled"), default=None, help="W-4 wiring-check arm (run on arm a0)")
     ap.add_argument("--label", default="base", help="output folder under reports/fractal_ablation_study/")
@@ -728,9 +1079,17 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.dry_run:
         return dry_run(args)
+    if args.run_v2:
+        if not args.arm or args.arm not in ARMS_V2:
+            ap.error("--run-v2 needs --arm in " + ", ".join(ARMS_V2))
+        return run_arm_v2(args)
+    if args.noise_pilot:
+        return noise_pilot(args)
+    if args.report_v2:
+        return report_v2(args)
     if args.run:
-        if not args.arm:
-            ap.error("--run needs --arm")
+        if not args.arm or args.arm not in ARMS:
+            ap.error("--run needs --arm in " + ", ".join(ARMS))
         return run_arm(args)
     if args.report:
         return report(args)
