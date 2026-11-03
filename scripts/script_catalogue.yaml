@@ -792,4 +792,4 @@ scripts/fractal_ablation_study.py:
   writes: "nothing persistent (model artifacts go to a temporary directory that is deleted); history database opened read-only"
   example: "python scripts/fractal_ablation_study.py --dry-run"
   explained: "[RESEARCH_GUIDE.md](../RESEARCH_GUIDE.md#5-the-engine)"
-  stamp: "93d4eceb0cf6"
+  stamp: "05e85a460e5f"
