@@ -44,6 +44,7 @@ The register of what research studies and measurements have shown, and whether e
 | F-007 | Range-model confidence floor 0.65 versus 0.55 | migrated, unreviewed | no |
 | F-008 | IV-surface features versus the hold-to-expiry result of a QQQ iron condor, by DTE bucket | pre-registered | yes |
 | F-009 | The F-008 condors scored with a 50%-of-credit take-profit (exploratory) | exploratory | no |
+| F-010 | Ablation of the fractal columns on the range model (out-of-sample Brier skill, SPY / QQQ / IWM) | pre-registered | yes (a VOID / INSUFFICIENT result only) |
 
 ## Study results
 
@@ -88,6 +89,16 @@ The register of what research studies and measurements have shown, and whether e
   Spearman rho of each F-008 feature with the managed result (90% block-bootstrap interval): A `vrp_h` +0.084 [+0.008, +0.159], `term_slope` +0.031, `rr25_norm` -0.085 [-0.162, -0.008]; B `vrp_h` -0.068, `term_slope` -0.026, `rr25_norm` +0.004 (every interval spans zero); C `vrp_h` -0.033, `term_slope` -0.101 [-0.203, -0.010], `rr25_norm` -0.072. Bucket C `term_slope` is -0.205 with hold-to-expiry (F-008).
 - Caveats: Exploratory and post-hoc, chosen after the F-008 result was known, with no multiplicity control; not a finding. A leg that did not trade is unpriced, so the target can be missed (the reached rate is a lower bound), and for 1-2 DTE there is at most one session between entry and expiry, which is why most bucket A rows have no priced session and the managed result there is mostly the hold result. Taking profit at 50% lowers the mean result in bucket C in this sample. Bucket C remains below the floor of 30 independent observations (F-008), so its figures are descriptive.
 - Fed decision: none      Superseded by: -
+
+### F-010  Ablation of the fractal columns on the range model (out-of-sample Brier skill, SPY / QQQ / IWM)
+- Status: pre-registered        Citable: yes, as "this design cannot decide"; it does not show that any block helps or does not help
+- Question: When a block of the fractal feature columns is removed from the range model's inputs, does its out-of-sample Brier skill change by at least 0.01, per block, horizon and symbol (QQQ primary, SPY and IWM replication)?
+- Rule: PLAN.md "W119 S1 AS PLANNED" as amended by "W119 S1 ADDENDUM 1", "W119 S1 ADDENDUM 2" and "W119 S1 PRE-RUN CHECKS" (all written before any score)
+- Study file / script: studies/fractal_ablation_{a0..a6,b0..b2}.yaml / scripts/fractal_ablation_study.py --run --arm <arm> --label base (seed 42), --label stress --seed 7, --run --arm a0 --canary leaked|shuffled; --report
+- Run record: none (the script writes reports/fractal_ablation_study/<label>/<arm>.json, untracked)   Commit: 61bd248 (script), 2021ceb (study files)   Data span: 2016-02-01 to 2026-10-30 (S1a, 38 windows per symbol, first test 2017-01-31); 2023-10-12 to 2026-10-30 (S1b, 8 windows)   Epoch: research view of config.yaml + config_research.yaml, `ml.hyperparams.random_state` 42 (base) and 7 (stress), range labels at horizons 5 / 9 / 30 bars with the window's adaptive threshold, windows 252 train / 63 test rows
+- Result: VOID in the base run and in the stress repeat, and INSUFFICIENT for every arm. W-3 (two constant columns removed must change the QQQ mean Brier skill by less than 0.005): base +0.006 / +0.022 / +0.264 at h = 5 / 9 / 30, stress +0.016 / -0.014 / -0.001, failed in five of six cases. W-4 LEAKED canary passed (+1.5 to +4.1 mean gain); SHUFFLED canary failed at h = 9 (+0.089 base, +0.063 stress) and h = 30 (+0.244, +0.190). QQQ scored windows of the baseline arm: 18 / 15 / 8 of 38 (the model gave no probability in 18 / 20 / 21 for lack of CV edge); paired windows per arm 14-18 (h = 5, 9) and 7-9 (h = 30) against the floor of 20. Noise: the same baseline arm with seed 7 instead of 42 changes the per-window Brier skill by sd 0.175 / 0.274 / 0.095 (median absolute 0.02-0.03; largest 1.01); the registered threshold is 0.01. No arm reached KEEP or REMOVAL OK.
+- Caveats: Per-window Brier skill is unstable (it divides by each window's own base-rate variance); the study could not detect a change smaller than about 0.06-0.1. The 252-row windows leave about 150 usable training rows after the feature warm-up. Three highly correlated ETFs, one history. The stage S1b has 8 windows per symbol. The result says nothing about whether the fractal columns help; a redesign (seed-averaged, pooled metrics, a power analysis first) would be a new pre-registered entry.
+- Fed decision: none (D2 unchanged: columns kept on; the redesign is the operator's call, see PLAN.md "W119 S1 AS BUILT / FELL SHORT / RESULT")      Superseded by: -
 
 ## Migrated, not yet reviewed
 
