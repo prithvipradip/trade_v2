@@ -20066,3 +20066,18 @@ Also: `diagnostics/fractal_report.py::plot_psd` fits RETURNS over the full band 
 **Limits stated in advance.** Per-window models are small (about 150 usable training rows after the warm-up); three correlated ETFs; the label is the range label, not condor P&L; the climatology treatment of abstention rewards a model that abstains rarely, which is the point but differs from the live engine (it rejects the entry); theta is the noise the pilot measures and is not a practical-importance threshold; NOT SHOWN is the expected result for most blocks and is not a failure; nothing here licenses a live change.
 
 **NEXT.** Commit this entry, the study files, the code and the tests; then run the noise pilot (nothing else is run before the thetas are recorded).
+
+## 2026-11-03 - W119 S1 v2 ADDENDUM 1 (written BEFORE any arm is scored; the pilot computed no arm difference): the noise-pilot result and the thetas
+
+**The pilot ran as registered** (code and registration committed at `2a9ba3c` first): arm a0 (the baseline), QQQ, all 38 windows, horizons 5 and 30, seed set A = {42, 7, 11, 23, 101} and set B = {13, 17, 19, 29, 31}; files `reports/fractal_ablation_study/v2_pilot/{pilot_A,pilot_B,pilot}.json` and `pilot.md` (untracked). Per window the difference of the two seed-averaged Brier scores is a null draw.
+
+**Result (statistics only).**
+- h = 5: 38 of 38 windows scored (the climatology treatment scores every window); null mean +0.00090 (within theta); per-window sd of the difference 0.00773; standard error of the mean (block bootstrap) 0.00126; **theta = 0.0030**.
+- h = 30: 38 of 38; null mean -0.00215 (within theta); per-window sd 0.00878; standard error 0.00133; **theta = 0.0030**.
+- Neither horizon exceeds the 0.005 cap: **both are usable; the study continues**; both null-mean checks pass.
+- For scale: the mean seed-averaged Brier of the baseline is 0.221 (h = 5) and 0.288 to 0.290 (h = 30); one model's Brier varies across seeds by sd 0.010 (h = 5) and 0.003 to 0.005 (h = 30), and the 5-seed average cuts the set-to-set difference to a per-window sd under 0.009 (S1's per-window Brier-skill difference between two seeds had sd 0.095 to 0.274). Cells in which at least one of the 5 models abstained (scored as the window's training in-range rate for that model): 21 and 22 of 38 at h = 5, 26 and 26 of 38 at h = 30 (sets A and B).
+- A change of 0.003 Brier is about 1.4 % of the h = 5 baseline Brier: the study can resolve changes of that size or larger, which is a statement about the noise, not about practical importance.
+
+**Registered values.** theta(5) = 0.0030 and theta(30) = 0.0030, fixed now; `--report-v2` takes them as `--theta 5=0.0030 30=0.0030`. Nothing else of the S1 v2 AS PLANNED entry changes.
+
+**NEXT.** The base run (nine arms a0-a6, a0c, a5c; seeds A; horizons 5 and 30; about 2 to 3 hours at four processes), the two canaries (arm a0, seed 42, QQQ, the most recent 20 windows), `--report-v2 --theta 5=0.0030 30=0.0030`, then ONE stress repeat on the seed set B, then AS BUILT / FELL SHORT and an F-NNN entry. Awaiting the operator's go-ahead for the base run.
