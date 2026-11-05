@@ -446,3 +446,284 @@ forecast of paper results.** The paper checkpoint (`scripts/paper_checkpoint.py`
   results.
 - **Registries with guard tests** (`gate_parity`, `DIVERGENCE_CLASSES`): the right mechanism. This audit's
   corrections are additions to them, not a replacement.
+
+---
+
+# Part II — component audit of the live-money layers (2026-11-05)
+
+**Scope.** Part I read the live components only as far as the research/live comparison needed. This part
+audits the rest of the live stack for its own correctness:
+
+- **Execution and broker:** `execution/executor.py`, `roll_*`, `manual_positions.py`, `synthetic_delta.py`,
+  `condor_defense.py`, `broker/*`.
+- **State, reconciliation and risk:** `bot/state.py`, `execution/reconciler.py`, `portfolio.py`, `risk/*`.
+- **Runtime and ops:**
+  - the orchestrator's control flow: loops, startup and shutdown, exception handling;
+  - `bot/scheduler.py`, `orchestration/master.py`, `gateway.py`, `retrain_ib.py`;
+  - `monitoring/*`, `notifications/*`;
+  - the live data collectors;
+  - the dashboard and status servers.
+
+**Method.** Same as Part I: three parallel read-only passes, then the key claims re-read by hand.
+- Every finding was checked against PLAN.md, and only issues still standing are listed.
+- **VERIFIED** means the cited lines were re-read by hand in this session; **READ** means the finding comes
+  from a pass and has not been re-read.
+- Nothing was run.
+
+**Severity.**
+- **CRITICAL:** an open position can lose its protection, or money can be booked wrong, on a path that
+  is live today.
+- **HIGH:** the same harm, but on a path that is off or not reachable today ("latent").
+- **MEDIUM:** the risk or ledger state can be wrong in some conditions.
+- **LOW:** hygiene.
+
+## Headline
+
+1. **One critical defect is live today: an exit can leave the trade CLOSING with no broker order and nothing
+   tracking it (G1).** Two of the three passes found it independently. A Gateway drop at the wrong moment
+   leaves an open condor unmanaged until the next full reconcile, which can be the post-market one. No page
+   is sent.
+2. **While the circuit breaker is tripped, most position work in the trading cycle stops (G5).** That
+   includes the exit outbox drain and the owed reconcile, all day after a daily-loss trip.
+3. **Two exits that should fail safe do not:**
+   - A filled exit can be reverted to FILLED because nobody checked the broker's fill records (G2).
+   - A failed fetch of the broker's open orders falls back to the cached view and is treated as the
+     broker's answer (G3).
+4. **Multi-lot booking still has a gap and the roll path is wrong at N lots (G9, G10).** Both are latent while
+   `positions.max_contracts_per_trade: 1` and rolls are off. They must be fixed BEFORE either is raised or
+   turned on.
+
+## G. Findings
+
+### Execution and broker
+
+**G1. CRITICAL — the exit wedge: CLOSING is written, placement fails, nothing reverts it.** VERIFIED; found
+by two passes.
+- **Where:** `bot/orchestrator.py:5838-5844` (combo exit) and `~4571-4616` (single-leg exits). Both do
+  `if not self._cas_to_closing(trade): return None`, then `return await self._ibkr.place_order(...)`.
+- **What happens:**
+  - `broker/ibkr_client.py:589-623`: `place_order` returns `None` when `ensure_connected()` fails, and when
+    `placeOrder` raises.
+  - `_execute_exit` (`orchestrator.py:4079-4087`) then logs `exit_order_not_placed` and returns. Its comment
+    says the trade "is still FILLED/PARTIAL, unchanged. Nothing to revert", which is false on this path.
+- **What fails to recover it:**
+  - `portfolio.check_positions` evaluates FILLED/PARTIAL only.
+  - The executor's CLOSING→FILLED reverts cover tracked orders only.
+  - `_sweep_stale_pending` covers PENDING rows and roll parents only.
+  - Only a full `reconcile()` recovers the row: post-market, pre-market, a restart, `reconcile_now`, or one
+    owed after a disconnected phase. This path does not set the owed flag.
+- **Scenario:** a touch stop fires on a condor. The Gateway drops during the roughly 2.5 s of combo quote
+  polling. The condor then runs with no stop, no take-profit and no event flatten for the rest of the
+  session, and nobody is paged.
+- **History:** W45 moved the CLOSING write before placement and reasoned "a path that never CASes never needs
+  to un-CAS". It did not consider a write followed by a failed placement.
+- **Fix:**
+  - When `place_order` returns `None`, set the row back from CLOSING to FILLED with a compare-and-set, page,
+    and set `_reconcile_pending`.
+  - Keep it CLOSING only when `placeOrder` itself was reached and may have sent.
+  - The roll path has the same shape on purpose (rolls are off; PLAN ~12977).
+
+**G2. MEDIUM — an exit that filled during a disconnect is reverted to FILLED without checking the broker's
+fill records.** READ.
+- **Where:** `executor.py:~1623-1657`. After 900 s, the "zombie" revert checks only
+  `_broker_open_order_ids()`, and a filled order is not open.
+- **Contrast:** the entry path got the R19 check of the broker's fill records (`_broker_fill_evidence`); the
+  exit path did not.
+- **Effect:**
+  - The real fill price is lost. Usually liveness then reads `gone` and `book_vanished_trade` books the close
+    from the broker's per-leg P&L.
+  - If liveness reads `unknown`, a reverse combo can be sent.
+- **Fix:** call `_broker_fill_evidence(order_id)` before reverting.
+
+**G3. MEDIUM — `get_all_open_trades` returns the session cache on failure instead of `None`.** READ.
+- **Where:** `ibkr_client.py:~713-722`. The reconciler's contract says `None` means the broker view is
+  unavailable and CLOSING must not be promoted (`reconciler.py:~881-886`).
+- **Effect:** a failed `reqAllOpenOrders` after a reconnect can make the reconciler revert a CLOSING trade
+  whose close is still working under another clientId. A second close then goes out, and if both fill the
+  position reverses.
+- **No timeout:** neither this call nor the one at `connect()` has a timeout.
+- **Fix:** behave like `get_all_open_order_ids`: `wait_for`, and `None` on failure.
+
+**G4. MEDIUM, standing since W53 — `_reconstruct_bag_price` sums the combo's summary row.** VERIFIED.
+- **Where:** `executor.py:2736-2738` adds every row in `trade.fills`.
+- **The problem:** the file's own `BAG_CON_ID` note, and the roll path (`:1684`, `if not
+  self._is_bag_row(f)`), say a combo also reports a combo-level summary execution. Here it is not skipped.
+- **When it bites:** whenever `avgFillPrice` is 0 or NaN, on entries (`:2759`) and exits (`:2887`). A doubled
+  entry price moves the take-profit and stop thresholds and the realized P&L.
+- **History:** registered as a hazard at PLAN ~9569 and never fixed.
+- **Fix:** skip `_is_bag_row(f)`, as `_broker_fill_evidence` already does.
+
+**G4b. Smaller execution items.** READ.
+- **Single-leg partial exit** (`orchestrator.py:~4385-4407`): it market-orders, polls for 4 s, then cancels
+  without waiting and books nothing. A racing fill reduces the broker quantity while the row's stays the
+  same, and the next full exit is refused as a partial structure.
+- **N-lot combo fill price:** `_broker_fill_evidence` books the FIRST combo row's price, not the average
+  (`executor.py:~2429`).
+- **Single-leg entry:** with no quote, it places at the scan-time price; combos refuse in that case. The loss
+  is bounded, since these are long debits.
+- **First-boot NLV estimate:** Σ|position|·avgCost (`account.py:~193-205`) counts short premium as equity
+  and is stamped as a fresh snapshot.
+- **`verify_can_trade` probe:** it bypasses the account pin and swallows a cancel failure
+  (`ibkr_client.py:~393`).
+
+### Runtime and ops
+
+**G5. MEDIUM — a tripped circuit breaker returns before all position work in the trading cycle.** VERIFIED.
+- **Where:** `orchestrator.py:1795-1812` returns before step 1b (the owed reconcile, W34) and before the whole
+  locked step 3.
+- **Skipped while tripped:** thesis exits, partial exits, the scan-path fill check and `_drain_exit_outbox`.
+- **Not skipped:** the fast monitor still runs stops, take-profits and fill checks.
+- **Effect:** after a daily-loss trip (all day), orphan and vanished bookings, plus an owed reconcile, wait
+  until post-market.
+- **History:** W36 fixed exactly this class for the `should_avoid_new_trades` return, but not the breaker
+  return above it.
+- **Fix:** move the breaker check down to the entry section only.
+
+**G6. MEDIUM — the post-market reconcile has no broker-connected check.** VERIFIED.
+- **Where:** `_post_market` calls `self._reconciler.reconcile()` directly (`orchestrator.py:~5953`). W34's
+  `_reconcile_with_broker` guards only pre-market.
+- **Scenario:** with the Gateway down at 16:00, `get_positions()` returns `[]`. The zero-options guard refuses
+  to close anything, and the page then reads "EOD RECON: CLEAN | matched 0", which is the false "clean" W34
+  set out to remove.
+- **Fix:** use `_reconcile_with_broker` and set it owed.
+
+**G7. MEDIUM — a failed startup reconcile is only logged.** VERIFIED.
+- **Where:** `orchestrator.py:726-727` (`log.error("startup_reconcile_failed")`). It sends no page and does
+  not set `_reconcile_pending`.
+- **Effect:** after a mid-day restart, entries that filled while the bot was down are not promoted, and
+  working exits are not re-adopted, until post-market.
+
+**G8. MEDIUM — a hung entry scan is invisible to the supervisor and freezes the phase machine.** READ.
+- **The mask:** since W47 the protection loop writes the heartbeat. `_scan_task_loop` awaits
+  `_trading_cycle()` with no timeout (`orchestrator.py:~1718-1736`).
+- **What freezes:** a scan await that never returns blocks post-market (EOD reconcile, outbox drain, the MTM
+  baseline pre-stamp) and the next day's pre-market. No entries happen again until a restart, while
+  protection keeps running.
+- **Likelihood:** uncertain, since most IB calls carry their own timeouts. Nothing structural bounds it.
+- **Fix:** `asyncio.wait_for` around the cycle, plus a scan-liveness stamp.
+
+**G8b. MEDIUM — the retrain reports success by exit code only.** READ.
+- **What passes as success** (`master.py:~1662-1739`, `ml/trainer.py:~260-296`):
+  - range-model and vol-model failures, which are caught as warnings;
+  - skipped symbols;
+  - an empty result.
+- **Effect:** the supervisor logs `retrain_complete` and writes `models/.retrained`, which restarts the bot
+  onto stale models, with no alert.
+- **Model writes:** they are atomic except `ml/meta_label.py` (`_save_model`, `save_to_path`), which writes in
+  place.
+
+**G8c. LOW — runtime hygiene.** READ.
+- Once the restart budget is spent, the supervisor pages every 2 minutes, unthrottled, and a hung bot is never
+  restarted again that session (`master.py:~1231-1238`, `~1358-1364`).
+- `_start_status` / `_start_weblog` leak a log handle per respawn (`master.py:~1407`, `~1477`).
+- An untracked `create_task` notification (`orchestrator.py:~6581`).
+- The retrain clientId check ignores the 194-198 fallback ladder.
+- `_reconcile_with_broker` ignores `closing_exit_orders`.
+- `main.py` never reads `bot_task`'s exception, so an early failure exits with code 0.
+- `status_server.py` builds HTML with `innerHTML` and no escaping. It binds to localhost, so this is hygiene
+  only.
+
+### State, reconciliation and risk
+
+**G9. HIGH, latent at 1 lot — a multi-lot trade that vanishes BEFORE expiry counts its exit slices twice.**
+VERIFIED.
+- **Where:** W112 drops the broker's per-leg `realizedPNL` only for an expired trade
+  (`reconciler.py:609`, `... and expiry_d <= _today`).
+- **The double count:**
+  - For a trade that vanishes earlier, the broker figure (which by the code's own comment "covers the legs'
+    whole life, slices included") is used.
+  - `close_trade` then adds the slices again (`state.py:525`).
+  - The outbox drain books `pnl - archived` (`orchestrator.py:1093-1095`), so the slices reach
+    `daily_stats`, the breaker and the go-live inputs twice.
+- **Scenario:** a 3-lot exit fills 1 lot, and the operator then flattens the other 2 in TWS.
+- **Uncertain:** whether IB's zero-position `realizedPNL` spans earlier sessions.
+- **Fix:** apply the slice rule to every vanished trade that has slices, not only to expired ones.
+
+**G10. HIGH, latent (rolls off) — roll booking at N lots.** READ.
+- **The arithmetic** (`execution/roll_booking.py:~209`, `~327-341`):
+  - It multiplies by `execution.shares`, which is N.
+  - It then mixes that N-times figure with a per-unit carried value and multiplies by quantity again.
+- **Effect:** the closing side is booked about N² times, and trade B's entry price about N times too large.
+  B's stop and take-profit then sit far beyond the real loss.
+- **Two more roll defects:**
+  - A cancelled or partially filled roll never leaves `_pending_roll_orders`.
+  - `portfolio.py:~1119-1121` sets `condor_roll_side = verdict.tested_side` for ROLL_UNTESTED too, so an
+    "untested" verdict rolls the tested side.
+- **History:** W112's N-lot sweep did not cover rolls.
+
+**G11. MEDIUM — a PENDING trade is promoted to FILLED when any ONE of its legs is live.** READ.
+- **Where:** `reconciler.py:~1402` (`isdisjoint`) and `~1585-1600`.
+- **Trigger:** a W101 residual wing, a declared manual leg, or another trade's identical leg makes a
+  never-filled entry a phantom FILLED row.
+- **Effect:** the row holds a slot and risk, its working entry order is not cancelled, and its exit reads
+  `partial`.
+
+**G12. MEDIUM — the liveness and adoption checks ignore the sign of a position.** READ.
+- **Where:** `abs(int(pos.position))` at `reconciler.py:~512`, `~849`, `~1536`, `~1701`.
+- **Effect:** a leg held long where the bot is short (the after-state of a reversal) reads `live`, so the
+  next exit doubles the inverted position instead of refusing.
+
+**G13. MEDIUM — partial-exit slice booking is four separate writes.** READ.
+- **Where:** `executor.py:~2985-3010` and `orchestrator.py:~4436-4458`. The writes are
+  `record_partial_exit`, `update_daily_stats`, `record_partial_pnl` and `update_trade_quantity`.
+- **Effect:** a crash after the first loses the slice from `daily_stats` and the breaker for good, because the
+  final close subtracts every archived slice as already booked.
+- **A second hazard:** `update_daily_stats` replaces the whole row, so it can overwrite a delta committed in
+  between.
+
+**G14. MEDIUM, uncertain — the stale-local sweep books "gone" from the cache without a fresh broker query.**
+READ.
+- **Where:** `reconciler.py:~2062-2095`. Contrast `position_liveness`, which requires a fresh query before
+  saying `gone`.
+- **Effect:** a partly populated cache would book a live position closed at $0 and leave it unmanaged.
+- **Uncertain:** whether ib_insync can expose such a partial snapshot.
+
+**G15. LOW — two state and risk items.** READ.
+- A later breaker trip overwrites an active daily-loss trip's reason and its no-resume time
+  (`circuit_breaker.py:~372-377`, `~472`). Gate 8 and the 30 s MTM check re-trip, so the window is about
+  30 s.
+- The commission true-up deletes its estimate before the booking lands, so a kill in between books the
+  close with roughly zero commission.
+
+## Checked and correct (Part II)
+
+- **Execution:**
+  - Combos are guaranteed (no NonGuaranteed routing), so there is no leg risk on entry or exit. W101 leaves
+    out long wings only.
+  - Combo price signs, the ladder and the credit-floor clamp are consistent.
+  - The ×100 unit scale is right in fill price and P&L.
+  - The PENDING row is written before placement.
+  - There is no await between `placeOrder` and the tracker registration while connected.
+  - The W112 N-lot fixes are present.
+- **State:**
+  - The exactly-once exit outbox (CAS plus outbox in one transaction, the `core_booked` marker, the
+    stale-claim re-offer).
+  - `book_exit_core` writes `daily_stats` and the breaker atomically.
+  - The P&L sign and ×100 on the intrinsic and expiry paths.
+  - WAL is on, and the migrations are ordered.
+- **Risk:**
+  - The lot fitting and gates 6, 6b, 6b-2 and 6c apply to the fitted total.
+  - PDT fails closed.
+  - The breaker resets on the ET day and survives a reload.
+  - Simulated capital is scaled before any gate reads it.
+- **Runtime:**
+  - The scheduler phases, half-days and holidays.
+  - The APScheduler grace and coalesce settings.
+  - Atomic alert-channel and status files.
+  - Copy-on-read caches.
+  - Yahoo calls run off the event loop with timeouts.
+  - Every `reqMktData` is paired with a cancel.
+  - The Telegram token is scrubbed from logs.
+  - The dashboard, weblog and status servers bind localhost only, and the dashboard SQL is parameterized.
+
+## Proposed fix wave (before any further go-live step)
+
+**R27-0 Protection integrity** should come before the parity waves of Part I:
+- **First:** G1. It is small, local and critical.
+- **Then:** G5, G6 and G7 (the reconcile and breaker flow), G2 and G3 (fail-closed broker views) and G4 (the
+  summary row).
+- **Before raising `max_contracts_per_trade` above 1:** G9, G13 and G12.
+- **Before enabling rolls:** G10.
+
+Each item gets a failing test first: for G1, a `place_order` that returns `None` after the CLOSING write, with
+the trade required to be FILLED and monitored on the next cycle.

@@ -20095,3 +20095,15 @@ Also: `diagnostics/fractal_report.py::plot_psd` fits RETURNS over the full band 
 **Proposed waves (operator to order; each pre-registered before code).** R27-1 transfer integrity (frozen-config OOS as the promotion number, exporter refuses parameters with no live reader, `max_hold_days` / `delta_short`, go-live overlay decision, `go_live.py:655` PF gate passes on `pf is None`); R27-2 one feature-frame builder + input-config in the model spec (refuse, do not zero-fill) + one range-model factory; R27-3 shared entry gates (session blackout, one-per-symbol, cooldown, registry fixes); R27-4 one pure `exit_policy.decide()` for live and engine (rule 3e, defense, exit IV); R27-5 methodology (out-of-fold gate probabilities in trials, mark-to-market equity for Sharpe / drawdown, meta-label context parity, surface-delta strikes, W115).
 
 **Not found.** Label leakage at the walk-forward window boundary (labels truncated at `train_end`; inner CV purges >= horizon).
+
+## 2026-11-05 - R27 PART II (no code change): component audit of the live-money layers; same report, Part II
+
+**Why.** Operator follow-up: audit the components Part I did not (execution/broker, state/reconciler/risk, runtime/ops). Read-only, three passes, key claims re-read by hand; each finding checked against this ledger, only standing ones listed.
+
+**CRITICAL (live today), G1:** an exit CASes the trade to CLOSING and then `place_order` returns None (Gateway down / placeOrder raised); `_execute_exit` logs `exit_order_not_placed` and returns ("Nothing to revert" is false on this path), so the condor sits CLOSING with no order and no tracker, outside `check_positions`, until the next full reconcile (possibly post-market). No page. `orchestrator.py:5838-5844`, `~4571-4616`, `4079-4087`; `ibkr_client.py:589-623`. Fix: revert CLOSING->FILLED (CAS) + page + owe a reconcile.
+
+**MEDIUM (live today):** G5 the breaker return in `_trading_cycle` (`:1795-1812`) skips the outbox drain, the owed reconcile and thesis / partial exits all day after a trip (W36's class, the line above it); G6 post-market reconcile has no connected check (false "EOD RECON: CLEAN"); G7 startup reconcile failure is log-only; G2 the exit zombie revert has no fill-evidence check; G3 `get_all_open_trades` falls back to cache instead of None; G4 `_reconstruct_bag_price` sums the BAG summary row (W53 hazard, unfixed); G8 a hung scan is masked by the protection-loop heartbeat; G8b retrain success = exit code only.
+
+**HIGH, latent (must precede raising `max_contracts_per_trade` / enabling rolls):** G9 a multi-lot trade vanishing before expiry double-counts its exit slices (W112's guard is expiry-only, `reconciler.py:609`); G10 roll booking at N lots (N^2 on the closing side) and ROLL_UNTESTED rolls the tested side; with G11-G13 (single-leg-match promotion, sign-blind liveness, non-atomic slice booking).
+
+**Proposed:** wave R27-0 (protection integrity) ahead of the Part I parity waves; G1 first, with a failing test.
