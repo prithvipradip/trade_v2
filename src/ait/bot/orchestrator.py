@@ -3930,6 +3930,14 @@ class TradingOrchestrator:
         to place something; every defer/no-quote/qualification-failure path
         returns before reaching this, so nothing needs a revert on the
         not-placed side -- a path that never CASes never needs to un-CAS.
+
+        R27 G1: a path that CASes and then FAILS to place does need it.
+        IBKRClient.place_order returns None when the broker cannot be reached
+        or placeOrder raises, and in ib_insync 0.9.86 both happen before the
+        order is written to the socket -- nothing reached IB. Builders call
+        _place_closing_order, never this followed by place_order directly, so
+        that None reverts the row instead of leaving it CLOSING with no order
+        and no tracker, outside check_positions, until the next reconcile.
         """
         ok = self._state.update_trade_status(
             trade.trade_id, TradeStatus.CLOSING,
@@ -3938,6 +3946,62 @@ class TradingOrchestrator:
             log.critical("closing_transition_refused_before_place",
                          trade_id=trade.trade_id)
         return ok
+
+    async def _place_closing_order(self, trade: TradeRecord, contract, order,
+                                   after_cas=None):
+        """R27 G1: CAS to CLOSING, place, and revert when nothing was placed.
+
+        Returns the broker Trade, or None when the CAS was refused (row left
+        as it is, as before) or placement returned None (row reverted to the
+        status it had, a reconcile owed, the operator paged). ``after_cas``
+        runs between the CAS and the placement, where the multi-leg close
+        records its W101 left-out wings.
+        """
+        prior = getattr(trade, "status", None)
+        if prior not in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+            prior = TradeStatus.FILLED   # _cas_to_closing accepts only these two
+        if not self._cas_to_closing(trade):
+            return None
+        if after_cas is not None:
+            after_cas()
+        placed = await self._ibkr.place_order(contract, order)
+        if placed is None:
+            await self._revert_unplaced_closing(trade, prior)
+        return placed
+
+    async def _revert_unplaced_closing(self, trade: TradeRecord,
+                                       prior: TradeStatus) -> None:
+        """R27 G1: put an exit that never left the client back under
+        monitoring. CAS from CLOSING only: a row something else moved in the
+        meantime (a reconcile booking it, a fill) is never overwritten."""
+        reverted = self._state.update_trade_status(
+            trade.trade_id, prior, from_statuses=(TradeStatus.CLOSING,))
+        # Insurance for a placeOrder that raised after writing (not reachable
+        # in ib_insync 0.9.86): the owed reconcile adopts any stray working
+        # close once the broker is back (W34's _reconcile_if_owed).
+        self._reconcile_pending = True
+        try:
+            self._watchdog.record_error("ibkr", f"exit not placed: {trade.trade_id}")
+        except Exception:  # noqa: BLE001 — bookkeeping must never block the revert
+            pass
+        if reverted:
+            log.error("exit_closing_reverted_order_not_placed",
+                      trade_id=trade.trade_id, symbol=trade.symbol,
+                      restored=str(prior))
+            _what = ("The position is back under monitoring; the exit is "
+                     "retried with backoff. Check the Gateway.")
+        else:
+            log.critical("exit_closing_revert_refused", trade_id=trade.trade_id,
+                         symbol=trade.symbol,
+                         note="the row left CLOSING before the revert; not overwritten")
+            _what = ("The row was moved by something else before it could be "
+                     "reverted; check this trade by hand.")
+        if self._alert_gate(f"exit_not_placed:{trade.trade_id}"):
+            await self._send_notification(
+                f"EXIT NOT SENT: {trade.symbol} {trade.strategy} — the closing "
+                f"order could not be placed (broker unreachable or the order "
+                f"call failed). {_what}"
+            )
 
     async def _execute_exit(self, pos: PositionStatus) -> None:
         """Execute an exit order for a position that needs to be closed."""
@@ -4077,12 +4141,11 @@ class TradingOrchestrator:
                     return
 
             if exit_trade is None:
-                # W45: the CAS to CLOSING (if it happened at all) already
-                # happened inside the builder, immediately before ITS OWN
-                # placeOrder call -- every path that reaches here with
-                # exit_trade None returned from the builder before that
-                # point, so the trade is still FILLED/PARTIAL, unchanged.
-                # Nothing to revert.
+                # W45 / R27 G1: either the builder returned before its CAS
+                # (the trade is still FILLED/PARTIAL), or it CASed and
+                # placement failed, and _place_closing_order has already
+                # reverted the row, owed a reconcile and paged. Nothing
+                # left to revert here.
                 log.error("exit_order_not_placed", trade_id=pos.trade_id)
                 return
 
@@ -4568,9 +4631,7 @@ class TradingOrchestrator:
                 order = OrderBuilder.market(action="SELL", quantity=trade.quantity)
             # R17: tag with trade_id for exact reconciler matching.
             order.orderRef = trade.trade_id
-            if not self._cas_to_closing(trade):
-                return None
-            return await self._ibkr.place_order(qualified, order)
+            return await self._place_closing_order(trade, qualified, order)  # R27 G1
 
         # BUY-to-close a short: unbounded risk if done at market. LIMIT only.
         is_put = trade.contract_type == "put"
@@ -4611,9 +4672,7 @@ class TradingOrchestrator:
                                    limit_price=limit_price)
         # R17: tag with trade_id for exact reconciler matching.
         order.orderRef = trade.trade_id
-        if not self._cas_to_closing(trade):
-            return None
-        return await self._ibkr.place_order(qualified, order)
+        return await self._place_closing_order(trade, qualified, order)  # R27 G1
 
     def _entry_signals_json(self, symbol: str) -> str:
         """R20: serialize the 11 technical META_FEATURES for trade_context.
@@ -5835,13 +5894,12 @@ class TradingOrchestrator:
 
         # R17: tag with trade_id for exact reconciler matching.
         order.orderRef = trade.trade_id
-        if not self._cas_to_closing(trade):
-            return None
         # W101: written BEFORE the order can fill (and so before the leftover
         # leg can be seen without a trade), and on every attempt, so a later
         # four-leg attempt overwrites an earlier three-leg one.
-        self._record_left_out_wings(trade, legs, left_out)
-        return await self._ibkr.place_order(combo, order)
+        return await self._place_closing_order(  # R27 G1
+            trade, combo, order,
+            after_cas=lambda: self._record_left_out_wings(trade, legs, left_out))
 
     async def _unbid_wings_to_leave_out(self, trade: TradeRecord,
                                         qualified_legs: list[dict]) -> set[int]:
