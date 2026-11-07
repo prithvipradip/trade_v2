@@ -497,7 +497,7 @@ audits the rest of the live stack for its own correctness:
 
 ### Execution and broker
 
-**G1. CRITICAL — the exit wedge: CLOSING is written, placement fails, nothing reverts it.** VERIFIED; found
+**G1. CRITICAL — the exit wedge: CLOSING is written, placement fails, nothing reverts it.** **STATUS 2026-11-07: FIXED** (commit `2fabcae`, `_place_closing_order` / `_revert_unplaced_closing`; PLAN.md R27 G1 AS BUILT). VERIFIED; found
 by two passes.
 - **Where:** `bot/orchestrator.py:5838-5844` (combo exit) and `~4571-4616` (single-leg exits). Both do
   `if not self._cas_to_closing(trade): return None`, then `return await self._ibkr.place_order(...)`.
